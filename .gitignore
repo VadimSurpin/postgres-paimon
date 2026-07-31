@@ -1,0 +1,26 @@
+# Build artifacts — C++ extension
+extension/*.o
+extension/*.so
+extension/*.a
+extension/*.bc
+extension/*.bc.tmp
+
+# Build artifacts — Java
+java/target/
+java/dependency-reduced-pom.xml
+java/org/
+
+# Class files scattered outside target/
+**/*.class
+
+# Editor and OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+
+# PostgreSQL install artifacts
+*.pyc

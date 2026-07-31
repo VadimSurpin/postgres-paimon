@@ -1,0 +1,503 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "pgbench run duration per scenario (seconds)"
+        default: "30"
+        type: string
+  workflow_call:
+    inputs:
+      duration:
+        description: "pgbench run duration per scenario (seconds)"
+        default: "30"
+        type: string
+
+jobs:
+  bench:
+    name: Load & stress (PG18 + paimon_heap)
+    runs-on: ubuntu-latest
+
+    env:
+      PGDURATION: ${{ inputs.duration || '30' }}
+      MINIO_PORT: "9100"
+      WAREHOUSE: "/tmp/paimon-bench-warehouse"
+      S3_BUCKET: "paimon-bench"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── System deps (shared with e2e / release) ─────────────────────────────
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git \
+            bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev \
+            apt-transport-https gnupg lsb-release wget \
+            libcurl4-openssl-dev uuid-dev \
+            libkrb5-dev libsasl2-dev libgsasl-dev libprotobuf-dev protobuf-compiler \
+            libbz2-dev libsnappy-dev libzstd-dev libthrift-dev
+
+      - name: Install Apache Arrow 18
+        run: |
+          wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release -cs).deb" \
+               -O /tmp/arrow.deb
+          sudo apt-get install -y /tmp/arrow.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libarrow-dev=18.1.0-1 libparquet-dev=18.1.0-1
+
+      - name: Install PostgreSQL 18
+        run: |
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18
+
+      - name: Cache AWS SDK
+        id: cache-aws
+        uses: actions/cache@v4
+        with:
+          path: /opt/aws-sdk-cpp
+          key: aws-sdk-shared-1.11.360-amd64-${{ runner.os }}
+
+      - name: Build AWS SDK
+        if: steps.cache-aws.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules \
+            --branch 1.11.360 \
+            https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk-cpp \
+            -DBUILD_ONLY="s3;core" -DENABLE_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          sudo cmake --build /tmp/aws-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/aws-build
+          rm -rf /tmp/aws-sdk-cpp /tmp/aws-build
+
+      - name: Cache libhdfs3
+        id: cache-hdfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdfs3*
+            /usr/local/include/hdfs
+            /usr/local/lib/pkgconfig/libhdfs3.pc
+          key: libhdfs3-hawq-pic-v2-amd64-${{ runner.os }}
+
+      - name: Build libhdfs3
+        if: steps.cache-hdfs.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
+          sed -i 's/-dumpversion/-dumpfullversion/' \
+              /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          cmake -S /tmp/hawq/depends/thirdparty/googletest \
+                -B /tmp/gtest-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/gtest-build
+          sudo cmake --install /tmp/gtest-build
+          cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include sys/types.h" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
+            -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
+            -DGtest_INCLUDE_DIR=/usr/local/include \
+            -DGmock_INCLUDE_DIR=/usr/local/include
+          sudo cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/hdfs3-build
+          sudo ldconfig
+
+      - name: Build extension
+        working-directory: extension
+        run: |
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      - name: Install extension
+        working-directory: extension
+        run: |
+          sudo make install \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      # ── Configure PostgreSQL for benchmarks ─────────────────────────────────
+      - name: Configure PostgreSQL
+        run: |
+          if ! sudo pg_lsclusters | grep -q '18.*main'; then
+            sudo pg_createcluster 18 main
+          fi
+
+          sudo sed -i \
+            's|^host[[:space:]].*127\.0\.0\.1.*scram-sha-256|host all all 127.0.0.1/32 trust|' \
+            /etc/postgresql/18/main/pg_hba.conf
+
+          {
+            echo "shared_preload_libraries = 'paimon_heap'"
+            echo "paimon_heap.warehouse = '${WAREHOUSE}'"
+            # Flush every 100 txns or 10 s — realistic production setting
+            echo "paimon_heap.flush_interval_txns = 100"
+            echo "paimon_heap.flush_interval_secs = 10"
+            echo "paimon_heap.min_rows_per_file = 0"
+            # Allow enough connections for stress test
+            echo "max_connections = 64"
+          } | sudo tee -a /etc/postgresql/18/main/postgresql.conf
+
+          echo /opt/aws-sdk-cpp/lib | sudo tee /etc/ld.so.conf.d/aws-sdk.conf
+          sudo ldconfig
+
+          sudo mkdir -p /var/lib/postgresql/.aws
+          printf '[default]\naws_access_key_id=minioadmin\naws_secret_access_key=minioadmin\n' \
+            | sudo tee /var/lib/postgresql/.aws/credentials > /dev/null
+          sudo chown -R postgres:postgres /var/lib/postgresql/.aws
+          sudo chmod 600 /var/lib/postgresql/.aws/credentials
+
+          sudo pg_ctlcluster 18 main start
+          sleep 2
+
+          PG18_PORT=$(sudo -u postgres /usr/lib/postgresql/18/bin/psql \
+            -At -c "SHOW port;" 2>/dev/null || echo 5433)
+          echo "PG18_PORT=${PG18_PORT}" >> "$GITHUB_ENV"
+
+          sudo -u postgres psql -p "$PG18_PORT" -c "CREATE USER runner SUPERUSER;"
+          sudo -u postgres psql -p "$PG18_PORT" -c "CREATE DATABASE benchdb OWNER runner;"
+          psql -p "$PG18_PORT" benchdb -c "CREATE EXTENSION paimon_heap;"
+
+      # ── MinIO ───────────────────────────────────────────────────────────────
+      - name: Start MinIO
+        run: |
+          wget -q https://dl.min.io/server/minio/release/linux-amd64/minio \
+               -O /usr/local/bin/minio
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc \
+               -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/minio /usr/local/bin/mc
+
+          mkdir -p /tmp/minio-bench
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            /usr/local/bin/minio server /tmp/minio-bench \
+            --address "127.0.0.1:${MINIO_PORT}" \
+            &>/tmp/minio-bench.log &
+
+          # Wait for MinIO to be ready
+          for i in $(seq 1 20); do
+            nc -z 127.0.0.1 "${MINIO_PORT}" 2>/dev/null && break || sleep 0.5
+          done
+          /usr/local/bin/mc alias set bench-minio \
+            "http://127.0.0.1:${MINIO_PORT}" minioadmin minioadmin
+          /usr/local/bin/mc mb "bench-minio/${S3_BUCKET}"
+
+      # ── Capture runner hardware ──────────────────────────────────────────────
+      - name: Capture hardware info
+        run: |
+          {
+            echo "cpu_model=$(lscpu | awk -F': +' '/Model name/{print $2}')"
+            echo "vcpus=$(nproc)"
+            echo "ram_gb=$(awk '/^MemTotal/{printf "%.0f", $2/1048576}' /proc/meminfo)"
+            echo "pg_version=$(psql -p "$PG18_PORT" -At -c 'SHOW server_version;' benchdb)"
+          } > /tmp/hw.env
+          cat /tmp/hw.env
+
+      # ── pgbench scripts ──────────────────────────────────────────────────────
+      - name: Prepare pgbench scripts
+        run: |
+          # Heap baseline table
+          cat > /tmp/init_heap.sql <<'SQL'
+          DROP TABLE IF EXISTS bench_heap;
+          CREATE TABLE bench_heap (id BIGINT, k INT, v TEXT);
+          SQL
+
+          # paimon_heap table
+          cat > /tmp/init_paimon.sql <<'SQL'
+          DROP TABLE IF EXISTS bench_paimon;
+          CREATE TABLE bench_paimon (id BIGINT, k INT, v TEXT) USING paimon_heap;
+          SQL
+
+          # Shared INSERT transaction script (one row per txn)
+          cat > /tmp/txn_heap.sql <<'SQL'
+          \set k random(1, 100000)
+          INSERT INTO bench_heap VALUES (0, :k, md5(:k::text));
+          SQL
+
+          cat > /tmp/txn_paimon.sql <<'SQL'
+          \set k random(1, 100000)
+          INSERT INTO bench_paimon VALUES (0, :k, md5(:k::text));
+          SQL
+
+      # ── Load test: heap baseline ─────────────────────────────────────────────
+      - name: Load test — heap (baseline, synchronous_commit=on)
+        run: |
+          mkdir -p /tmp/bench-results
+          psql -p "$PG18_PORT" benchdb -f /tmp/init_heap.sql
+          for C in 1 4 8; do
+            echo "=== heap c=${C} ==="
+            pgbench -p "$PG18_PORT" -d benchdb \
+              -c "$C" -j "$C" -T "$PGDURATION" \
+              --no-vacuum -f /tmp/txn_heap.sql \
+              2>&1 | tee "/tmp/bench-results/heap_c${C}.txt"
+          done
+
+      - name: Load test — heap (synchronous_commit=off)
+        run: |
+          psql -p "$PG18_PORT" benchdb \
+            -c "ALTER SYSTEM SET synchronous_commit = off;" \
+            -c "SELECT pg_reload_conf();"
+          sleep 1
+          psql -p "$PG18_PORT" benchdb -f /tmp/init_heap.sql
+          for C in 1 4 8; do
+            echo "=== heap_async c=${C} ==="
+            pgbench -p "$PG18_PORT" -d benchdb \
+              -c "$C" -j "$C" -T "$PGDURATION" \
+              --no-vacuum -f /tmp/txn_heap.sql \
+              2>&1 | tee "/tmp/bench-results/heap_async_c${C}.txt"
+          done
+          # Restore synchronous_commit
+          psql -p "$PG18_PORT" benchdb \
+            -c "ALTER SYSTEM RESET synchronous_commit;" \
+            -c "SELECT pg_reload_conf();"
+
+      # ── Load test: paimon_heap ───────────────────────────────────────────────
+      - name: Load test — paimon_heap (flush_interval_txns=100)
+        run: |
+          psql -p "$PG18_PORT" benchdb -f /tmp/init_paimon.sql
+          for C in 1 4 8; do
+            echo "=== paimon_heap c=${C} ==="
+            pgbench -p "$PG18_PORT" -d benchdb \
+              -c "$C" -j "$C" -T "$PGDURATION" \
+              --no-vacuum -f /tmp/txn_paimon.sql \
+              2>&1 | tee "/tmp/bench-results/paimon_c${C}.txt"
+          done
+
+      # ── Load test: paimon_heap + WAL durability ─────────────────────────────
+      - name: Load test — paimon_heap (wal_level=local)
+        run: |
+          psql -p "$PG18_PORT" benchdb \
+            -c "ALTER SYSTEM SET paimon_heap.wal_level = 'local';" \
+            -c "SELECT pg_reload_conf();"
+          sleep 1
+          psql -p "$PG18_PORT" benchdb -f /tmp/init_paimon.sql
+          for C in 1 4 8; do
+            echo "=== paimon_heap wal=local c=${C} ==="
+            pgbench -p "$PG18_PORT" -d benchdb \
+              -c "$C" -j "$C" -T "$PGDURATION" \
+              --no-vacuum -f /tmp/txn_paimon.sql \
+              2>&1 | tee "/tmp/bench-results/paimon_wal_c${C}.txt"
+          done
+          psql -p "$PG18_PORT" benchdb \
+            -c "ALTER SYSTEM RESET paimon_heap.wal_level;" \
+            -c "SELECT pg_reload_conf();"
+
+      # ── Restart PG with S3 settings before throughput test ─────────────────
+      # Write S3 GUCs into postgresql.conf and restart so the bgworker starts
+      # with them from the beginning — avoids a SIGHUP race condition where the
+      # bgworker flushes the INSERT to local disk before picking up the new GUCs.
+      - name: Restart PostgreSQL with S3 settings
+        run: |
+          {
+            echo "paimon_heap.s3_bucket   = '${S3_BUCKET}'"
+            echo "paimon_heap.s3_endpoint = 'http://127.0.0.1:${MINIO_PORT}'"
+            echo "paimon_heap.s3_region   = 'us-east-1'"
+            echo "paimon_heap.flush_interval_txns = 1"
+            echo "paimon_heap.flush_interval_secs = 3"
+          } | sudo tee -a /etc/postgresql/18/main/postgresql.conf
+          sudo pg_ctlcluster 18 main restart
+          sleep 5
+
+      # ── S3 bulk-load throughput ──────────────────────────────────────────────
+      - name: S3 bulk-load throughput (100 k rows → MinIO)
+        run: |
+          mkdir -p /tmp/bench-results
+
+          psql -p "$PG18_PORT" benchdb \
+            -c "DROP TABLE IF EXISTS bench_s3;" \
+            -c "CREATE TABLE bench_s3 (id INT, v TEXT) USING paimon_heap;"
+
+          T0=$(date +%s%3N)
+          psql -p "$PG18_PORT" benchdb \
+            -c "INSERT INTO bench_s3 SELECT i, md5(i::text) FROM generate_series(1,100000) i;"
+          T1=$(date +%s%3N)
+
+          # Wait for snapshot/LATEST to appear in MinIO (bgworker flush → S3)
+          for i in $(seq 1 60); do
+            /usr/local/bin/mc stat \
+              "bench-minio/${S3_BUCKET}/bench_s3/snapshot/LATEST" \
+              &>/dev/null && break || sleep 1
+          done
+          T2=$(date +%s%3N)
+
+          INSERT_MS=$((T1 - T0))
+          FLUSH_MS=$((T2 - T0))
+
+          echo "s3_insert_ms=${INSERT_MS}" >> /tmp/bench-results/s3.env
+          echo "s3_flush_ms=${FLUSH_MS}"   >> /tmp/bench-results/s3.env
+          echo "s3_rows=100000"            >> /tmp/bench-results/s3.env
+
+          # Approximate Parquet file size (sum "size":N fields from mc find --json)
+          PARQUET_BYTES=$( \
+            /usr/local/bin/mc find \
+              "bench-minio/${S3_BUCKET}/bench_s3" --name "*.parquet" \
+              --json 2>/dev/null \
+            | grep -o '"size":[0-9]*' \
+            | awk -F: '{s+=$2} END{print s+0}' \
+            || echo 0)
+          echo "s3_parquet_bytes=${PARQUET_BYTES}" >> /tmp/bench-results/s3.env
+          cat /tmp/bench-results/s3.env
+
+      # ── Stress test: ring-buffer saturation ─────────────────────────────────
+      - name: Stress test — ring-buffer saturation (16 clients, 15 s)
+        run: |
+          psql -p "$PG18_PORT" benchdb \
+            -c "DROP TABLE IF EXISTS bench_stress;" \
+            -c "CREATE TABLE bench_stress (id BIGINT, k INT, v TEXT) USING paimon_heap;"
+
+          # 16 concurrent writers for 15 s — no S3, pure local flush
+          pgbench -p "$PG18_PORT" -d benchdb \
+            -c 16 -j 4 -T 15 \
+            --no-vacuum -f /tmp/txn_paimon.sql \
+            2>&1 | tee /tmp/bench-results/stress_c16.txt
+
+          # Count ring-buffer drop warnings in PG log
+          # grep -c exits 1 on zero matches, so use || true to avoid the double-0 issue
+          DROPS=$(grep -c "ring-buffer messages were dropped" \
+            /var/log/postgresql/postgresql-18-main.log 2>/dev/null || true)
+          DROPS="${DROPS:-0}"
+          echo "stress_drops=${DROPS}" > /tmp/bench-results/stress.env
+
+          # pgbench 18 outputs a single TPS line: "tps = N (without initial connection time)"
+          # The word "initial" is in that line, so grep -v 'initial' would wrongly discard it
+          TPS=$(grep 'tps = ' /tmp/bench-results/stress_c16.txt \
+            | head -1 | awk '{print $3}')
+          echo "stress_tps=${TPS}" >> /tmp/bench-results/stress.env
+          cat /tmp/bench-results/stress.env
+
+      # ── Generate results markdown ────────────────────────────────────────────
+      - name: Generate results
+        run: |
+          python3 - <<'PYEOF'
+          import re, os
+
+          def pgbench_stats(path):
+              """Return (tps, avg_lat_ms) from a pgbench output file."""
+              try:
+                  txt = open(path).read()
+              except FileNotFoundError:
+                  return ('n/a', 'n/a')
+              tps = re.search(r'tps = ([\d.]+) \(without', txt)
+              lat = re.search(r'latency average = ([\d.]+) ms', txt)
+              return (
+                  f"{float(tps.group(1)):,.0f}" if tps else 'n/a',
+                  f"{float(lat.group(1)):.2f}"  if lat  else 'n/a',
+              )
+
+          def load_env(path):
+              d = {}
+              try:
+                  for line in open(path):
+                      k, _, v = line.strip().partition('=')
+                      d[k] = v
+              except FileNotFoundError:
+                  pass
+              return d
+
+          hw   = load_env('/tmp/hw.env')
+          s3   = load_env('/tmp/bench-results/s3.env')
+          st   = load_env('/tmp/bench-results/stress.env')
+
+          cpu  = hw.get('cpu_model', 'unknown')
+          cpus = hw.get('vcpus', '?')
+          ram  = hw.get('ram_gb', '?')
+          pgv  = hw.get('pg_version', '?')
+
+          dur  = os.environ.get('PGDURATION', '30')
+
+          lines = []
+          lines.append(f"## paimon_heap benchmark results\n")
+          lines.append(f"**Runner:** {cpu} · {cpus} vCPU · {ram} GB RAM  ")
+          lines.append(f"**PostgreSQL:** {pgv}  ")
+          lines.append(f"**pgbench duration:** {dur} s per scenario  ")
+          lines.append(f"**Schema:** `(id BIGINT, k INT, v TEXT)`, one INSERT per transaction\n")
+
+          # Load test table
+          lines.append("### Write throughput (INSERT/s)")
+          lines.append("")
+          lines.append("| Engine | Clients | TPS | Avg latency |")
+          lines.append("|--------|--------:|----:|------------:|")
+          for C in [1, 4, 8]:
+              tps, lat = pgbench_stats(f'/tmp/bench-results/heap_c{C}.txt')
+              lines.append(f"| heap (sync) | {C} | {tps} | {lat} ms |")
+          for C in [1, 4, 8]:
+              tps, lat = pgbench_stats(f'/tmp/bench-results/heap_async_c{C}.txt')
+              lines.append(f"| heap (async) | {C} | {tps} | {lat} ms |")
+          for C in [1, 4, 8]:
+              tps, lat = pgbench_stats(f'/tmp/bench-results/paimon_c{C}.txt')
+              lines.append(f"| paimon_heap (flush/100 txns) | {C} | {tps} | {lat} ms |")
+          for C in [1, 4, 8]:
+              tps, lat = pgbench_stats(f'/tmp/bench-results/paimon_wal_c{C}.txt')
+              lines.append(f"| paimon_heap (wal_level=local) | {C} | {tps} | {lat} ms |")
+
+          # S3 bulk load
+          rows  = int(s3.get('s3_rows', 0))
+          ins   = int(s3.get('s3_insert_ms', 0))
+          flush = int(s3.get('s3_flush_ms', 0))
+          pbytes = int(s3.get('s3_parquet_bytes', 0))
+          ins_rps   = f"{rows / ins * 1000:,.0f}" if ins > 0 else 'n/a'
+          flush_rps = f"{rows / flush * 1000:,.0f}" if flush > 0 else 'n/a'
+          parquet_kb = f"{pbytes/1024:.0f}" if pbytes > 0 else 'n/a'
+
+          lines.append("")
+          lines.append("### S3 bulk load (100 k rows → local MinIO)")
+          lines.append("")
+          lines.append("| Metric | Value |")
+          lines.append("|--------|------:|")
+          lines.append(f"| INSERT time (PostgreSQL commit) | {ins} ms |")
+          lines.append(f"| End-to-end time (commit → S3 flush) | {flush} ms |")
+          lines.append(f"| INSERT throughput | {ins_rps} rows/s |")
+          lines.append(f"| End-to-end throughput | {flush_rps} rows/s |")
+          lines.append(f"| Parquet file size | {parquet_kb} KB |")
+
+          # Stress test
+          s_tps   = st.get('stress_tps', 'n/a')
+          s_drops = st.get('stress_drops', '0')
+          lines.append("")
+          lines.append("### Stress test (16 concurrent clients, 15 s)")
+          lines.append("")
+          lines.append("| Metric | Value |")
+          lines.append("|--------|------:|")
+          lines.append(f"| TPS | {s_tps} |")
+          lines.append(f"| Ring-buffer overflow warnings | {s_drops} |")
+
+          md = '\n'.join(lines) + '\n'
+          print(md)
+
+          # Write artifact file
+          os.makedirs('/tmp/bench-results', exist_ok=True)
+          with open('/tmp/bench-results/bench-latest.md', 'w') as f:
+              f.write(md)
+
+          # Write to GitHub step summary
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(md)
+          PYEOF
+
+      # ── Upload artifacts ─────────────────────────────────────────────────────
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/bench-results/
+          retention-days: 90

@@ -1,0 +1,189 @@
+name: Extension build
+# trigger first run
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "extension/**"
+      - "docker/Dockerfile"
+      - ".github/workflows/extension.yml"
+  pull_request:
+    paths:
+      - "extension/**"
+      - "docker/Dockerfile"
+      - ".github/workflows/extension.yml"
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ── Build (or reuse cached) the heavy build-environment image ───────────────
+  build-env:
+    name: Build environment image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      image_lc: ${{ steps.img.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=${GITHUB_REPOSITORY,,}/build-env" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}
+          # Pin by Dockerfile hash so the image is rebuilt only when the
+          # Dockerfile changes, not on every commit.
+          tags: |
+            type=sha,prefix=env-,format=short
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push build-env image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:latest
+          cache-to: type=inline
+
+  # ── Trivy: scan the build-env image for OS/library CVEs ─────────────────────
+  scan:
+    name: Trivy image scan
+    runs-on: ubuntu-latest
+    needs: build-env
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.REGISTRY }}/${{ needs.build-env.outputs.image_lc }}:latest"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'  # Report but don't fail the build
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  # ── Compile the extension inside the build-env image ────────────────────────
+  compile:
+    name: Compile extension
+    runs-on: ubuntu-latest
+    needs: build-env
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compile
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/src \
+            -w /src/extension \
+            ${{ env.REGISTRY }}/${{ needs.build-env.outputs.image_lc }}:latest \
+            make -j"$(nproc)"
+
+      - name: Verify shared library was produced
+        run: test -f extension/paimon_heap.so
+
+      - name: Upload .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paimon-heap-so
+          path: extension/paimon_heap.so
+          retention-days: 7
+
+  # ── pg_regress: install extension and run SQL regression tests ───────────────
+  regress:
+    name: Regression tests
+    runs-on: ubuntu-latest
+    needs: build-env
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run regression tests
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/src \
+            ${{ env.REGISTRY }}/${{ needs.build-env.outputs.image_lc }}:latest \
+            bash -c "
+              set -euo pipefail
+              adduser --disabled-password --gecos '' pgtest
+              cd /src/extension && make -j\$(nproc) install
+              mkdir -p /tmp/paimon-regress-warehouse
+              chown pgtest /tmp/paimon-regress-warehouse
+              su pgtest -c '/usr/local/pgsql/bin/initdb -D /tmp/pgdata --username=pgtest --auth=trust'
+              printf "shared_preload_libraries = 'paimon_heap'\npaimon_heap.warehouse = '/tmp/paimon-regress-warehouse'\n" \
+                >> /tmp/pgdata/postgresql.conf
+              su pgtest -c '/usr/local/pgsql/bin/pg_ctl -D /tmp/pgdata -l /tmp/pg.log start -w' \
+                || { echo '=== PostgreSQL log ==='; cat /tmp/pg.log; exit 1; }
+              su pgtest -c '/usr/local/pgsql/bin/createdb regress'
+              su pgtest -c \"/usr/local/pgsql/bin/psql regress -c 'CREATE EXTENSION paimon_heap;'\"
+              make -C /src/extension installcheck PGUSER=pgtest PGDATABASE=regress PGHOST=/tmp
+            "
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-regress-diffs
+          path: extension/test/results/
+          retention-days: 7

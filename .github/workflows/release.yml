@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ── C++ extension — PG 18, linux/amd64 and linux/arm64 ──────────────────────
+  build-extension:
+    name: Extension (PG 18, linux/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git \
+            bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev \
+            apt-transport-https gnupg lsb-release wget \
+            libcurl4-openssl-dev uuid-dev \
+            libkrb5-dev libsasl2-dev libgsasl-dev libprotobuf-dev protobuf-compiler \
+            libbz2-dev libsnappy-dev libzstd-dev libthrift-dev
+
+      - name: Install Apache Arrow 18
+        run: |
+          wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release -cs).deb" \
+               -O /tmp/arrow.deb
+          sudo apt-get install -y /tmp/arrow.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libarrow-dev=18.1.0-1 libparquet-dev=18.1.0-1
+
+      - name: Install PostgreSQL 18 dev headers
+        run: |
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-18
+
+      # ── AWS SDK (shared) — used by the normal .so ──────────────────────────
+      - name: Cache AWS SDK (shared)
+        id: cache-aws
+        uses: actions/cache@v4
+        with:
+          path: /opt/aws-sdk-cpp
+          key: aws-sdk-shared-1.11.360-${{ matrix.arch }}-${{ runner.os }}
+
+      - name: Build AWS SDK (shared)
+        if: steps.cache-aws.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules \
+            --branch 1.11.360 \
+            https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk-cpp \
+            -DBUILD_ONLY="s3;core" -DENABLE_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          sudo cmake --build /tmp/aws-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/aws-build
+          rm -rf /tmp/aws-sdk-cpp /tmp/aws-build
+
+      # ── libhdfs3 ──────────────────────────────────────────────────────────
+      - name: Cache libhdfs3
+        id: cache-hdfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdfs3*
+            /usr/local/include/hdfs
+            /usr/local/lib/pkgconfig/libhdfs3.pc
+          key: libhdfs3-hawq-pic-v2-${{ matrix.arch }}-${{ runner.os }}
+
+      - name: Build libhdfs3
+        if: steps.cache-hdfs.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
+          sed -i 's/-dumpversion/-dumpfullversion/' \
+              /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          cmake -S /tmp/hawq/depends/thirdparty/googletest \
+                -B /tmp/gtest-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/gtest-build
+          sudo cmake --install /tmp/gtest-build
+          cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include sys/types.h" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
+            -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
+            -DGtest_INCLUDE_DIR=/usr/local/include \
+            -DGmock_INCLUDE_DIR=/usr/local/include
+          sudo cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/hdfs3-build
+          sudo ldconfig
+
+      # ── Build extension (normal + fat) ────────────────────────────────────
+      - name: Build normal extension
+        working-directory: extension
+        run: |
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      - name: Build fat extension
+        working-directory: extension
+        run: |
+          make fat -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            HDFS3_ROOT=/usr/local
+
+      # ── Package ───────────────────────────────────────────────────────────
+      - name: Package
+        run: |
+          VER="${{ github.ref_name }}"
+          ARCH="${{ matrix.arch }}"
+
+          strip --strip-unneeded extension/paimon_heap.so
+          strip --strip-unneeded extension/paimon_heap_fat.so
+
+          # Normal package (requires Arrow, AWS SDK, libhdfs3 installed)
+          PKG="paimon_heap-${VER}-pg18-linux-${ARCH}"
+          mkdir -p "dist/${PKG}"
+          cp extension/paimon_heap.so       "dist/${PKG}/"
+          cp extension/paimon_heap.control  "dist/${PKG}/"
+          cp extension/paimon_heap--1.0.sql "dist/${PKG}/"
+          tar -czf "dist/${PKG}.tar.gz" -C dist "${PKG}"
+
+          # Fat package (Arrow/Parquet/libhdfs3/AWS SDK statically linked)
+          PKG_FAT="paimon_heap-fat-${VER}-pg18-linux-${ARCH}"
+          mkdir -p "dist/${PKG_FAT}"
+          cp extension/paimon_heap_fat.so   "dist/${PKG_FAT}/paimon_heap.so"
+          cp extension/paimon_heap.control  "dist/${PKG_FAT}/"
+          cp extension/paimon_heap--1.0.sql "dist/${PKG_FAT}/"
+          tar -czf "dist/${PKG_FAT}.tar.gz" -C dist "${PKG_FAT}"
+
+      - name: Upload extension artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-pg18-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
+  # ── GitHub release ───────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub release
+    needs: [build-extension]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true

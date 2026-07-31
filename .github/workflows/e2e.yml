@@ -1,0 +1,233 @@
+name: E2E test
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "extension/**"
+      - "java/**"
+      - ".github/workflows/e2e.yml"
+  pull_request:
+    paths:
+      - "extension/**"
+      - "java/**"
+      - ".github/workflows/e2e.yml"
+
+jobs:
+  e2e:
+    name: End-to-end (PG18 + MinIO + Java reader)
+    runs-on: ubuntu-latest
+
+    env:
+      # PG18 from PGDG is assigned port 5433 on ubuntu-latest (5432 is taken by pre-installed PG)
+      E2E_JDBC_URL: "jdbc:postgresql://localhost:5433/testdb"
+      E2E_DB_USER:  runner
+      E2E_MINIO_BIN: /usr/local/bin/minio
+      E2E_MC_BIN:    /usr/local/bin/mc
+      E2E_MINIO_PORT: "9100"
+      # MiniDFSCluster requires shaded Jetty classes that are hard to bundle; skip in CI
+      E2E_SKIP_HDFS: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── System deps (same set as release.yml) ──────────────────────────────
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git \
+            bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev \
+            apt-transport-https gnupg lsb-release wget \
+            libcurl4-openssl-dev uuid-dev \
+            libkrb5-dev libsasl2-dev libgsasl-dev libprotobuf-dev protobuf-compiler \
+            libbz2-dev libsnappy-dev libzstd-dev libthrift-dev
+
+      - name: Install Apache Arrow 18
+        run: |
+          wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release -cs).deb" \
+               -O /tmp/arrow.deb
+          sudo apt-get install -y /tmp/arrow.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libarrow-dev=18.1.0-1 libparquet-dev=18.1.0-1
+
+      # ── PostgreSQL 18 ───────────────────────────────────────────────────────
+      - name: Install PostgreSQL 18
+        run: |
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18
+
+      # ── AWS SDK (reuse release.yml cache) ──────────────────────────────────
+      - name: Cache AWS SDK
+        id: cache-aws
+        uses: actions/cache@v4
+        with:
+          path: /opt/aws-sdk-cpp
+          key: aws-sdk-shared-1.11.360-amd64-${{ runner.os }}
+
+      - name: Build AWS SDK
+        if: steps.cache-aws.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules \
+            --branch 1.11.360 \
+            https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk-cpp \
+            -DBUILD_ONLY="s3;core" -DENABLE_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          sudo cmake --build /tmp/aws-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/aws-build
+          rm -rf /tmp/aws-sdk-cpp /tmp/aws-build
+
+      # ── libhdfs3 (reuse release.yml cache) ─────────────────────────────────
+      - name: Cache libhdfs3
+        id: cache-hdfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdfs3*
+            /usr/local/include/hdfs
+            /usr/local/lib/pkgconfig/libhdfs3.pc
+          key: libhdfs3-hawq-pic-v2-amd64-${{ runner.os }}
+
+      - name: Build libhdfs3
+        if: steps.cache-hdfs.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
+          sed -i 's/-dumpversion/-dumpfullversion/' \
+              /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          cmake -S /tmp/hawq/depends/thirdparty/googletest \
+                -B /tmp/gtest-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/gtest-build
+          sudo cmake --install /tmp/gtest-build
+          cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include sys/types.h" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
+            -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
+            -DGtest_INCLUDE_DIR=/usr/local/include \
+            -DGmock_INCLUDE_DIR=/usr/local/include
+          sudo cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/hdfs3-build
+          sudo ldconfig
+
+      # ── Build and install extension ─────────────────────────────────────────
+      - name: Build extension
+        working-directory: extension
+        run: |
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      - name: Install extension
+        working-directory: extension
+        run: |
+          sudo make install \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      # ── Configure PostgreSQL ────────────────────────────────────────────────
+      - name: Configure PostgreSQL
+        run: |
+          # PGDG apt install may skip pg_createcluster on some runners
+          if ! sudo pg_lsclusters | grep -q '18.*main'; then
+            sudo pg_createcluster 18 main
+          fi
+
+          # Trust all local TCP connections so the test can connect without a password
+          sudo sed -i \
+            's|^host[[:space:]].*127\.0\.0\.1.*scram-sha-256|host all all 127.0.0.1/32 trust|' \
+            /etc/postgresql/18/main/pg_hba.conf
+
+          # Add paimon_heap to shared_preload_libraries.
+          # Pre-set warehouse to what PaimonOffloadTest expects; bgworker reads
+          # these at startup so ALTER SYSTEM + pg_reload_conf() is a no-op.
+          {
+            echo "shared_preload_libraries = 'paimon_heap'"
+            echo "paimon_heap.warehouse = '/tmp/paimon-offload-warehouse'"
+            echo "paimon_heap.flush_interval_txns = 1"
+            echo "paimon_heap.flush_interval_secs = 3"
+          } | sudo tee -a /etc/postgresql/18/main/postgresql.conf
+
+          # Add AWS SDK rpath to ldconfig so the extension .so resolves at startup
+          echo /opt/aws-sdk-cpp/lib | sudo tee /etc/ld.so.conf.d/aws-sdk.conf
+          sudo ldconfig
+
+          # Write MinIO credentials for the postgres user (bgworker runs as postgres,
+          # so the AWS SDK credential chain looks in /var/lib/postgresql/.aws/).
+          sudo mkdir -p /var/lib/postgresql/.aws
+          printf '[default]\naws_access_key_id=minioadmin\naws_secret_access_key=minioadmin\n' \
+            | sudo tee /var/lib/postgresql/.aws/credentials > /dev/null
+          sudo chown -R postgres:postgres /var/lib/postgresql/.aws
+          sudo chmod 600 /var/lib/postgresql/.aws/credentials
+
+          sudo pg_ctlcluster 18 main start
+          sleep 2
+
+          # Determine which port PG18 is actually listening on
+          PG18_PORT=$(sudo -u postgres /usr/lib/postgresql/18/bin/psql \
+            -At -c "SHOW port;" 2>/dev/null || echo 5433)
+          echo "PG18 port: $PG18_PORT"
+
+          # Create a superuser matching the GH Actions runner account
+          sudo -u postgres psql -p "$PG18_PORT" -c "CREATE USER runner SUPERUSER;"
+          sudo -u postgres psql -p "$PG18_PORT" -c "CREATE DATABASE testdb OWNER runner;"
+          sudo -u postgres psql -p "$PG18_PORT" testdb -c "CREATE EXTENSION paimon_heap;"
+
+          # Patch the JDBC URL to use the correct port (may differ from default 5433)
+          echo "E2E_JDBC_URL=jdbc:postgresql://localhost:${PG18_PORT}/testdb" >> "$GITHUB_ENV"
+
+      # ── Download MinIO and mc ───────────────────────────────────────────────
+      - name: Download MinIO
+        run: |
+          wget -q https://dl.min.io/server/minio/release/linux-amd64/minio \
+               -O /usr/local/bin/minio
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc \
+               -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/minio /usr/local/bin/mc
+
+      # ── Build the offload-test jar ──────────────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build offload-test jar
+        working-directory: java
+        run: mvn -B package -P offload-test --no-transfer-progress
+
+      # ── Run E2E offload test (T18: MinIO S3, T19: HDFS) ────────────────────
+      - name: Run E2E offload test
+        run: |
+          java -jar java/target/paimon-offload-test.jar
+
+      # ── Upload logs on failure ──────────────────────────────────────────────
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            /tmp/minio-offload.log
+            /var/log/postgresql/postgresql-18-main.log
+          retention-days: 7

@@ -1,0 +1,5 @@
+comment = 'Heap table AM with Paimon lake offload'
+default_version = '1.0'
+module_pathname = '$libdir/paimon_heap'
+relocatable = true
+superuser = true
