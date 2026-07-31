@@ -24,3 +24,6 @@ java/org/
 
 # PostgreSQL install artifacts
 *.pyc
+
+# PR / devrel materials — local only
+/pr/
