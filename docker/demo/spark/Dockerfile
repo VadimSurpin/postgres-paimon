@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pip install --no-cache-dir pyspark==3.5.3 && \
     rm -rf /var/lib/apt/lists/*
 
-ARG PAIMON_VERSION=0.8.2
+ARG PAIMON_VERSION=1.4.1
 ARG HADOOP_AWS_VERSION=3.3.4
 ARG AWS_BUNDLE_VERSION=1.12.262
 ARG MVN=https://repo1.maven.org/maven2
