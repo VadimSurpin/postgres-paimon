@@ -76,6 +76,25 @@ pg_type_to_ptype(Oid typoid, int32_t typmod, uint32_t *typmod_out)
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
+/*
+ * At hook time we see the raw parse tree before transformColumnDef() runs.
+ * DEFAULT is stored in ColumnDef->constraints as a CONSTR_DEFAULT node, NOT
+ * in ColumnDef->raw_default (which is only set after transformation).
+ */
+static bool
+cdef_has_default(ColumnDef *cdef)
+{
+    if (cdef->raw_default != NULL)
+        return true;
+    ListCell *lc;
+    foreach(lc, cdef->constraints) {
+        Constraint *con = castNode(Constraint, lfirst(lc));
+        if (con->contype == CONSTR_DEFAULT)
+            return true;
+    }
+    return false;
+}
+
 static void
 error_no_default(const char *colname)
 {
@@ -114,7 +133,7 @@ handle_create_pre(CreateStmt *stmt)
         if (!IsA(lfirst(lc), ColumnDef))
             continue;
         ColumnDef *cdef = castNode(ColumnDef, lfirst(lc));
-        if (cdef->raw_default != NULL)
+        if (cdef_has_default(cdef))
             error_no_default(cdef->colname);
     }
 }
@@ -195,7 +214,7 @@ handle_alter_pre(AlterTableStmt *stmt)
         switch (cmd->subtype) {
             case AT_AddColumn: {
                 ColumnDef *cdef = castNode(ColumnDef, cmd->def);
-                if (cdef->raw_default != NULL)
+                if (cdef_has_default(cdef))
                     error_no_default(cdef->colname);
                 break;
             }
