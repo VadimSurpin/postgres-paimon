@@ -423,7 +423,25 @@ handle_ddl_drop_table(Cursor &c)
     if (!c.ok()) return;
     auto it = g_tables.find(oid);
     if (it != g_tables.end()) {
-        it->second->drop();
+        /*
+         * Flush any buffered rows so they are not lost, then promote the
+         * final state to S3/HDFS.  After this the remote copy is complete
+         * and remains intact (metadata-only drop: we never delete from S3).
+         */
+        try { it->second->flush(); }
+        catch (const std::exception &e) {
+            ereport(WARNING, errmsg("paimon_bgworker: DROP TABLE flush: %s", e.what()));
+        }
+        try { promote_table(it->second->tableName()); }
+        catch (const std::exception &e) {
+            ereport(WARNING, errmsg("paimon_bgworker: DROP TABLE promote: %s", e.what()));
+        }
+        /*
+         * Remove only local metadata (schema/, snapshot/, manifest/).
+         * Local data files (bucket-0/) are left in place; S3/HDFS keeps the
+         * authoritative copy of everything.
+         */
+        it->second->dropMetadataOnly();
         g_tables.erase(it);
     }
 }

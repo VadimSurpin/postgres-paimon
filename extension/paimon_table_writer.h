@@ -64,8 +64,15 @@ public:
     /* Drop all Parquet files and reset snapshot state */
     bool truncate();
 
-    /* Remove the entire table directory */
+    /* Remove the entire table directory (used internally / for testing) */
     bool drop();
+
+    /*
+     * Metadata-only drop: remove schema/, snapshot/, manifest/ from local
+     * staging but leave bucket-0/ data files intact.  Call flush() and
+     * promote_table() before this so S3/HDFS has the final complete copy.
+     */
+    bool dropMetadataOnly();
 
     const std::string &tableName() const { return name_; }
 

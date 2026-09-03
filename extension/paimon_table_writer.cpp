@@ -353,4 +353,15 @@ bool PaimonTableWriter::drop() {
     return !ec;
 }
 
+bool PaimonTableWriter::dropMetadataOnly() {
+    rk_buf_.clear(); seq_buf_.clear(); col_buf_.clear(); buf_rows_ = 0;
+    latest_snapshot_id_ = -1;
+    committed_manifests_.clear();
+    std::error_code ec;
+    fs::remove_all(fs::path(root_) / "schema",   ec);
+    fs::remove_all(fs::path(root_) / "snapshot", ec);
+    fs::remove_all(fs::path(root_) / "manifest", ec);
+    return true;
+}
+
 } // namespace paimon

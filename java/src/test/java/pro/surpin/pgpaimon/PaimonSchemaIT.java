@@ -320,6 +320,71 @@ class PaimonSchemaIT {
         assertTrue(after2 > after1, "highestFieldId must increase again on second ADD COLUMN");
     }
 
+    // ── metadata-only drop ───────────────────────────────────────────────────
+
+    /**
+     * Verifies the metadata-only DROP TABLE semantic:
+     * after the schema directory is removed the table cannot be read via
+     * SchemaManager, but any "data files" (directories/files in bucket-0)
+     * survive.  This mirrors what dropMetadataOnly() does in the bgworker:
+     * schema/ + snapshot/ + manifest/ are deleted, bucket-0/ stays.
+     */
+    @Test
+    void metadataOnlyDrop_schemaGone_dataFilesPreserved() throws Exception {
+        SchemaManager sm = schemaManager("t_meta_drop");
+        sm.createTable(baseSchema());
+
+        // Simulate a "data file" that would be written by the Parquet writer.
+        File dataDir = new File(warehouseDir, "t_meta_drop/bucket-0");
+        assertTrue(dataDir.mkdirs() || dataDir.exists(), "bucket-0 dir should be creatable");
+        File fakeParquet = new File(dataDir, "data-00000.parquet");
+        fakeParquet.createNewFile();
+
+        // Schema is present before drop.
+        assertTrue(sm.latest().isPresent(), "schema should exist before drop");
+
+        // Perform metadata-only drop: remove schema/, snapshot/, manifest/ directories.
+        File tableDir  = new File(warehouseDir, "t_meta_drop");
+        deleteDir(new File(tableDir, "schema"));
+        deleteDir(new File(tableDir, "snapshot"));
+        deleteDir(new File(tableDir, "manifest"));
+
+        // Schema is gone — SchemaManager sees no table.
+        assertTrue(sm.latest().isEmpty(), "schema should be absent after metadata-only drop");
+
+        // Data file is preserved.
+        assertTrue(fakeParquet.exists(),
+                "Parquet data file must survive a metadata-only drop");
+    }
+
+    @Test
+    void metadataOnlyDrop_tableCanBeRecreated() throws Exception {
+        SchemaManager sm = schemaManager("t_recreate");
+        sm.createTable(baseSchema());
+        sm.commitChanges(SchemaChange.addColumn("email", DataTypes.STRING()));
+        assertEquals(1, sm.latest().orElseThrow().id());
+
+        // Metadata-only drop.
+        File tableDir = new File(warehouseDir, "t_recreate");
+        deleteDir(new File(tableDir, "schema"));
+        deleteDir(new File(tableDir, "snapshot"));
+        deleteDir(new File(tableDir, "manifest"));
+        assertTrue(sm.latest().isEmpty());
+
+        // Re-create with a fresh schema — starts at schema-0 again.
+        sm.createTable(baseSchema());
+        TableSchema fresh = sm.latest().orElseThrow();
+        assertEquals(0, fresh.id(), "fresh schema after re-create should be schema-0");
+        assertEquals(List.of("id"), fresh.primaryKeys());
+    }
+
+    private static void deleteDir(File dir) {
+        if (!dir.exists()) return;
+        File[] children = dir.listFiles();
+        if (children != null) for (File c : children) deleteDir(c);
+        dir.delete();
+    }
+
     // ── gap #2 documentation ──────────────────────────────────────────────────
 
     /**
