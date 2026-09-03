@@ -31,6 +31,10 @@ jobs:
           distribution: "temurin"
           cache: maven
 
+      - name: Run unit tests (PaimonSchemaIT)
+        working-directory: java
+        run: mvn -B test --no-transfer-progress
+
       - name: Build reader jar (PaimonRead)
         working-directory: java
         run: mvn -B package --no-transfer-progress

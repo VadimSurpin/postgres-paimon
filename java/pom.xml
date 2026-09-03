@@ -36,6 +36,12 @@
             <artifactId>postgresql</artifactId>
             <version>42.7.3</version>
         </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
+        </dependency>
         <!-- Embedded single-node HDFS for T19 -->
         <dependency>
             <groupId>org.apache.hadoop</groupId>
@@ -337,13 +343,15 @@
 
     <build>
         <plugins>
-            <!-- Prevent Surefire from treating *Test.java entry-points as JUnit tests -->
+            <!-- Run *IT.java JUnit 5 tests; *Test.java classes are main() entry-points -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
-                    <skipTests>true</skipTests>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
                 </configuration>
             </plugin>
             <!-- Merge test-classes into classes so the shade plugin bundles them -->

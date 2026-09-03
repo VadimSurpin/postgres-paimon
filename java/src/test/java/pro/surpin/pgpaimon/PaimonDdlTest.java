@@ -206,7 +206,7 @@ public class PaimonDdlTest {
 
         boolean alterOk = true;
         try (Connection conn = connect()) {
-            exec(conn, "ALTER TABLE " + tbl + " ADD COLUMN extra TEXT DEFAULT 'x'");
+            exec(conn, "ALTER TABLE " + tbl + " ADD COLUMN extra TEXT");
             // Insert using the new column — ensures bgworker sees DDL before this DML
             exec(conn, "INSERT INTO " + tbl + " VALUES (3,30,'hello')");
             exec(conn, "INSERT INTO " + tbl + " VALUES (4,40,'world')");
