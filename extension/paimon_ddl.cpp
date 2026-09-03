@@ -74,7 +74,50 @@ pg_type_to_ptype(Oid typoid, int32_t typmod, uint32_t *typmod_out)
                                           typmod_out, (uint32_t) typmod);
 }
 
+/* ── helpers ─────────────────────────────────────────────────────────── */
+
+static void
+error_no_default(const char *colname)
+{
+    if (colname)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("paimon_heap: column default values are not supported"),
+                 errdetail("Column \"%s\" has a DEFAULT clause.", colname),
+                 errhint("Remove the DEFAULT clause; existing rows will read NULL "
+                         "for newly added columns.")));
+    else
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("paimon_heap: column default values are not supported"),
+                 errhint("Remove the DEFAULT clause; existing rows will read NULL "
+                         "for newly added columns.")));
+}
+
 /* ── pre-execute handlers ────────────────────────────────────────────── */
+
+/*
+ * Block CREATE TABLE USING paimon_heap when any column has a DEFAULT clause.
+ * We cannot backfill defaults into historical Parquet files, so defaults
+ * would silently produce NULLs for older rows in Spark — it is better to
+ * refuse early than to silently mislead.
+ */
+static void
+handle_create_pre(CreateStmt *stmt)
+{
+    if (!stmt->accessMethod ||
+        strcmp(stmt->accessMethod, "paimon_heap") != 0)
+        return;
+
+    ListCell *lc;
+    foreach(lc, stmt->tableElts) {
+        if (!IsA(lfirst(lc), ColumnDef))
+            continue;
+        ColumnDef *cdef = castNode(ColumnDef, lfirst(lc));
+        if (cdef->raw_default != NULL)
+            error_no_default(cdef->colname);
+    }
+}
 
 static void
 handle_drop_pre(DropStmt *stmt)
@@ -150,6 +193,18 @@ handle_alter_pre(AlterTableStmt *stmt)
         AlterTableCmd *cmd = castNode(AlterTableCmd, lfirst(lc));
 
         switch (cmd->subtype) {
+            case AT_AddColumn: {
+                ColumnDef *cdef = castNode(ColumnDef, cmd->def);
+                if (cdef->raw_default != NULL)
+                    error_no_default(cdef->colname);
+                break;
+            }
+            case AT_ColumnDefault:
+                /* cmd->def == NULL means DROP DEFAULT (harmless); non-NULL is SET DEFAULT */
+                if (cmd->def != NULL)
+                    error_no_default(cmd->name);
+                break;
+
             case AT_DropColumn: {
                 AttrNumber attnum = get_attnum(relid, cmd->name);
                 if (attnum == InvalidAttrNumber)
@@ -276,6 +331,9 @@ paimon_process_utility(PlannedStmt *pstmt,
      * and block forbidden operations (PK changes) before they happen.
      */
     switch (nodeTag(parsetree)) {
+        case T_CreateStmt:
+            handle_create_pre(castNode(CreateStmt, parsetree));
+            break;
         case T_DropStmt:
             handle_drop_pre(castNode(DropStmt, parsetree));
             break;

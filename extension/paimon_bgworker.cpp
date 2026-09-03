@@ -357,7 +357,10 @@ handle_ddl_add(Cursor &c)
     f.name      = c.str();
     if (!c.ok()) return;
     auto it = g_tables.find(oid);
-    if (it != g_tables.end()) it->second->ddlAddField(f);
+    if (it != g_tables.end()) {
+        it->second->ddlAddField(f);
+        promote_table(it->second->tableName());
+    }
 }
 
 static void
@@ -367,7 +370,10 @@ handle_ddl_drop(Cursor &c)
     uint16_t attnum = c.u16();
     if (!c.ok()) return;
     auto it = g_tables.find(oid);
-    if (it != g_tables.end()) it->second->ddlDropField(attnum);
+    if (it != g_tables.end()) {
+        it->second->ddlDropField(attnum);
+        promote_table(it->second->tableName());
+    }
 }
 
 static void
@@ -378,7 +384,10 @@ handle_ddl_rename(Cursor &c)
     std::string name = c.str();
     if (!c.ok()) return;
     auto it = g_tables.find(oid);
-    if (it != g_tables.end()) it->second->ddlRenameField(an, name);
+    if (it != g_tables.end()) {
+        it->second->ddlRenameField(an, name);
+        promote_table(it->second->tableName());
+    }
 }
 
 static void
@@ -390,7 +399,10 @@ handle_ddl_type(Cursor &c)
     uint32_t       typmod = c.u32();
     if (!c.ok()) return;
     auto it = g_tables.find(oid);
-    if (it != g_tables.end()) it->second->ddlChangeType(an, tc, typmod);
+    if (it != g_tables.end()) {
+        it->second->ddlChangeType(an, tc, typmod);
+        promote_table(it->second->tableName());
+    }
 }
 
 static void
