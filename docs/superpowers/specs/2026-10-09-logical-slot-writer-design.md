@@ -62,9 +62,11 @@ krb5 in the postmaster address space. No TAM signature churn across major versio
 (`extension/paimon_heap.cpp:540-632` already carries three variants). Installable on managed
 PostgreSQL.
 
-**What it costs.** Unchanged-TOAST values are unavailable at any replica identity setting
-(§5). Intra-transaction intermediate row versions are collapsed (§7). `merge-engine` is
-constrained to `partial-update` (§5). An abandoned slot is a new operational hazard (§8).
+**What it costs.** Tracked tables must be switched to `REPLICA IDENTITY FULL`, which adds
+the old row to the WAL of every UPDATE and DELETE — that is what makes an unchanged TOASTed
+column recoverable (§5). `merge-engine` is constrained to `deduplicate` (§5). Physical tuple
+identifiers are not obtainable, so `meta_field_tid` has no counterpart (§6). An abandoned
+slot is a new operational hazard (§8).
 
 **What is preserved.** DDL interception with the ability to abort the user's DDL — the one
 capability an external consumer structurally cannot have — survives as event triggers,
@@ -122,6 +124,8 @@ CREATE TABLE paimon.table_registry (
     pk_cols      text[]  NOT NULL,
     field_ids    jsonb   NOT NULL,   -- attname -> attnum, the stable Paimon field_id
     backfill_due boolean NOT NULL DEFAULT true,
+    replica_identity text NOT NULL DEFAULT 'full',   -- 'full' | 'default', §5 escape
+    changelog_producer text NOT NULL DEFAULT 'input',-- 'input' | 'lookup',  §5 escape
     registered_at timestamptz NOT NULL DEFAULT now()
 );
 ```
@@ -132,8 +136,11 @@ the registry records *what they looked like*.
 
 ### API
 
-- `paimon.add_table(regclass)` — sets `REPLICA IDENTITY FULL`, adds the table to
-  `paimon_pub`, inserts the registry row, emits a `create` message.
+- `paimon.add_table(regclass, replica_identity => 'full', changelog_producer => 'input')`
+  — sets `REPLICA IDENTITY FULL` unless the escape says otherwise, adds the table to
+  `paimon_pub`, inserts the registry row, emits a `create` message carrying the Paimon
+  table options. Raises if the table has no primary key. The two escape arguments are
+  accepted and recorded in v1 but only their default values are implemented (§5).
 - `paimon.remove_table(regclass)` — drops from publication, deletes the registry row.
   Does not delete Paimon data.
 
@@ -159,26 +166,38 @@ Blocked, matching main:
   default. Replaces `extension/paimon_ddl.cpp:102`.
 
 **No longer blocked: `ADD COLUMN ... DEFAULT`.** Main rejects column defaults outright
-(commits `abb792b`, `7529932`) because `gaps.md` item 2 has no cheap fix there. Under the
-merge engine chosen in §5 it does: the handler emits `add_col` followed by a `refill_col`
-job, and the writer replays `(pk, newcol, newcol_seq = LSN)` tuples that populate exactly
-one column on existing records and touch nothing else.
+(commits `abb792b`, `7529932`) because `gaps.md` item 2 has no cheap fix there. Here the
+handler emits `add_col` and sets `backfill_due = true`; the writer then refills the table
+from an exported snapshot (§6), writing complete `+I` rows stamped with the snapshot LSN so
+that concurrent higher-LSN streaming events win.
+
+The refill is O(table) for a DDL that PostgreSQL performs in O(1) with its fast-default
+mechanism, and that cost is accepted deliberately. `merge-engine = deduplicate` offers no
+cheaper route: populating one column on existing records requires rewriting whole rows,
+because nothing short of a partial-update engine can write a column in isolation — and
+§5 records why partial-update was rejected. Narrowing the refill is a later optimisation,
+not a v1 requirement.
 
 ### Primary key is required
 
 `paimon.add_table()` raises if the table has no primary key. This is a deliberate scope
 reduction from main, which permits `pk_count = 0` (`extension/paimon_client.cpp:105`) and
-produces an append-only Paimon table. A PK-less table cannot use `partial-update`, because
-that merge engine needs a key to merge on, so the §5 TOAST resolution would not apply and
-`u` columns would be unrecoverable. Supporting PK-less tables means supporting a second
-TOAST strategy; it is deferred to a follow-up spec.
+produces an append-only Paimon table.
+
+PostgreSQL refuses `UPDATE` and `DELETE` on a published table that has no replica
+identity. `REPLICA IDENTITY FULL` lifts that restriction, so a PK-less table *can* stream
+updates — but the stream then identifies a row only by its complete old value, which is
+not a key: two identical rows are indistinguishable, and `merge-engine = deduplicate` has
+nothing to deduplicate on. Every §5 write rule that references the old key loses meaning.
+Supporting PK-less tables means a second write path onto an append table with
+`(commit_lsn, op_index)` identity; it is deferred to a follow-up spec.
 
 ### Resolution of `gaps.md`
 
 | Gap | Resolution |
 |---|---|
 | 1. DROP COLUMN not propagated | `SchemaChange.dropColumn` via the official Paimon API |
-| 2. Defaults not backfilled on ADD COLUMN | `refill_col` job, per above |
+| 2. Defaults not backfilled on ADD COLUMN | `add_col` + table refill via `Backfiller`, per above |
 | 3. DROP TABLE leaves warehouse data | `Catalog.dropTable(identifier, true)` |
 
 ---
@@ -195,54 +214,144 @@ messages rather than being inferred.
 
 ### The TOAST problem
 
-`logicalrep_write_tuple()` in core emits `LOGICALREP_COLUMN_UNCHANGED` (`u`) for any
-attribute that is `VARATT_IS_EXTERNAL_ONDISK`, for the old tuple as well as the new one.
-`ReorderBufferToastReplace` can only reassemble TOAST chains written in the same
-transaction. Therefore a TOASTed column that an UPDATE did not touch is unavailable at
-**any** replica identity setting. `REPLICA IDENTITY FULL` buys before-images; it does not
-buy TOAST values. Main gets them free via `slot_getallattrs()`
-(`extension/paimon_heap.cpp:394`).
+`logicalrep_write_tuple()` (`src/backend/replication/logical/proto.c:46`) substitutes
+`LOGICALREP_COLUMN_UNCHANGED` (`u`) for any attribute still held externally at
+serialisation time:
 
-### Chosen resolution: partial-update with sequence groups
+```c
+if (att->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(values[i])))
+{
+    pq_sendbyte(out, LOGICALREP_COLUMN_UNCHANGED);
+    continue;
+}
+```
 
-`merge-engine = partial-update` retains the previous value for any omitted column. But
-`PartialUpdateMergeFunction` treats an incoming NULL as "no change" for *every* column,
-not only toastable ones, which would silently drop `UPDATE t SET note = NULL` on a plain
-`varchar`. Sequence groups recover it: a group is overwritten only when its sequence field
-advances, and NULLs do overwrite within a group.
+`ReorderBufferToastReplace` reassembles a TOAST chain only from chunks written in the same
+transaction, and only into `newtuple`. For the **new** tuple the gap is therefore exactly
+and only *an UPDATE that does not touch a TOASTed column*. Everything else arrives complete
+and byte-exact: INSERT always, COPY and multi-insert through `clear_toast_afterwards`
+(`decode.c:1222-1228`), and any UPDATE that does rewrite the column. Truncation is
+impossible by assertion — `Assert(data_done == VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer))`
+— so a partial value is never silently delivered.
+
+The **old** tuple behaves differently, and the design turns on this. `ExtractReplicaIdentity`
+(`src/backend/access/heap/heapam.c`) force-inlines external values *before* the record
+reaches WAL, in both of its branches:
+
+```c
+if (replident == REPLICA_IDENTITY_FULL)
+{
+    /* When logging the entire old tuple, it very well could contain
+     * toasted columns. If so, force them to be inlined. */
+    if (HeapTupleHasExternal(tp))
+        tp = toast_flatten_tuple(tp, desc);
+    return tp;
+}
+...
+if (HeapTupleHasExternal(key_tuple))        /* key-only path */
+    key_tuple = toast_flatten_tuple(oldtup, desc);
+```
+
+Because the old tuple is already flattened when it is written, the `EXTERNAL_ONDISK` test
+in `logicalrep_write_tuple` never fires for it. Under `REPLICA IDENTITY FULL` the old tuple
+carries **every column in full, TOASTed ones included**.
+
+### Chosen resolution: `REPLICA IDENTITY FULL`, resolved on the write path
+
+An UPDATE that leaves a TOASTed column untouched sends `u` for that column in the new
+tuple, and the flattened old tuple carries the column's full value. The column was not
+modified, so the old value *is* the new value; the writer substitutes it.
+
+Exact, at the event's own LSN, with no cache, no lookup query, and no merge-engine
+constraint. The writer stays stateless.
 
 Per-table options:
 
 ```
-merge-engine                            = partial-update
-partial-update.remove-record-on-delete  = true
-changelog-producer                      = lookup
-fields.main_seq.sequence-group          = <all non-toastable columns>
-fields.<col>_seq.sequence-group         = <col>      -- one per toastable column
+merge-engine          = deduplicate
+changelog-producer    = input
+sequence.field        = _seq,_op_seq
+ignore-update-before  = false
 ```
 
-Write rules:
+`sequence.field` is a list — `CoreOptions.sequenceField()` returns `List<String>` — and it
+needs to be, because a `-U` and the `+U` it precedes originate from one change and would
+otherwise carry the same sequence value. §7 defines the two fields. `ignore-update-before`
+is set explicitly rather than left to its default: `-U` records are required by the
+acceptance suite, and `TableWriteImpl` carries a `rowKindFilter` that this option drives.
 
-| Column state on UPDATE | Value sent | Group sequence sent | Effect |
-|---|---|---|---|
-| unchanged (`u`) | NULL | `0` (sentinel) | group not advanced, prior value retained |
-| changed | new value | `commit_lsn` | group advanced, overwrites |
-| set to NULL explicitly | NULL | `commit_lsn` | group advanced, NULL overwrites |
+`paimon.add_table()` issues `ALTER TABLE ... REPLICA IDENTITY FULL`. This takes a brief
+`ACCESS EXCLUSIVE` lock for the catalog update, and thereafter adds the size of the old row
+to the WAL written by every UPDATE and DELETE on that table. For a row carrying a large
+`jsonb` column that is updated often, the flattened value is written to WAL on each
+otherwise-unrelated update — see the second escape below for that case.
 
-`0` is reserved as the "do not advance" sentinel, so **no real sequence value may ever be
-0**. Backfill therefore stamps group sequences with the slot's `consistent_point` LSN, not
-0 (§6) — otherwise a stored 0 compared against an incoming 0 could advance the group and
-overwrite a live value with NULL.
+Write rules, per decoded message:
 
-"Toastable" is decided from the PG type: varlena types (`text`, `varchar`, `bytea`,
-`numeric`, `jsonb`, …) get their own sequence group; fixed-width types cannot be TOASTed
-and share `main_seq`. The `*_seq` columns exist only in the Paimon schema, not in
-PostgreSQL.
+| pgoutput message | Emitted to Paimon |
+|---|---|
+| `I` Insert | `+I(new)` |
+| `U` Update, key unchanged | `-U(old)`, `+U(new)`; each `u` column filled from `old` |
+| `U` Update, key changed | `-D(old)`, `+I(new)`; each `u` column filled from `old` |
+| `D` Delete | `-D(old)` |
+| `T` Truncate | empty overwrite commit, matching main's `PaimonTableWriter::truncate()` (`extension/paimon_table_writer.cpp:302`) |
 
-**This section depends on spike 1 (§12).** If NULL does not overwrite within a sequence
-group, or the comparison is strictly `>` rather than `>=`, fall back to writer-side
-resolution — a bounded per-PK cache plus lookup by PK on miss — and return to the user
-before switching, since that changes the user's explicit choice.
+The presence of an old tuple is not evidence that the key changed. `heap_update` logs the
+old key when `bms_overlap(modified_attrs, id_attrs) || id_has_external`
+(`heapam.c:4007-4010`), so a row with a TOASTed key column produces one on every UPDATE,
+and under `REPLICA IDENTITY FULL` the `'O'` old tuple is present unconditionally. The
+writer compares old and new key values; it never infers a key move from presence alone.
+
+### Two documented escapes
+
+Both are per-table arguments to `paimon.add_table()`, neither is a default, and neither is
+implemented in v1. They are recorded now so the table options do not have to be retrofitted
+onto existing warehouses later.
+
+**`changelog_producer => 'lookup'`.** Paimon reconstructs before-images from its own prior
+state instead of taking them from Postgres. Verified present in `paimon-api` 1.4.1:
+`CoreOptions$ChangelogProducer` is `{none, input, lookup, full-compaction}`, and
+`changelog-producer.row-deduplicate` is documented as *"Whether to generate -U, +U changelog
+for the same record. This configuration is only valid for the changelog-producer is lookup
+or full-compaction."* `LookupChangelogMergeFunctionWrapper` carries `reusedBefore`,
+`reusedAfter`, `setChangelog(before, after)` and a `valueEqualiser`. Use it when a
+downstream consumer needs before-images consistent with *Paimon's* own history across
+replays rather than with Postgres's. Costs: `changelog-producer.lookup-wait` defaults on, so
+commit waits for lookup compaction — and commit is also the LSN-advance path, hence the
+slot-retention path; and the lookup state is RocksDB-backed on the writer's local disk
+(`org/apache/paimon/lookup/rocksdb/`), which makes the writer stateful. If enabled,
+`changelog-producer.row-deduplicate-ignore-fields` must list the metadata columns of §6:
+they change on every event and would otherwise defeat row deduplication entirely.
+
+**`replica_identity => 'default'`.** For tables where logging the old row on every UPDATE is
+unaffordable. `add_table()` then mutates nothing and takes no lock, at the price of moving
+the TOAST work to the writer: `u` columns are resolved by a batched
+`SELECT <cols> FROM t WHERE pk = ANY($1)` once per flush. That reads Postgres's *current*
+value, so the result is eventually exact rather than exact at the event's LSN — a later
+change emits its own higher-LSN event, and the table converges. Before-images are
+unavailable under this escape, so it pairs with `changelog-producer = lookup` for any
+consumer that needs them.
+
+### What Paimon cannot do for us
+
+Paimon's `lookup` producer *reports* a before-image; it does not merge. If the writer emits
+`+U` with a NULL where a `u` column belongs, `deduplicate` stores the NULL and `lookup`
+faithfully emits `-U(old)` / `+U(NULL)`. Filling `u` columns is unavoidably a write-path
+responsibility.
+
+Merging would require `merge-engine = partial-update`, which is rejected here.
+`PartialUpdateMergeFunction` treats an incoming NULL as "no change" for *every* column, so
+`UPDATE t SET note = NULL` on a plain `varchar` would be silently dropped. Sequence groups
+recover that, but only by reserving a sentinel sequence value that no real sequence may
+take, and they still cannot express `-U` or handle a primary-key value change.
+
+`merge-engine` and `changelog-producer` are closed enums — `CoreOptions$MergeEngine` is
+`{deduplicate, partial-update, aggregation, first-row}` — and `MergeFunctionFactory` is a
+bare `@FunctionalInterface extends Serializable` that is **not** registered in the
+`org.apache.paimon.factories.Factory` SPI, so custom merge semantics would mean forking
+Paimon. The one supported extension door is a per-column aggregator: that SPI does carry
+`FieldSumAggFactory`, `FieldLastNonNullValueAggFactory` and twenty-odd siblings, usable with
+`merge-engine = aggregation`. Recorded as an escape hatch; not used.
 
 ---
 
@@ -260,7 +369,8 @@ same versions. One responsibility per class; each testable without the others.
 | `PgOutputDecoder` | protocol bytes → `ChangeEvent`; Relation cache; `n`/`t`/`u` column states | — |
 | `DdlMessageHandler` | `Message` JSON → list of `SchemaChange` | `SchemaRegistry` |
 | `SchemaRegistry` | PG relid → Paimon `Identifier`; applies evolution; owns field-id ↔ column mapping | Paimon `Catalog` |
-| `TxnBatcher` | groups by transaction, collapses per-PK, flushes on size or time | — |
+| `ToastResolver` | fills `u` columns in the new tuple from the old tuple; decomposes key changes into `-D` + `+I` | — |
+| `TxnBatcher` | groups by transaction, preserves LSN order, flushes on transaction boundary or size | — |
 | `PaimonSink` | `TableWriteImpl` writes, commit with identifier | Paimon |
 | `Backfiller` | exported-snapshot COPY → `+I` rows | PgJDBC, `PaimonSink` |
 | `OffsetStore` | last committed LSN, read back from Paimon snapshots | Paimon |
@@ -271,7 +381,7 @@ same versions. One responsibility per class; each testable without the others.
 CREATE_REPLICATION_SLOT paimon LOGICAL pgoutput EXPORT_SNAPSHOT
 START_REPLICATION SLOT paimon LOGICAL <lsn>
     (proto_version '2', publication_names 'paimon_pub',
-     messages 'true', binary 'false')
+     messages 'true', binary 'false', streaming 'off')
 ```
 
 Decoded message types: `B` Begin, `C` Commit, `R` Relation, `I` Insert, `U` Update,
@@ -284,14 +394,24 @@ Main exposes three optional metadata columns via GUC
 
 | Main GUC | New architecture | Source |
 |---|---|---|
-| `meta_field_xid` | supported | `xid` from the pgoutput `Begin` message |
-| `meta_field_op` | supported | per-row counter within the transaction, assigned by `TxnBatcher` |
+| `meta_field_xid` | supported, optional | `xid` from the pgoutput `Begin` message |
+| `meta_field_op` | supported, **now mandatory** | ordinal within the transaction, assigned by `TxnBatcher`; second `sequence.field` |
 | `meta_field_tid` | **not supported** | physical `(block << 16) \| offset` is not carried by logical decoding |
-| — | `meta_field_lsn` (new) | transaction `commit_lsn`, strictly more useful than a TID |
+| `_seq` | mandatory, as in main | per-change LSN; first `sequence.field` |
 
-`meta_field_tid` is replaced rather than emulated. T4 (`test4_metadataFields`) and T5
-(`test5_configurableFieldNames`) assert on the TID field and must be updated to assert on
-`lsn` instead. This is a genuine, documented behaviour difference, not a defect.
+`_seq` keeps its name and its role from main but changes its derivation. Main computes
+`((uint64_t)xid << 32) | op` (`extension/paimon_heap.cpp:370`), which is not monotone across
+XID wraparound; the per-change LSN is monotone for the lifetime of the cluster.
+
+`meta_field_op` becomes mandatory because it is the tiebreaker that orders a `-U` before its
+`+U` (§7). Its default name stays `_op_seq`, so T4 (`test4_metadataFields`) continues to
+pass for `_xid` and `_op_seq`; only its `_tid` assertion must change. T5
+(`test5_configurableFieldNames`) and T6 (`test6_schemaStructure`) assert the *presence* of
+`_seq` and set the metadata GUCs to `''`, and both still pass — an additional mandatory
+column breaks no assertion there.
+
+`meta_field_tid` is replaced rather than emulated: no physical tuple identifier survives the
+reorder buffer. This is a genuine, documented behaviour difference, not a defect.
 
 ### Text mode in v1
 
@@ -308,7 +428,7 @@ CREATE_REPLICATION_SLOT paimon LOGICAL pgoutput EXPORT_SNAPSHOT
     -> snapshot_name, consistent_point
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY
 SET TRANSACTION SNAPSHOT '<snapshot_name>'
-COPY <table> TO STDOUT        -> Paimon +I, all group seqs = consistent_point
+COPY <table> TO STDOUT        -> Paimon +I, _seq = consistent_point
 COMMIT
 START_REPLICATION SLOT paimon LOGICAL <consistent_point>
 ```
@@ -320,8 +440,53 @@ registry are loaded before streaming begins.
 
 ## 7. Delivery guarantees
 
-Effectively-once, using Paimon's own commit-identifier dedup rather than a bespoke
-mechanism:
+### Sequencing
+
+`sequence.field = _seq,_op_seq`, compared in that order:
+
+- `_seq` — the **per-change LSN**, read from the `XLogData` header via
+  `PGReplicationStream.getLastReceiveLSN()`, not the transaction's commit LSN. Using the
+  commit LSN would give every change in a transaction the same value and make tie
+  resolution inside `deduplicate` load-bearing.
+- `_op_seq` — an ordinal incremented once per **emitted record**, not per change. A `-U`
+  and the `+U` that follows it come from one change and therefore share `_seq`; `_op_seq`
+  separates them, and a stored `-U` winning that comparison would be read back as a
+  retraction and silently drop the row.
+
+The pair is lexicographically monotone over the whole stream: `_seq` is non-decreasing
+because LSNs are, and `_op_seq` increases strictly within a transaction. This mirrors
+main, whose `next_seq()` already uses a per-operation counter in its low 32 bits
+(`extension/paimon_heap.cpp:370`); the difference is that the high bits are an LSN rather
+than an XID.
+
+### Intra-transaction key collisions
+
+`TxnBatcher` does **not** collapse per key. Every change is written with its own `_seq`, so
+Paimon orders them without help, and intermediate row versions are preserved rather than
+discarded — matching main, which buffers every slot (`extension/paimon_heap.cpp:380`).
+
+One case makes the rule concrete:
+
+```sql
+UPDATE t SET id = id + 1;        -- rewrites every key, in an unspecified row order
+```
+
+Each row decomposes to `-D(old_key)` + `+I(new_key)`, and those pairs interleave across
+keys: the `+I` for key 3 may arrive before the `-D` that vacates it. Because every event
+carries its own LSN and Paimon applies events in LSN order, the final state is correct for
+any interleaving — the highest-LSN event for a key wins. The obligation this places on the
+writer is narrow and absolute: **never reorder, collapse or deduplicate within a batch**,
+because the batch's correctness rests entirely on LSN order surviving intact. T20 (§9) is
+the named acceptance test.
+
+### Complete transactions only
+
+The pgoutput `streaming` option stays off. `proto_version '2'` can stream in-progress
+transactions (`Stream Start` / `Stream Stop` / `Stream Commit` / `Stream Abort`), which
+would deliver changes that may still abort, and the guarantee below requires that a batch
+never contains a transaction that has not committed.
+
+### Effectively-once
 
 1. `TxnBatcher` accumulates complete transactions only — never a partial one.
 2. `PaimonSink` commits with `commitIdentifier = commit_lsn` under a fixed `commitUser`.
@@ -331,20 +496,13 @@ mechanism:
    from the Paimon snapshots and resumes the slot from it. Paimon discards commits whose
    identifier it has already seen, so replayed transactions are idempotent.
 
-Confirming the LSN only after the Paimon commit is what makes crash recovery a property of
-the code rather than best-effort, and is why `extension/paimon_wal.cpp` has no counterpart
-here.
+Commit identity remains the transaction's commit LSN even though sequencing uses
+per-change LSNs: the commit is the unit of atomicity, the per-change LSN the unit of
+ordering. The two never need to agree.
 
-### Ordering
-
-The sequence value for every group is the transaction's `commit_lsn`. `TxnBatcher`
-collapses multiple changes to the same primary key within one transaction to their final
-state, which removes the question of how Paimon compares equal sequence values.
-
-Consequence: intra-transaction intermediate row versions do not appear in the changelog.
-Those versions were never visible to any other transaction. T2 (`test2_updateCapture`) and
-`testCrudCdcAndCompaction` must be checked for reliance on them; both are expected to use
-autocommit and be unaffected.
+Confirming the LSN only after the Paimon commit returns is what makes crash recovery a
+property of the code rather than best-effort, and is why `extension/paimon_wal.cpp` has no
+counterpart here.
 
 ---
 
@@ -364,8 +522,12 @@ autocommit and be unaffected.
 - Unlogged and temporary tables produce no logical changes and cannot be tracked.
 - Partitioned tables require `publish_via_partition_root` set deliberately.
 - `wal_level = logical` is mandatory.
-- `merge-engine` is fixed at `partial-update` for tracked tables.
-- Intra-transaction intermediate row versions are collapsed.
+- `merge-engine` is fixed at `deduplicate` for tracked tables.
+- Tracked tables are switched to `REPLICA IDENTITY FULL`, which adds the old row to the
+  WAL written by every UPDATE and DELETE and is visible to any other logical consumer of
+  the same table. The §5 escape exists for tables that cannot afford it.
+- `paimon.add_table()` briefly takes an `ACCESS EXCLUSIVE` lock to set the replica
+  identity. Main's `SET ACCESS METHOD` took one too, so this is not a regression.
 
 ---
 
@@ -382,6 +544,7 @@ Three suites change meaningfully:
 
 | Test | Change |
 |---|---|
+| T4 (metadata fields) | `_tid` assertion replaced; `_xid` and `_op_seq` assertions kept (§6) |
 | T10, T11 (vacuum, vacuum freeze) | Become assertions that nothing spurious appears — VACUUM emits no logical changes |
 | T16 (crash recovery) | Strengthened: kill the writer mid-load, assert zero loss, which main cannot promise |
 | D7, D8 (blocked PK) | Same error asserted, now raised from an event trigger rather than `ProcessUtility` |
@@ -394,8 +557,16 @@ unregistered table reaches neither the publication nor the warehouse.
 - `PgOutputDecoder` against recorded byte fixtures, including `u` columns, multi-column
   keys, and `Message` interleaved with DML.
 - `SchemaRegistry` evolution unit tests for each DDL op.
-- A direct Paimon test of sequence-group semantics (also spike 1).
-- `TxnBatcher` per-PK collapse.
+- A direct Paimon test that `deduplicate` with `sequence.field = _seq,_op_seq` applies
+  events in that order irrespective of the order they are written within one commit, and
+  that a `-U` written alongside its `+U` never survives the merge.
+- `ToastResolver` unit tests: `u` filled from the old tuple; key change decomposed into
+  `-D` + `+I`; an old tuple present with an unchanged key treated as unchanged.
+- `TxnBatcher` preserves LSN order and never splits a transaction.
+- **T20** (new, named): `UPDATE t SET id = id + 1` over contiguous integer keys. One
+  transaction rewrites every key, producing `-D` / `+I` pairs whose key ranges overlap and
+  whose order is unspecified. Asserts the final Paimon state equals the final PostgreSQL
+  state. This is the test that any writer-side collapsing or reordering would fail.
 - A pg_regress suite for `paimon_slot`, replacing `extension/test/sql/paimon_heap.sql`.
 
 ### Harness
@@ -437,28 +608,36 @@ acceptance suite passing, rather than integrating everything at the end.
 
 | Phase | Deliverable | Green tests |
 |---|---|---|
-| 0 | The four spikes in §12 | — |
+| 0 | The five spikes in §12 | — |
 | 1 | `paimon_slot` registry + `add_table`, `SlotConsumer`, `PgOutputDecoder`, `PaimonSink`, `TxnBatcher` | T1–T3, T6–T8, `PaimonTypeTest` |
-| 2 | Metadata fields, sequence groups, TOAST handling | T4, T5 (adapted per §6) |
+| 2 | Metadata fields, `ToastResolver`, key-change decomposition | T4 (adapted per §6), T5, T20 |
 | 3 | DDL event triggers, messages, `DdlMessageHandler`, `SchemaRegistry` | D1–D9, `PaimonSchemaIT` |
 | 4 | `Backfiller`, `OffsetStore`, effectively-once commit | T16, backfill tests |
 | 5 | S3 and HDFS warehouse config, docker harness | T18, T19 |
 | 6 | Vacuum/checkpoint no-op assertions, README, limitations | T9–T15, T17 |
 
 Phase 0 gates the rest: a failure in spike 1 sends §5 back to the user before any writer
-code is written.
+code is written, because the whole TOAST resolution rests on it.
 
 ## 12. Spikes to run before implementation
 
 Each can invalidate part of the design, and each is cheap.
 
-1. **Paimon sequence-group semantics** — does NULL overwrite within a group, and is the
-   comparison `>` or `>=`? Direct test against paimon-bundle 1.4.1. **Load-bearing for §5.**
-   On failure, fall back to writer-side cache-and-lookup and return to the user.
-2. **The `u` placeholder** — confirm via `pg_recvlogical` that an unchanged TOASTed column
-   arrives as `u` under `REPLICA IDENTITY FULL`, and that a short inline `text` value does
-   not. Load-bearing for §5.
-3. **PgJDBC + pgoutput + `messages 'true'`** — confirm `Message` records reach the stream
+1. **The `u` placeholder and old-tuple flattening** — on a table with a TOASTed column
+   under `REPLICA IDENTITY FULL`, use `pg_recvlogical` to confirm all three halves of §5:
+   that an UPDATE which does not touch the column sends `u` for it in the new tuple, that
+   the old tuple carries that column's full value, and that a short inline `text` value is
+   not reported as `u`. **Load-bearing for §5** — the entire TOAST resolution rests on the
+   second of the three. On failure, fall back to the `replica_identity => 'default'` escape
+   with batched lookups and return to the user.
+2. **PgJDBC + pgoutput + `messages 'true'`** — confirm `Message` records reach the stream
    through `PGReplicationStream`. Load-bearing for §4 and §6.
-4. **Commit-identifier dedup** — confirm replaying an already-committed identifier is a
+3. **Commit-identifier dedup** — confirm replaying an already-committed identifier is a
    no-op. Load-bearing for §7.
+4. **Per-change LSN exposure** — confirm `getLastReceiveLSN()` returns the LSN of the
+   change just read rather than a batch-level value, since `sequence.field` depends on it
+   being per change. Load-bearing for §7.
+5. **`-U` survival** — write `-U` and `+U` for one key with `ignore-update-before = false`
+   and `sequence.field = _seq,_op_seq`; confirm both appear in a raw pre-compaction read
+   (what `PaimonFeatureTest` asserts) and that the post-compaction merge keeps the `+U`.
+   Load-bearing for §5 and §7, and for T2, E2E T2 and the offload tests.
