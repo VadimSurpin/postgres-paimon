@@ -14,8 +14,19 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.StreamTableScan;
+
 import java.io.File;
 import java.sql.*;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import org.junit.jupiter.api.Test;
 import java.util.*;
 
 /**
@@ -44,16 +55,22 @@ import java.util.*;
  */
 public class PaimonDdlTest {
 
-    static final String DEFAULT_WAREHOUSE = "/tmp/paimon-warehouse";
+    static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
     static final String DEFAULT_JDBC =
-        "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=";
+        env("PGPAIMON_IT_JDBC_URL", "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=");
 
     static String warehouse;
     static String jdbcUrl;
     static LocalFileIO fileIO = LocalFileIO.create();
     static int passed = 0, failed = 0;
+    static final List<String> failures = new ArrayList<>();
 
     public static void main(String[] args) throws Exception {
+        System.exit(run(args) > 0 ? 1 : 0);
+    }
+
+    static int run(String[] args) throws Exception {
+        passed = 0; failed = 0; failures.clear();
         warehouse = args.length > 0 ? args[0] : DEFAULT_WAREHOUSE;
         jdbcUrl   = args.length > 1 ? args[1] : DEFAULT_JDBC;
 
@@ -77,7 +94,21 @@ public class PaimonDdlTest {
         System.out.println();
         System.out.println("═".repeat(52));
         System.out.printf("  Results: %d passed, %d failed%n", passed, failed);
-        System.exit(failed > 0 ? 1 : 0);
+        return failed;
+    }
+
+    /** Surefire entry point: the harness exports the stack's location. */
+    @Test
+    void acceptanceSuite() throws Exception {
+        String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
+        String wh = System.getenv("PGPAIMON_IT_WAREHOUSE");
+        if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
+            assertNotNull(jdbc, "harness did not export PGPAIMON_IT_JDBC_URL");
+            assertNotNull(wh, "harness did not export PGPAIMON_IT_WAREHOUSE");
+        }
+        assumeTrue(jdbc != null && wh != null, "no live stack: run test/slot-acceptance/run_acceptance.sh");
+        int failedChecks = run(new String[0]);
+        assertEquals(0, failedChecks, "failed checks: " + failures);
     }
 
     // ── D1: DROP TABLE ───────────────────────────────────────────────────────
@@ -94,7 +125,7 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(2,'b')");
         }
         waitForParquet(tbl, 1);
@@ -125,7 +156,7 @@ public class PaimonDdlTest {
         boolean recreateOk = true;
         try (Connection conn = connect()) {
             disableMeta(conn);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'re-a'),(2,'re-b'),(3,'re-c')");
         } catch (Exception e) {
             recreateOk = false;
@@ -149,7 +180,7 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20),(3,30),(4,40),(5,50)");
         }
         waitForParquet(tbl, 1);
@@ -197,10 +228,10 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
         }
-        waitForFile(new File(warehouse + "/" + tbl + "/schema/schema-0"));
+        waitForFile(new File(tableDir(tbl) + "/schema/schema-0"));
         waitForParquet(tbl, 1);
         Thread.sleep(500);
 
@@ -255,11 +286,10 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl +
-                       " (id INT PRIMARY KEY, v INT, extra TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT, extra TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10,'a'),(2,20,'b')");
         }
-        waitForFile(new File(warehouse + "/" + tbl + "/schema/schema-0"));
+        waitForFile(new File(tableDir(tbl) + "/schema/schema-0"));
         waitForParquet(tbl, 1);
         Thread.sleep(500);
 
@@ -306,11 +336,10 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl +
-                       " (id INT PRIMARY KEY, v_old INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v_old INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,100),(2,200)");
         }
-        waitForFile(new File(warehouse + "/" + tbl + "/schema/schema-0"));
+        waitForFile(new File(tableDir(tbl) + "/schema/schema-0"));
         waitForParquet(tbl, 1);
         Thread.sleep(500);
 
@@ -352,11 +381,10 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl +
-                       " (id INT PRIMARY KEY, v SMALLINT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v SMALLINT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
         }
-        waitForFile(new File(warehouse + "/" + tbl + "/schema/schema-0"));
+        waitForFile(new File(tableDir(tbl) + "/schema/schema-0"));
         waitForParquet(tbl, 1);
         Thread.sleep(500);
 
@@ -411,7 +439,15 @@ public class PaimonDdlTest {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             // Create WITHOUT a primary key so we can attempt to add one
-            exec(conn, "CREATE TABLE " + tbl + " (id INT, v TEXT) USING paimon_heap");
+            exec(conn, "CREATE TABLE " + tbl + " (id INT, v TEXT)");
+            // Slot architecture: a table without a primary key cannot be tracked at all
+            // (add_table refuses it), so it stays untracked and the assertions below run
+            // against that. See the Task 15 report: D7 needs Task 16.
+            try {
+                exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
+            } catch (SQLException e) {
+                System.out.println("  note: add_table refused the key-less table: " + e.getMessage());
+            }
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a')");
         }
 
@@ -448,8 +484,7 @@ public class PaimonDdlTest {
         try (Connection conn = connect()) {
             disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl +
-                       " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a')");
         }
 
@@ -584,13 +619,11 @@ public class PaimonDdlTest {
     }
 
     static void disableMeta(Connection c) throws SQLException {
-        exec(c, "SET paimon_heap.meta_field_xid = ''");
-        exec(c, "SET paimon_heap.meta_field_op  = ''");
-        exec(c, "SET paimon_heap.meta_field_tid = ''");
+        noGuc();
     }
 
     static void cleanup(String tbl) {
-        File dir = new File(warehouse + "/" + tbl);
+        File dir = new File(tableDir(tbl));
         if (dir.exists()) deleteDir(dir);
     }
 
@@ -605,8 +638,8 @@ public class PaimonDdlTest {
     }
 
     static void waitForParquet(String tbl, int minFiles) throws InterruptedException {
-        File bucketDir      = new File(warehouse + "/" + tbl + "/bucket-0");
-        File snapshotLatest = new File(warehouse + "/" + tbl + "/snapshot/LATEST");
+        File bucketDir      = new File(tableDir(tbl) + "/bucket-0");
+        File snapshotLatest = new File(tableDir(tbl) + "/snapshot/LATEST");
         long deadline = System.currentTimeMillis() + 120_000;
         while (System.currentTimeMillis() < deadline) {
             File[] f = bucketDir.listFiles((d, n) -> n.endsWith(".parquet"));
@@ -624,68 +657,108 @@ public class PaimonDdlTest {
      * — give it a generous timeout.
      */
     static boolean waitForSchemaV(String tbl, long version) throws InterruptedException {
-        File f = new File(warehouse + "/" + tbl + "/schema/schema-" + version);
+        File f = new File(tableDir(tbl) + "/schema/schema-" + version);
         long deadline = System.currentTimeMillis() + 30_000;
         while (!f.exists() && System.currentTimeMillis() < deadline) Thread.sleep(500);
         return f.exists();
     }
 
     static TableSchema readSchema(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
+        Path tablePath = new Path(tableDir(tbl));
         return new SchemaManager(fileIO, tablePath).latest()
             .orElseThrow(() -> new RuntimeException("No schema for " + tbl));
     }
 
     static PaimonRows waitAndRead(String tbl, int minTotal) throws Exception {
         waitForParquet(tbl, 1);
-        Thread.sleep(1500);
-        return readRows(tbl);
+        // The writer commits asynchronously: poll until the changelog is complete (the
+        // assertions that follow are exact, so this only waits, it never relaxes them).
+        long deadline = System.currentTimeMillis() + 60_000;
+        PaimonRows rows = readRows(tbl);
+        while (rows.total < minTotal && System.currentTimeMillis() < deadline) {
+            Thread.sleep(500);
+            rows = readRows(tbl);
+        }
+        return rows;
     }
 
     static PaimonRows readRows(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
-
-        TableSchema stored = new SchemaManager(fileIO, tablePath).latest()
-            .orElseThrow(() -> new RuntimeException("No schema for " + tbl));
-        Map<String, String> opts = new HashMap<>(stored.options());
-        opts.put("bucket", "-1");
-        opts.remove("merge-engine");
-        opts.remove("changelog-producer");
-        opts.remove("sequence.field");
-
-        List<DataField> fields = new ArrayList<>();
-        fields.add(new DataField(-1, "_row_kind", DataTypes.TINYINT().notNull()));
-        fields.addAll(stored.fields());
-
-        TableSchema schema = new TableSchema(
-            stored.id(), fields, stored.highestFieldId(),
-            stored.partitionKeys(), stored.primaryKeys(), opts, stored.comment());
-        FileStoreTable table = FileStoreTableFactory.create(fileIO, tablePath, schema);
-
-        ReadBuilder rb = table.newReadBuilder();
-        List<Split> splits = rb.newScan().plan().splits();
-
         PaimonRows result = new PaimonRows();
-        try (RecordReader<InternalRow> reader = rb.newRead().createReader(splits)) {
-            RecordReader.RecordIterator<InternalRow> batch;
-            while ((batch = reader.readBatch()) != null) {
-                InternalRow r;
-                while ((r = batch.next()) != null) {
-                    result.total++;
-                    if (!r.isNullAt(0)) result.kindCounts.merge((int) r.getByte(0), 1L, Long::sum);
+        try {
+            Options o = new Options();
+            o.set("warehouse", warehouse);
+            try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+                /* Row kinds come from the $audit_log system table over a streaming scan: Paimon
+                 * stores the kind as the reserved _VALUE_KIND, so a batch read (merged, or with
+                 * a faked _row_kind column) cannot report it.  Column 0 is the kind as a string. */
+                Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+                    .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
+                StreamTableScan scan = al.newReadBuilder().newStreamScan();
+                scan.plan();                          // the first plan() is always empty: discard
+                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+                    .snapshotManager().latestSnapshotId();
+                List<Split> splits = new ArrayList<>();
+                for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {
+                    splits.addAll(scan.plan().splits());
                 }
-                batch.releaseBatch();
+                try (RecordReader<InternalRow> reader = al.newReadBuilder().newRead().createReader(splits)) {
+                    reader.forEachRemaining(r -> {
+                        result.total++;
+                        result.kindCounts.merge(kindOf(r.getString(0).toString()), 1L, Long::sum);
+                    });
+                }
             }
         } catch (Exception e) {
-            System.err.println("  warn: row read failed for " + tbl + ": " + e.getMessage());
+            System.err.println("  warn: row-kind read failed for " + tbl + ": " + e.getMessage());
         }
         return result;
+    }
+
+    /** $audit_log's rowkind string to the ordinal the assertions use: +I 0, -U 1, +U 2, -D 3. */
+    static int kindOf(String k) {
+        switch (k) {
+            case "+I": return 0;
+            case "-U": return 1;
+            case "+U": return 2;
+            case "-D": return 3;
+            default: throw new IllegalStateException("unknown row kind " + k);
+        }
     }
 
     static class PaimonRows {
         long total = 0;
         Map<Integer, Long> kindCounts = new HashMap<>();
         long ofKind(int k) { return kindCounts.getOrDefault(k, 0L); }
+    }
+
+
+    // ── Slot-architecture setup helpers (the only thing the port changes) ─────
+
+    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    static void createTracked(Connection conn, String tbl, String columns) throws Exception {
+        exec(conn, "DROP TABLE IF EXISTS " + tbl);
+        exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
+        exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
+    }
+
+    /** Paimon's filesystem catalog nests tables under <database>.db/. */
+    static String tableDir(String tbl) {
+        return warehouse + "/default.db/" + tbl;
+    }
+
+    static boolean gucNoteLogged = false;
+
+    /** paimon_heap.* GUCs no longer exist: metadata columns are writer-side configuration. */
+    static void noGuc() {
+        if (!gucNoteLogged) {
+            gucNoteLogged = true;
+            System.out.println("  note: paimon_heap.* GUCs are no-ops in the slot architecture");
+        }
+    }
+
+    static String env(String name, String dflt) {
+        String v = System.getenv(name);
+        return v != null ? v : dflt;
     }
 
     static void check(String name, boolean condition) {
@@ -695,6 +768,7 @@ public class PaimonDdlTest {
         } else {
             System.out.printf("  FAIL  %s%n", name);
             failed++;
+            failures.add(name);
         }
     }
 }

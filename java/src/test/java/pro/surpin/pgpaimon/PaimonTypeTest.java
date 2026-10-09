@@ -14,8 +14,19 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.StreamTableScan;
+
 import java.io.File;
 import java.sql.*;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import org.junit.jupiter.api.Test;
 import java.util.*;
 
 /**
@@ -37,14 +48,15 @@ import java.util.*;
  */
 public class PaimonTypeTest {
 
-    static final String DEFAULT_WAREHOUSE = "/tmp/paimon-warehouse";
+    static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
     static final String DEFAULT_JDBC =
-        "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=";
+        env("PGPAIMON_IT_JDBC_URL", "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=");
 
     static String warehouse;
     static String jdbcUrl;
     static LocalFileIO fileIO = LocalFileIO.create();
     static int passed = 0, failed = 0;
+    static final List<String> failures = new ArrayList<>();
 
     record TypeCase(String colType, String pgType, String insertVal, String expectedPaimonType) {}
 
@@ -68,6 +80,11 @@ public class PaimonTypeTest {
     };
 
     public static void main(String[] args) throws Exception {
+        System.exit(run(args) > 0 ? 1 : 0);
+    }
+
+    static int run(String[] args) throws Exception {
+        passed = 0; failed = 0; failures.clear();
         warehouse = args.length > 0 ? args[0] : DEFAULT_WAREHOUSE;
         jdbcUrl   = args.length > 1 ? args[1] : DEFAULT_JDBC;
 
@@ -85,7 +102,21 @@ public class PaimonTypeTest {
         System.out.println();
         System.out.println("═".repeat(52));
         System.out.printf("  Results: %d passed, %d failed%n", passed, failed);
-        System.exit(failed > 0 ? 1 : 0);
+        return failed;
+    }
+
+    /** Surefire entry point: the harness exports the stack's location. */
+    @Test
+    void acceptanceSuite() throws Exception {
+        String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
+        String wh = System.getenv("PGPAIMON_IT_WAREHOUSE");
+        if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
+            assertNotNull(jdbc, "harness did not export PGPAIMON_IT_JDBC_URL");
+            assertNotNull(wh, "harness did not export PGPAIMON_IT_WAREHOUSE");
+        }
+        assumeTrue(jdbc != null && wh != null, "no live stack: run test/slot-acceptance/run_acceptance.sh");
+        int failedChecks = run(new String[0]);
+        assertEquals(0, failedChecks, "failed checks: " + failures);
     }
 
     static void testAllTypesInOneTable() throws Exception {
@@ -94,10 +125,9 @@ public class PaimonTypeTest {
         try (Connection conn = connect()) {
             disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            StringBuilder ddl = new StringBuilder("CREATE TABLE " + tbl + " (id INT PRIMARY KEY");
+            StringBuilder ddl = new StringBuilder("id INT PRIMARY KEY");
             for (TypeCase tc : CASES) ddl.append(", ").append(tc.colType).append(" ").append(tc.pgType);
-            ddl.append(") USING paimon_heap");
-            exec(conn, ddl.toString());
+            createTracked(conn, tbl, ddl.toString());
 
             StringBuilder ins = new StringBuilder("INSERT INTO " + tbl + " (id");
             for (TypeCase tc : CASES) ins.append(", ").append(tc.colType);
@@ -140,8 +170,7 @@ public class PaimonTypeTest {
         try (Connection conn = connect()) {
             disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl +
-                " (id INT PRIMARY KEY, c_int INT, c_text TEXT, c_date DATE) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, c_int INT, c_text TEXT, c_date DATE");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1, NULL, NULL, NULL)");
             exec(conn, "INSERT INTO " + tbl + " VALUES (2, 42, 'not null', '2024-01-01')");
         }
@@ -167,7 +196,7 @@ public class PaimonTypeTest {
         try (Connection conn = connect()) {
             disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, " + colName + " " + pgType + ") USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, " + colName + " " + pgType + "");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1, " + value + ")");
         }
         waitForParquet(tbl, 1);
@@ -187,13 +216,11 @@ public class PaimonTypeTest {
     }
 
     static void disableMetaFields(Connection c) throws SQLException {
-        exec(c, "SET paimon_heap.meta_field_xid = ''");
-        exec(c, "SET paimon_heap.meta_field_op  = ''");
-        exec(c, "SET paimon_heap.meta_field_tid = ''");
+        noGuc();
     }
 
     static void cleanup(String tbl) {
-        File dir = new File(warehouse + "/" + tbl);
+        File dir = new File(tableDir(tbl));
         if (dir.exists()) deleteDir(dir);
     }
 
@@ -203,8 +230,8 @@ public class PaimonTypeTest {
     }
 
     static void waitForParquet(String tbl, int minFiles) throws InterruptedException {
-        File bucketDir      = new File(warehouse + "/" + tbl + "/bucket-0");
-        File snapshotLatest = new File(warehouse + "/" + tbl + "/snapshot/LATEST");
+        File bucketDir      = new File(tableDir(tbl) + "/bucket-0");
+        File snapshotLatest = new File(tableDir(tbl) + "/snapshot/LATEST");
         long deadline = System.currentTimeMillis() + 120_000;
         while (System.currentTimeMillis() < deadline) {
             File[] f = bucketDir.listFiles((d, n) -> n.endsWith(".parquet"));
@@ -215,45 +242,62 @@ public class PaimonTypeTest {
     }
 
     static TableSchema readSchema(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
+        Path tablePath = new Path(tableDir(tbl));
         return new SchemaManager(fileIO, tablePath).latest()
             .orElseThrow(() -> new RuntimeException("No schema: " + tbl));
     }
 
     static long countRows(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
-
-        TableSchema stored = readSchema(tbl);
-        Map<String, String> opts = new HashMap<>(stored.options());
-        opts.put("bucket", "-1");
-        opts.remove("merge-engine");
-        opts.remove("changelog-producer");
-        opts.remove("sequence.field");
-
-        List<DataField> fields = new ArrayList<>();
-        fields.add(new DataField(-1, "_row_kind", DataTypes.TINYINT().notNull()));
-        fields.addAll(stored.fields());
-
-        TableSchema schema = new TableSchema(
-            stored.id(), fields, stored.highestFieldId(),
-            stored.partitionKeys(), stored.primaryKeys(), opts, stored.comment());
-        FileStoreTable table = FileStoreTableFactory.create(fileIO, tablePath, schema);
-
-        ReadBuilder rb = table.newReadBuilder();
-        List<Split> splits = rb.newScan().plan().splits();
-
         long count = 0;
-        try (RecordReader<InternalRow> reader = rb.newRead().createReader(splits)) {
-            RecordReader.RecordIterator<InternalRow> batch;
-            while ((batch = reader.readBatch()) != null) {
-                InternalRow r;
-                while ((r = batch.next()) != null) count++;
-                batch.releaseBatch();
+        try {
+            Options o = new Options();
+            o.set("warehouse", warehouse);
+            try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+                /* A plain batch read of the table: each primary key surfaces once, which for an
+                 * insert-only table is exactly the number of rows inserted. */
+                Table t = catalog.getTable(Identifier.create("default", tbl));
+                ReadBuilder rb = t.newReadBuilder();
+                try (RecordReader<InternalRow> reader = rb.newRead().createReader(rb.newScan().plan())) {
+                    RecordReader.RecordIterator<InternalRow> batch;
+                    while ((batch = reader.readBatch()) != null) {
+                        while (batch.next() != null) count++;
+                        batch.releaseBatch();
+                    }
+                }
             }
         } catch (Exception e) {
             System.err.println("  warn: read failed for " + tbl + ": " + e.getMessage());
         }
         return count;
+    }
+
+    // ── Slot-architecture setup helpers (the only thing the port changes) ─────
+
+    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    static void createTracked(Connection conn, String tbl, String columns) throws Exception {
+        exec(conn, "DROP TABLE IF EXISTS " + tbl);
+        exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
+        exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
+    }
+
+    /** Paimon's filesystem catalog nests tables under <database>.db/. */
+    static String tableDir(String tbl) {
+        return warehouse + "/default.db/" + tbl;
+    }
+
+    static boolean gucNoteLogged = false;
+
+    /** paimon_heap.* GUCs no longer exist: metadata columns are writer-side configuration. */
+    static void noGuc() {
+        if (!gucNoteLogged) {
+            gucNoteLogged = true;
+            System.out.println("  note: paimon_heap.* GUCs are no-ops in the slot architecture");
+        }
+    }
+
+    static String env(String name, String dflt) {
+        String v = System.getenv(name);
+        return v != null ? v : dflt;
     }
 
     static void check(String name, boolean condition) {
@@ -263,6 +307,7 @@ public class PaimonTypeTest {
         } else {
             System.out.printf("  FAIL  %s%n", name);
             failed++;
+            failures.add(name);
         }
     }
 }

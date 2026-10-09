@@ -92,11 +92,13 @@ load_extension() {
 start_writer() {
   echo ">> starting writer (log: $RUN/writer.log)"
   # flush interval 500ms (default 1000): halves the smoke test's wait without making tiny commits
+  # _xid is optional and off by default (spec section 6); PaimonFeatureTest T4 asserts it is in the schema.
   # PGPAIMON_COMMIT_USER is left to its default (paimon-writer-<slot>): it must be stable.
   PGPAIMON_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB" \
   PGPAIMON_USER="$PGUSER" PGPAIMON_PASSWORD="" \
   PGPAIMON_SLOT="$SLOT" PGPAIMON_WAREHOUSE="$WAREHOUSE" \
   PGPAIMON_FLUSH_MAX_INTERVAL_MS=500 \
+  PGPAIMON_XID_FIELD=_xid \
     nohup java -jar "$JAR" >"$RUN/writer.log" 2>&1 &
   WRITER_PID=$!
   echo "$WRITER_PID" >"$RUN/writer.pid"
