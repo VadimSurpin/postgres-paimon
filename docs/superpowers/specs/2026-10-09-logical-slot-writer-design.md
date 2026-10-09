@@ -588,13 +588,18 @@ startup cost is one query, independent of how much WAL the slot is holding.
   the same table. The §5 escape exists for tables that cannot afford it.
 - `paimon.add_table()` briefly takes an `ACCESS EXCLUSIVE` lock to set the replica
   identity. Main's `SET ACCESS METHOD` took one too, so this is not a regression.
-- **A table cannot be added once the writer's slot exists.** `add_table()` succeeds and sets
-  `backfill_due`, but a running writer never backfills it and a restart refuses to start, saying
-  so. This is a v1 limitation, not a bug: a correct backfill must read a snapshot at a known LSN
-  and then suppress streamed changes for that table from before that point, and the slot's stream
-  is shared by every tracked table. Refusing loudly is deliberate — the alternative is a table
-  whose Paimon copy silently begins mid-history. The operator's recourse is to stop the writer,
-  drop and recreate the slot, and let the first start backfill every registered table together.
+- **A *non-empty* table cannot be added once the writer's slot exists.** `add_table()` sets
+  `backfill_due` from whether the table actually has rows, under the `SHARE ROW EXCLUSIVE` lock it
+  already holds — which conflicts with `ROW EXCLUSIVE`, so no concurrent write can commit between
+  the check and the registry row. An **empty** table therefore registers fine against a live
+  writer: backfill exists to copy rows committed before streaming began, an empty table has none,
+  and the `create` message travels through the slot so the running writer tracks it immediately.
+  A **non-empty** table still cannot be added, and a restart refuses to start rather than
+  proceeding: a correct backfill would have to read a snapshot at a known LSN and then suppress
+  streamed changes for that table from before that point, and the slot's stream is shared by every
+  tracked table. Refusing loudly is deliberate — the alternative is a table whose Paimon copy
+  silently begins mid-history. The recourse is to stop the writer, drop and recreate the slot, and
+  let the first start backfill every registered table together.
 - A crash after some tables are marked backfilled but before others leaves a state that needs
   manual re-registration, for the same reason.
 
