@@ -121,6 +121,9 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: % is already tracked', rel;
     END IF;
 
+    -- Lock before reading pk/cols so a concurrent ADD COLUMN cannot leave stale cols in the registry.
+    EXECUTE format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE', rel::text);
+
     v_pk := paimon.pk_cols(v_relid);
     IF cardinality(v_pk) = 0 THEN
         RAISE EXCEPTION 'paimon_slot: % has no primary key', rel
@@ -158,6 +161,8 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM paimon.table_registry WHERE relid = rel::oid) THEN
         RAISE EXCEPTION 'paimon_slot: % is not tracked', rel;
     END IF;
+    -- Order is add_table in reverse: leave the publication while the registry row still exists,
+    -- so the DDL event trigger still recognises the table; only then delete the row.
     EXECUTE format('ALTER PUBLICATION paimon_pub DROP TABLE %s', rel::text);
     DELETE FROM paimon.table_registry WHERE relid = rel::oid;
 END $$;
@@ -172,8 +177,11 @@ BEGIN
     FOR r IN
         SELECT data FROM pg_logical_slot_get_changes('paimon_test', NULL, NULL)
     LOOP
-        IF r.data LIKE 'message: transactional:%prefix: paimon%' THEN
+        IF r.data LIKE 'message: transactional:%prefix: paimon, sz:%' THEN
             RETURN NEXT substring(r.data from position('content:' in r.data) + 8)::jsonb;
         END IF;
     END LOOP;
 END $$;
+
+-- Test-only: destructively drains slot paimon_test, so keep it away from non-superusers.
+REVOKE ALL ON FUNCTION paimon.peek_messages() FROM PUBLIC;

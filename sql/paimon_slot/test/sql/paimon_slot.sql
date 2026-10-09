@@ -1,3 +1,4 @@
+\set VERBOSITY terse
 CREATE EXTENSION paimon_slot;
 
 -- type mapping, mirroring extension/type_map_pg.h
