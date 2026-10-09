@@ -49,3 +49,36 @@ SELECT paimon.pk_cols('no_pk_t'::regclass) AS pk,
 CREATE TABLE no_cols_t ();
 SELECT paimon.table_cols('no_cols_t'::regclass) AS cols,
        paimon.table_cols('no_cols_t'::regclass) IS NULL AS is_null;
+
+-- add_table requires a primary key
+CREATE TABLE nopk (a int);
+SELECT paimon.add_table('nopk'::regclass);        -- expect ERROR
+
+-- the v1 escapes are accepted but not implemented
+SELECT paimon.add_table('reg_t'::regclass, 'default');          -- expect ERROR
+SELECT paimon.add_table('reg_t'::regclass, 'full', 'lookup');   -- expect ERROR
+
+-- happy path
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon', 'pgoutput');
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+SELECT paimon.add_table('reg_t'::regclass);
+SELECT schema_name, table_name, pk_cols, backfill_due, replica_identity, changelog_producer
+FROM paimon.table_registry WHERE relid = 'reg_t'::regclass;
+SELECT relreplident FROM pg_class WHERE oid = 'reg_t'::regclass;
+SELECT count(*) FROM pg_publication_tables
+WHERE pubname = 'paimon_pub' AND tablename = 'reg_t';
+
+-- the create message reached the slot
+SELECT (j->>'op') AS op, (j->>'table') AS tbl, (j->'cols'->0->>'name') AS first_col
+FROM (SELECT paimon.peek_messages() AS j) s;
+
+-- add_table twice is an error, not a silent no-op
+SELECT paimon.add_table('reg_t'::regclass);       -- expect ERROR
+
+-- remove_table
+SELECT paimon.remove_table('reg_t'::regclass);
+SELECT count(*) FROM paimon.table_registry WHERE relid = 'reg_t'::regclass;
+SELECT count(*) FROM pg_publication_tables
+WHERE pubname = 'paimon_pub' AND tablename = 'reg_t';
+SELECT pg_drop_replication_slot('paimon');
+SELECT pg_drop_replication_slot('paimon_test');

@@ -77,3 +77,103 @@ RETURNS text[] LANGUAGE sql STABLE AS $$
     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
     WHERE c.conrelid = relid AND c.contype = 'p';
 $$;
+
+CREATE PUBLICATION paimon_pub;
+
+CREATE FUNCTION paimon.emit(payload jsonb) RETURNS void
+LANGUAGE sql AS $$
+    SELECT pg_logical_emit_message(true, 'paimon', payload::text);
+$$;
+
+CREATE FUNCTION paimon.add_table(rel regclass,
+                                 replica_identity text DEFAULT 'full',
+                                 changelog_producer text DEFAULT 'input')
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_relid  oid  := rel::oid;
+    v_nsp    text;
+    v_name   text;
+    v_pk     text[];
+    v_cols   jsonb;
+    v_kind   "char";
+BEGIN
+    IF replica_identity <> 'full' THEN
+        RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
+                        replica_identity
+              USING HINT = 'only ''full'' is supported; see design spec section 5';
+    END IF;
+    IF changelog_producer <> 'input' THEN
+        RAISE EXCEPTION 'paimon_slot: changelog_producer => % is not implemented in v1',
+                        changelog_producer
+              USING HINT = 'only ''input'' is supported; see design spec section 5';
+    END IF;
+
+    SELECT n.nspname, c.relname, c.relkind
+      INTO v_nsp, v_name, v_kind
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = v_relid;
+
+    IF v_kind <> 'r' THEN
+        RAISE EXCEPTION 'paimon_slot: % is not an ordinary table (relkind %)', rel, v_kind;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM paimon.table_registry WHERE relid = v_relid) THEN
+        RAISE EXCEPTION 'paimon_slot: % is already tracked', rel;
+    END IF;
+
+    v_pk := paimon.pk_cols(v_relid);
+    IF cardinality(v_pk) = 0 THEN
+        RAISE EXCEPTION 'paimon_slot: % has no primary key', rel
+              USING HINT = 'a primary key is required; see design spec section 4';
+    END IF;
+
+    v_cols := paimon.table_cols(v_relid);
+
+    -- ORDER IS LOAD-BEARING: do both ALTERs BEFORE inserting the registry row.
+    -- The ddl_command_end event trigger decides what to emit by looking the
+    -- table up in paimon.table_registry.  With no row yet it stays silent about
+    -- these two ALTERs.  Insert the row first and the trigger sees our own
+    -- ALTER TABLE as a change to a tracked table, emits a spurious message and
+    -- may trip the PK guardrail from inside the statement that establishes the
+    -- table.  Do not "tidy" this order.
+    EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', rel::text);
+    EXECUTE format('ALTER PUBLICATION paimon_pub ADD TABLE %s', rel::text);
+
+    INSERT INTO paimon.table_registry
+        (relid, schema_name, table_name, pk_cols, cols,
+         backfill_due, replica_identity, changelog_producer)
+    VALUES (v_relid, v_nsp, v_name, v_pk, v_cols,
+            true, replica_identity, changelog_producer);
+
+    PERFORM paimon.emit(jsonb_build_object(
+        'v', 1, 'op', 'create', 'relid', v_relid,
+        'schema', v_nsp, 'table', v_name,
+        'pk', to_jsonb(v_pk), 'cols', v_cols,
+        'options', jsonb_build_object('changelog-producer', changelog_producer)));
+END $$;
+
+CREATE FUNCTION paimon.remove_table(rel regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM paimon.table_registry WHERE relid = rel::oid) THEN
+        RAISE EXCEPTION 'paimon_slot: % is not tracked', rel;
+    END IF;
+    EXECUTE format('ALTER PUBLICATION paimon_pub DROP TABLE %s', rel::text);
+    DELETE FROM paimon.table_registry WHERE relid = rel::oid;
+END $$;
+
+-- Test helper: decode paimon-prefixed logical messages through a private
+-- test_decoding slot.  Not used by the writer.
+CREATE FUNCTION paimon.peek_messages() RETURNS SETOF jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT data FROM pg_logical_slot_get_changes('paimon_test', NULL, NULL)
+    LOOP
+        IF r.data LIKE 'message: transactional:%prefix: paimon%' THEN
+            RETURN NEXT substring(r.data from position('content:' in r.data) + 8)::jsonb;
+        END IF;
+    END LOOP;
+END $$;
