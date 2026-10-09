@@ -392,6 +392,86 @@ SELECT paimon.peek_messages() - 'relid';
 ----------
 (0 rows)
 
+-- combined actions are judged on the statement's net effect
+CREATE TABLE combo_t (id int PRIMARY KEY, b int, y int, w int, x int, k int);
+SELECT paimon.add_table('combo_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                                                                                         ?column?                                                                                                                                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT"}, {"id": 3, "name": "y", "type": "INT"}, {"id": 4, "name": "w", "type": "INT"}, {"id": 5, "name": "x", "type": "INT"}, {"id": 6, "name": "k", "type": "INT"}], "table": "combo_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+ALTER TABLE combo_t DROP COLUMN b, ADD COLUMN z int DEFAULT 5;       -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.combo_t.z)
+HINT:  add the column without a default, then UPDATE it
+ALTER TABLE combo_t DROP COLUMN y, ADD COLUMN nn int NOT NULL;       -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN ... NOT NULL without a default is not supported (public.combo_t.nn)
+ALTER TABLE combo_t DROP COLUMN w, ADD COLUMN rowkind int;           -- expect ERROR
+ERROR:  paimon_slot: column name "rowkind" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+SELECT paimon.peek_messages() - 'relid';                             -- nothing emitted
+ ?column? 
+----------
+(0 rows)
+
+SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
+WHERE attrelid = 'combo_t'::regclass AND attnum > 0 AND NOT attisdropped;
+  string_agg  
+--------------
+ id,b,y,w,x,k
+(1 row)
+
+ALTER TABLE combo_t DROP COLUMN x, ADD COLUMN w2 int;                -- allowed
+SELECT paimon.peek_messages() - 'relid';
+                                 ?column?                                 
+--------------------------------------------------------------------------
+ {"v": 1, "op": "drop_col", "name": "x"}
+ {"v": 1, "op": "add_col", "col": {"id": 7, "name": "w2", "type": "INT"}}
+(2 rows)
+
+ALTER TABLE combo_t DROP COLUMN w, ALTER COLUMN k TYPE bigint;       -- allowed
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                               
+---------------------------------------------------------------------
+ {"v": 1, "op": "drop_col", "name": "w"}
+ {"v": 1, "id": 6, "op": "alter_col", "name": "k", "type": "BIGINT"}
+(2 rows)
+
+DROP TABLE combo_t;
+SELECT paimon.peek_messages() - 'relid';
+                               ?column?                               
+----------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "combo_t", "schema": "public"}
+(1 row)
+
+-- dropping a schema emits drop_table only, no per-column messages
+CREATE SCHEMA s4;
+CREATE TABLE s4.t (id int PRIMARY KEY, a int, b int);
+SELECT paimon.add_table('s4.t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                         ?column?                                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}, {"id": 3, "name": "b", "type": "INT"}], "table": "t", "schema": "s4", "options": {"changelog-producer": "input"}}
+(1 row)
+
+DROP SCHEMA s4 CASCADE;
+NOTICE:  drop cascades to table s4.t
+SELECT paimon.peek_messages() - 'relid';
+                          ?column?                          
+------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "t", "schema": "s4"}
+(1 row)
+
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
 --------------------------

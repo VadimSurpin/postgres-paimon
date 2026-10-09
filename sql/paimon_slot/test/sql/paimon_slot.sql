@@ -144,4 +144,30 @@ SELECT count(*) FROM paimon.table_registry WHERE relid IS NOT NULL
 CREATE TABLE plain_t (id int PRIMARY KEY);
 ALTER TABLE plain_t ADD COLUMN whatever int NOT NULL DEFAULT 1;
 SELECT paimon.peek_messages() - 'relid';
+
+-- combined actions are judged on the statement's net effect
+CREATE TABLE combo_t (id int PRIMARY KEY, b int, y int, w int, x int, k int);
+SELECT paimon.add_table('combo_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE combo_t DROP COLUMN b, ADD COLUMN z int DEFAULT 5;       -- expect ERROR
+ALTER TABLE combo_t DROP COLUMN y, ADD COLUMN nn int NOT NULL;       -- expect ERROR
+ALTER TABLE combo_t DROP COLUMN w, ADD COLUMN rowkind int;           -- expect ERROR
+SELECT paimon.peek_messages() - 'relid';                             -- nothing emitted
+SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
+WHERE attrelid = 'combo_t'::regclass AND attnum > 0 AND NOT attisdropped;
+ALTER TABLE combo_t DROP COLUMN x, ADD COLUMN w2 int;                -- allowed
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE combo_t DROP COLUMN w, ALTER COLUMN k TYPE bigint;       -- allowed
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE combo_t;
+SELECT paimon.peek_messages() - 'relid';
+
+-- dropping a schema emits drop_table only, no per-column messages
+CREATE SCHEMA s4;
+CREATE TABLE s4.t (id int PRIMARY KEY, a int, b int);
+SELECT paimon.add_table('s4.t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+DROP SCHEMA s4 CASCADE;
+SELECT paimon.peek_messages() - 'relid';
+
 SELECT pg_drop_replication_slot('paimon_test');
