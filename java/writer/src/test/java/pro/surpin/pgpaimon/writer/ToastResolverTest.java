@@ -195,4 +195,61 @@ class ToastResolverTest {
                 t(v("1"), v("2"), ColumnValue.unchanged()), false,
                 t(v("1"), v("2"), ColumnValue.unchanged())), META));
     }
+
+    private List<RowKind> kinds(List<PartialRecord> out) {
+        return out.stream().map(PartialRecord::kind).toList();
+    }
+
+    /** The key is the LAST column; "compare column 0" would get both halves wrong. */
+    @Test
+    void keyColumnChoiceIsHonouredWhenKeyIsNotFirst() {
+        RelationMeta m = new RelationMeta(2, "public", "k", List.of("a", "b", "id"),
+                                          List.of(false, false, true));
+        assertEquals(List.of(RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER), kinds(r.resolve(
+            new PgEvent.Update(2, t(v("x"), v("y"), v("7")), false,
+                               t(v("X"), v("y"), v("7"))), m)));
+        assertEquals(List.of(RowKind.DELETE, RowKind.INSERT), kinds(r.resolve(
+            new PgEvent.Update(2, t(v("x"), v("y"), v("7")), false,
+                               t(v("x"), v("y"), v("8"))), m)));
+    }
+
+    /** Only the SECOND key column moves; an "only check the first key column" bug misses it. */
+    @Test
+    void twoColumnKeyWhereOnlyTheSecondKeyColumnMoves() {
+        RelationMeta m = new RelationMeta(3, "public", "k2", List.of("a", "b", "c"),
+                                          List.of(true, true, false));
+        assertEquals(List.of(RowKind.DELETE, RowKind.INSERT), kinds(r.resolve(
+            new PgEvent.Update(3, t(v("1"), v("2"), v("c")), false,
+                               t(v("1"), v("3"), v("c"))), m)));
+        assertEquals(List.of(RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER), kinds(r.resolve(
+            new PgEvent.Update(3, t(v("1"), v("2"), v("c")), false,
+                               t(v("1"), v("2"), v("d"))), m)));
+    }
+
+    /** Real PostgreSQL does not TOAST a NULL, but the branch exists; pin it. */
+    @Test
+    void unchangedColumnFilledFromAnOldNullStaysNull() {
+        List<PartialRecord> out = r.resolve(new PgEvent.Update(16412,
+            t(v("1"), v("2"), ColumnValue.ofNull()), false,
+            t(v("1"), v("3"), ColumnValue.unchanged())), META);
+        assertNull(out.get(1).values().get(2));
+    }
+
+    @Test
+    void unchangedErrorsPointAtRelreplidentToo() {
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
+            r.resolve(new PgEvent.Update(16412,
+                t(v("1"), v("2"), ColumnValue.unchanged()), false,
+                t(v("1"), v("2"), ColumnValue.unchanged())), META));
+        assertTrue(e.getMessage().contains("relreplident"), e.getMessage());
+    }
+
+    @Test
+    void relationWidthMismatchIsRejectedNotTreatedAsKeyUnchanged() {
+        RelationMeta wide = new RelationMeta(16412, "public", "t",
+            List.of("id", "n", "body", "extra"), List.of(true, false, false, true));
+        assertThrows(IllegalStateException.class, () -> r.resolve(
+            new PgEvent.Update(16412, t(v("1"), v("2"), v("b")), false,
+                               t(v("1"), v("2"), v("b"))), wide));
+    }
 }

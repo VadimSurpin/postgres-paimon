@@ -22,6 +22,12 @@ import java.util.Objects;
  */
 public final class ToastResolver {
 
+    /** Shared by every "no faithful before-image" failure so they all point at the same place. */
+    private static final String REMEDY =
+        "(its replica identity is not FULL: check pg_class.relreplident, which must be 'f';"
+        + " without it the writer cannot produce a faithful before-image;"
+        + " the table must be at REPLICA IDENTITY FULL)";
+
     public List<PartialRecord> resolve(PgEvent event, RelationMeta meta) {
         if (event instanceof PgEvent.Insert i) {
             return List.of(new PartialRecord(i.relid(), RowKind.INSERT,
@@ -75,8 +81,7 @@ public final class ToastResolver {
                 "table " + meta.namespace() + "." + meta.relName() + " sent "
                 + (old == null ? "no old tuple" : "a key-only old tuple")
                 + " for an UPDATE/DELETE: its replica identity is not FULL"
-                + " (check pg_class.relreplident; it must be 'f'), so the writer cannot"
-                + " produce a faithful before-image; the table must be at REPLICA IDENTITY FULL" + unchanged);
+                + " " + REMEDY + unchanged);
         }
     }
 
@@ -105,7 +110,7 @@ public final class ToastResolver {
                             "column '" + columnName(meta, i) + "' of " + meta.namespace()
                             + "." + meta.relName() + " arrived unchanged (an unreassembled"
                             + " TOAST pointer) and no old tuple carries its value;"
-                            + " the table must be at REPLICA IDENTITY FULL");
+                            + " " + REMEDY);
                     }
                     out.add(from.state() == ColState.NULL ? null : from.text());
                 }
@@ -118,7 +123,13 @@ public final class ToastResolver {
     private static boolean keyChanged(List<String> oldValues, List<String> newValues,
                                       RelationMeta meta) {
         List<Boolean> isKey = meta.isKey();
-        for (int i = 0; i < isKey.size() && i < oldValues.size(); i++) {
+        if (isKey.size() != oldValues.size() || isKey.size() != newValues.size()) {
+            // Concluding "key unchanged" from a width mismatch could hide a key move.
+            throw new IllegalStateException("relation " + meta.namespace() + "."
+                + meta.relName() + " describes " + isKey.size() + " columns but the tuples have "
+                + oldValues.size() + " (old) and " + newValues.size() + " (new)");
+        }
+        for (int i = 0; i < isKey.size(); i++) {
             if (!isKey.get(i)) {
                 continue;
             }
