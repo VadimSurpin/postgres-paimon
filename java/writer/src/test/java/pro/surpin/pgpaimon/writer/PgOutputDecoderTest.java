@@ -46,12 +46,14 @@ class PgOutputDecoderTest {
         PgEvent.Begin b = (PgEvent.Begin) dec.decode(
             new Msg().b('B').i64(0x16B374D8L).i64(700000L).i32(4711).buf());
         assertEquals(0x16B374D8L, b.finalLsn());
+        assertEquals(700000L, b.commitTimestamp());
         assertEquals(4711L, b.xid());
 
         PgEvent.Commit c = (PgEvent.Commit) dec.decode(
             new Msg().b('C').b(0).i64(0x16B374D8L).i64(0x16B374F0L).i64(700000L).buf());
         assertEquals(0x16B374D8L, c.commitLsn());
         assertEquals(0x16B374F0L, c.endLsn());
+        assertEquals(700000L, c.commitTimestamp());
     }
 
     @Test
@@ -119,6 +121,8 @@ class PgOutputDecoderTest {
                      .buf());
         assertTrue(u.oldIsKeyOnly());
         assertEquals("1", u.oldTuple().columns().get(0).text());
+        assertEquals(ColState.NULL, u.oldTuple().columns().get(1).state());
+        assertEquals("2", u.newTuple().columns().get(0).text());
     }
 
     @Test
@@ -137,6 +141,7 @@ class PgOutputDecoderTest {
         PgEvent.Delete d = (PgEvent.Delete) dec.decode(
             new Msg().b('D').i32(16412).b('K').i16(2).text("7").b('n').buf());
         assertEquals("7", d.oldTuple().columns().get(0).text());
+        assertTrue(d.oldIsKeyOnly());
 
         PgEvent.Truncate t = (PgEvent.Truncate) dec.decode(
             new Msg().b('T').i32(2).b(0).i32(16412).i32(16500).buf());
@@ -152,6 +157,7 @@ class PgOutputDecoderTest {
         PgEvent.Message msg = (PgEvent.Message) dec.decode(m.buf());
         assertTrue(msg.transactional());
         assertEquals("paimon", msg.prefix());
+        assertEquals(0x100L, msg.lsn());
         assertEquals("{\"v\":1,\"op\":\"create\"}",
                      new String(msg.content(), StandardCharsets.UTF_8));
     }
@@ -202,6 +208,8 @@ class PgOutputDecoderTest {
         PgEvent.TypeMsg y = (PgEvent.TypeMsg) dec.decode(
             new Msg().b('Y').i32((int) big).cstr("public").cstr("mood").buf());
         assertEquals(big, y.typeOid());
+        assertEquals("public", y.namespace());
+        assertEquals("mood", y.name());
     }
 
     @Test
@@ -284,5 +292,92 @@ class PgOutputDecoderTest {
         assertEquals(sb.toString(), oldBody.text());
         assertEquals("99", u.newTuple().columns().get(1).text());
         assertEquals(ColState.UNCHANGED, u.newTuple().columns().get(2).state());
+    }
+
+    @Test
+    void deleteWithFullOldTupleIsNotKeyOnly() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        dec.decode(relationOf(16412, "id", "v"));
+        PgEvent.Delete d = (PgEvent.Delete) dec.decode(
+            new Msg().b('D').i32(16412).b('O').i16(2).text("7").text("x").buf());
+        assertFalse(d.oldIsKeyOnly());
+        assertEquals("x", d.oldTuple().columns().get(1).text());
+    }
+
+    @Test
+    void truncateFlagBitsAreIndependent() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        PgEvent.Truncate cascade = (PgEvent.Truncate) dec.decode(
+            new Msg().b('T').i32(1).b(1).i32(5).buf());
+        assertTrue(cascade.cascade());
+        assertFalse(cascade.restartIdentity());
+        PgEvent.Truncate restart = (PgEvent.Truncate) dec.decode(
+            new Msg().b('T').i32(1).b(2).i32(5).buf());
+        assertFalse(restart.cascade());
+        assertTrue(restart.restartIdentity());
+    }
+
+    @Test
+    void badMarkersAreRejected() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        dec.decode(relationOf(16412, "id"));
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('I').i32(16412).b('X').i16(1).text("1").buf()));
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('U').i32(16412).b('X').i16(1).text("1").buf()));
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('D').i32(16412).b('N').i16(1).text("1").buf()));
+        assertThrows(java.nio.BufferUnderflowException.class,
+            () -> dec.decode(new Msg().b('D').i32(16412).buf()));
+    }
+
+    @Test
+    void negativeAndOversizedLengthsFailCleanly() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        dec.decode(relationOf(16412, "id"));
+        for (int len : new int[] { -1, 1000, Integer.MAX_VALUE }) {
+            assertThrows(IllegalStateException.class,
+                () -> dec.decode(new Msg().b('I').i32(16412).b('N').i16(1)
+                                          .b('t').i32(len).b(0x41).buf()), "text len " + len);
+            assertThrows(IllegalStateException.class,
+                () -> dec.decode(new Msg().b('M').b(1).i64(0).cstr("p").i32(len).b(1).buf()),
+                "message len " + len);
+        }
+        for (int n : new int[] { -1, 2, Integer.MAX_VALUE }) {
+            assertThrows(IllegalStateException.class,
+                () -> dec.decode(new Msg().b('T').i32(n).b(0).i32(1).buf()), "truncate n " + n);
+        }
+    }
+
+    @Test
+    void tupleWidthMustMatchCachedRelation() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        dec.decode(relationOf(16412, "id", "v"));
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('I').i32(16412).b('N').i16(1).text("1").buf()));
+        assertTrue(e.getMessage().contains("16412"));
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('D').i32(16412).b('K').i16(3)
+                                      .text("1").b('n').b('n').buf()));
+        // A relation with no cached R is not this decoder's concern.
+        PgEvent.Insert i = (PgEvent.Insert) dec.decode(
+            new Msg().b('I').i32(99).b('N').i16(1).text("1").buf());
+        assertEquals(1, i.newTuple().columns().size());
+        // A later R replaces the cached width.
+        dec.decode(relationOf(16412, "id"));
+        assertEquals(1, ((PgEvent.Insert) dec.decode(
+            new Msg().b('I').i32(16412).b('N').i16(1).text("1").buf())).newTuple().columns().size());
+    }
+
+    @Test
+    void malformedUtf8IsRejectedNotReplaced() {
+        PgOutputDecoder dec = new PgOutputDecoder();
+        dec.decode(relationOf(16412, "id"));
+        // 0xC3 0x28 is an invalid two-byte sequence.
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('I').i32(16412).b('N').i16(1)
+                                      .b('t').i32(2).b(0xC3).b(0x28).buf()));
+        assertThrows(IllegalStateException.class,
+            () -> dec.decode(new Msg().b('R').i32(1).b(0xC3).b(0x28).b(0).buf()));
     }
 }
