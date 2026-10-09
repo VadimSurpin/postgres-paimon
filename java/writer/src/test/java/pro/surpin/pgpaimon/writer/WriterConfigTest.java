@@ -86,7 +86,7 @@ class WriterConfigTest {
     }
 
     @Test
-    void relidAboveIntMaxIsHeldUnsigned() {
+    void oidAboveIntMaxIsHeldUnsignedAsLong() {
         long oid = 3_000_000_000L;
         RelationMeta m = new RelationMeta(oid, "public", "t", List.of("id"), List.of(true));
         // pgoutput binary route and DDL JSON string route land on the same value

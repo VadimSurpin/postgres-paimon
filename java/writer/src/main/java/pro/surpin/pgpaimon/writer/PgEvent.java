@@ -3,7 +3,7 @@ package pro.surpin.pgpaimon.writer;
 
 import java.util.List;
 
-/** Every relid below is an unsigned 32-bit OID widened to long; see RelationMeta. */
+/** Every relid and OID below is a long; see the OID rule in package-info. */
 public sealed interface PgEvent {
     record Begin(long finalLsn, long commitTimestamp, long xid)          implements PgEvent {}
     record Commit(long commitLsn, long endLsn, long commitTimestamp)     implements PgEvent {}
@@ -18,5 +18,5 @@ public sealed interface PgEvent {
     record Message(boolean transactional, long lsn, String prefix, byte[] content)
                                                                          implements PgEvent {}
     record Origin(long commitLsn, String name)                           implements PgEvent {}
-    record TypeMsg(int typeOid, String namespace, String name)           implements PgEvent {}
+    record TypeMsg(long typeOid, String namespace, String name)           implements PgEvent {}
 }

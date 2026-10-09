@@ -4,6 +4,6 @@ package pro.surpin.pgpaimon.writer;
 import java.util.List;
 import org.apache.paimon.types.RowKind;
 
-/** relid: unsigned 32-bit OID widened to long; see RelationMeta. */
+/** relid: a PostgreSQL OID held as long; see package-info. */
 public record SinkRecord(long relid, RowKind kind, List<String> values,
                          long seq, int opSeq, long xid) {}
