@@ -174,6 +174,23 @@ newlines. A fixture built by slicing `spike1.bin` must drop that separator byte,
 parser written against the real `PGReplicationStream` must **not** expect it (PgJDBC hands
 over one message per `ByteBuffer`, with no separator — see spike 2).
 
+**How to read the hex excerpts below.** They are `xxd`-style in *format* (8-hex-digit
+address, byte pairs, ASCII gutter) but **not** `xxd` output, and two things differ from a
+plain `xxd spike1.hex`:
+
+1. **The addresses are offsets of the message within the file, so they are not
+   16-byte-aligned rows.** Each excerpt starts at the first byte of the message, not at a
+   multiple of 16, so its rows are offset relative to the aligned rows that `xxd` or the
+   `spike1.hex` dump produce for the same bytes. Cross-checking a value against
+   `spike1.hex` means looking at the byte at that *offset*, not at the identically
+   numbered line.
+2. **The offsets are into `spike1.bin`, which contains the injected `0x0a` separators**
+   described above. They are therefore not offsets into a clean pgoutput message stream;
+   subtract one separator byte per preceding message to convert.
+
+Neither point affects the byte *values* quoted, only how to locate them. The field tables
+below are the authoritative form for building a fixture.
+
 #### `U` message for `id = 1` — the TOAST case
 
 Message span `0x1f4e8..0x3e912`, **128042 bytes**. Header plus the old tuple through the
@@ -339,17 +356,82 @@ transaction.
 `lsn=` does differ between the `kind=I` and `kind=M` lines: the `M` message is at
 `0/1C52B60` while the inserts are at `0/1C52B90` and `0/1C52DC0`–`0/1C52ED0`.
 
-Two details a later task will care about:
-
-1. **The first change of a transaction shares its LSN with that transaction's `B`
-   message** (`B` and the first `I` are both `0/1C52DC0`; likewise `B` and `I` at
-   `0/1C52B90`, and `B` and `M` at `0/1C52B60`). So an LSN is unique *per change* but is
-   not unique across *message kinds* — do not use it as a global key without the kind.
-2. **A `Relation` (`R`) message reports `LSN{0/0}`.** `getLastReceiveLSN()` is therefore
-   not monotonic across all messages, and the writer must not feed an `R` message's LSN
-   into `_seq`, nor use it to advance the flush position.
-
 ### Verdict: **CONFIRMED**
+
+### Two further properties, confirmed by a second dedicated run
+
+The single run above showed one `R` message and would have supported the two claims below
+only anecdotally. Because both are load-bearing for Tasks 10 and 12, they were re-tested
+on a **separate slot (`s3`) and publication (`p2`) over three tables (`t2`, `t3`, `t4`),
+across five explicit transactions**, so that several `R` messages and several
+transaction-opening changes of differing kinds were observed. Source:
+`$SPIKE/jdbc/Spike4b.java` (identical to `Spike2.java` apart from the slot, the
+publication and the loop count); output `$SPIKE/spike4b.txt`.
+
+```bash
+psql -p 5440 -h 127.0.0.1 -U postgres -d spike <<'SQL'
+BEGIN; INSERT INTO t2 VALUES (1,'a'); INSERT INTO t2 VALUES (2,'b'); COMMIT;
+BEGIN; INSERT INTO t3 VALUES (1,'c'); INSERT INTO t2 VALUES (3,'d'); COMMIT;
+BEGIN; UPDATE t2 SET v='z' WHERE id=1; UPDATE t2 SET v='y' WHERE id=2; COMMIT;
+BEGIN; INSERT INTO t4 VALUES (1,'e'),(2,'f'),(3,'g'); COMMIT;
+BEGIN; DELETE FROM t2 WHERE id=3; INSERT INTO t3 VALUES (2,'h'); COMMIT;
+SQL
+```
+
+Complete output:
+
+```
+kind=B lsn=LSN{0/1C93020} remaining=21
+kind=R lsn=LSN{0/0} remaining=41
+kind=I lsn=LSN{0/1C93020} remaining=20
+kind=I lsn=LSN{0/1C93100} remaining=20
+kind=C lsn=LSN{0/1C931B0} remaining=26
+kind=B lsn=LSN{0/1C931B0} remaining=21
+kind=R lsn=LSN{0/0} remaining=41
+kind=I lsn=LSN{0/1C931B0} remaining=20
+kind=I lsn=LSN{0/1C93290} remaining=20
+kind=C lsn=LSN{0/1C93340} remaining=26
+kind=B lsn=LSN{0/1C93340} remaining=21
+kind=U lsn=LSN{0/1C93340} remaining=35
+kind=U lsn=LSN{0/1C93398} remaining=35
+kind=C lsn=LSN{0/1C93420} remaining=26
+kind=B lsn=LSN{0/1C93420} remaining=21
+kind=R lsn=LSN{0/0} remaining=41
+kind=I lsn=LSN{0/1C93420} remaining=20
+kind=I lsn=LSN{0/1C93500} remaining=20
+kind=I lsn=LSN{0/1C93580} remaining=20
+kind=C lsn=LSN{0/1C93630} remaining=26
+kind=B lsn=LSN{0/1C93630} remaining=21
+kind=D lsn=LSN{0/1C93630} remaining=20
+kind=I lsn=LSN{0/1C93678} remaining=20
+kind=C lsn=LSN{0/1C93728} remaining=26
+```
+
+**1. A `Relation` (`R`) message reports `LSN{0/0}`.** All **three** `R` messages in this
+run did, one per table. `getLastReceiveLSN()` is therefore not monotonic across all
+message kinds; the writer must not feed an `R` message's LSN into `_seq`, nor use it to
+advance the flush position. (Confirmed for `R` across 3 observations plus the 1 in spike 2
+— 4 in total. Not tested for message kinds this project does not enable, such as the
+streaming `S`/`E` family or `O`/`T`.)
+
+**2. The first change of a transaction shares its LSN with that transaction's `B`
+message.** True in **all five** transactions, and for three different first-change kinds:
+
+| txn | `B` LSN | first change | its LSN | equal? |
+| --- | --- | --- | --- | --- |
+| 1 | `0/1C93020` | `I` | `0/1C93020` | yes |
+| 2 | `0/1C931B0` | `I` | `0/1C931B0` | yes |
+| 3 | `0/1C93340` | `U` | `0/1C93340` | yes |
+| 4 | `0/1C93420` | `I` | `0/1C93420` | yes |
+| 5 | `0/1C93630` | `D` | `0/1C93630` | yes |
+
+So an LSN is unique *per change* but is **not** unique across *message kinds* — do not use
+it as a global key without the kind. The same run also shows each `C`'s LSN equal to the
+*next* `B`'s LSN (`0/1C931B0`, `0/1C93340`, `0/1C93420`, `0/1C93630`), i.e. four more
+instances of the same "LSN shared across kinds" effect.
+
+Within every transaction the change LSNs remain strictly increasing, so spike 4's primary
+conclusion is unaffected by either property.
 
 ---
 
@@ -413,25 +495,173 @@ after other commitUser:      snapshot=3 rows=2 [(1,a,100,0), (2,b,101,0)]
 - A fresh identifier (43) returns 1 and commits normally, so the filter is not simply
   swallowing everything.
 - The same identifier 42 under a **different** `commitUser` returns 1 and **does** commit
-  (snapshot 3). Dedup state is per-`commitUser`, tracked through the committed snapshots'
-  identifiers for that user.
+  (snapshot 3). Dedup state is therefore per-`commitUser`.
 
-### Verdict: **CONFIRMED WITH CAVEAT**
+#### How the replay was performed — this matters for reading the result
 
-The idempotent-replay property the design relies on is real, but it is **not** a property
-of `commit(identifier, messages)` — that method the brief used does not dedup and
-duplicates both data and changelog on replay. Task 13 and Task 11 must commit through
-`TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)` and must use a
-`commitUser` that is **stable across process restarts** (a random per-process UUID would
-silently defeat the dedup, as the `other-user` case above shows).
+The `filterAndCommit` attempt did **not** reuse the original `CommitMessage` objects, and
+did **not** reuse the original committer. Each attempt in `Spike3b` opens a **fresh
+`TableWriteImpl`** and a **fresh `TableCommitImpl`**, re-writes the same row, and calls
+`prepareCommit(false, 42L)` again, so the `CommitMessage` list is a **newly produced one
+describing newly written data files**. That is deliberate: it is the shape a real crash
+recovery takes, where the process has restarted and nothing in memory survived. The dedup
+therefore cannot be relying on object identity or on a cached committable — it is keyed on
+`(commitUser, commitIdentifier)` alone.
+
+#### What the snapshots record
+
+Reading the snapshot metadata directly shows what the filter has to work from — each
+snapshot stores the `commitUser` and `commitIdentifier` that produced it:
+
+```
+=== snapshot-1 ===            === snapshot-2 ===            === snapshot-3 ===
+  id = 1                        id = 2                        id = 3
+  commitUser = 'spike-user'     commitUser = 'spike-user'     commitUser = 'other-user'
+  commitIdentifier = 42         commitIdentifier = 43         commitIdentifier = 42
+  commitKind = 'APPEND'         commitKind = 'APPEND'         commitKind = 'APPEND'
+```
+
+This is consistent with dedup being decided from the committed snapshots' recorded
+`(commitUser, commitIdentifier)` pairs — identifier 42 already present for `spike-user`
+was filtered, while identifier 42 for `other-user` was not. I did not read Paimon's
+implementation to confirm *how* it searches those snapshots (how far back it scans, or
+what it does once snapshots are expired), so treat the mechanism as observed behaviour
+rather than a documented contract. **A later task that expires snapshots aggressively
+should re-verify that replay is still deduplicated.**
+
+#### `Spike3b.java` source
+
+```java
+import org.apache.paimon.catalog.*;
+import org.apache.paimon.data.*;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.*;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.types.*;
+import java.util.*;
+
+/** Spike 3b: does commit-identifier dedup happen, and through which entry point? */
+public class Spike3b {
+  static FileStoreTable t;
+
+  public static void main(String[] a) throws Exception {
+    Options o = new Options();
+    o.set("warehouse", a[0]);
+    Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
+    cat.createDatabase("db", true);
+    Schema s = Schema.newBuilder()
+        .column("id", DataTypes.INT().notNull())
+        .column("v", DataTypes.STRING())
+        .column("_seq", DataTypes.BIGINT().notNull())
+        .column("_op_seq", DataTypes.INT().notNull())
+        .primaryKey("id")
+        .option("merge-engine", "deduplicate")
+        .option("changelog-producer", "input")
+        .option("sequence.field", "_seq,_op_seq")
+        .option("ignore-update-before", "false")
+        .build();
+    Identifier id = Identifier.create("db", "t");
+    cat.createTable(id, s, true);
+    t = (FileStoreTable) cat.getTable(id);
+
+    /* Attempt 0: plain commit(identifier, messages). */
+    try (TableWriteImpl<?> w = t.newWrite("spike-user");
+         TableCommitImpl c = t.newCommit("spike-user")) {
+      w.write(GenericRow.of(1, BinaryString.fromString("a"), 100L, 0), 0);
+      c.commit(42L, w.prepareCommit(false, 42L));
+    }
+    System.out.println("after plain commit():        snapshot=" + snap() + " rows=" + rows());
+
+    /* Attempt 1: SAME identifier, SAME commitUser, via filterAndCommit().
+       Fresh writer, fresh committer, freshly produced CommitMessages. */
+    try (TableWriteImpl<?> w = t.newWrite("spike-user");
+         TableCommitImpl c = t.newCommit("spike-user")) {
+      w.write(GenericRow.of(1, BinaryString.fromString("a"), 100L, 0), 0);
+      Map<Long, List<CommitMessage>> m = new HashMap<>();
+      m.put(42L, w.prepareCommit(false, 42L));
+      int committed = c.filterAndCommit(m);
+      System.out.println("filterAndCommit() returned:  " + committed
+          + "  (number of identifiers actually committed)");
+    }
+    System.out.println("after filterAndCommit():     snapshot=" + snap() + " rows=" + rows());
+
+    /* Attempt 2: a NEW identifier via filterAndCommit() must still go through. */
+    try (TableWriteImpl<?> w = t.newWrite("spike-user");
+         TableCommitImpl c = t.newCommit("spike-user")) {
+      w.write(GenericRow.of(2, BinaryString.fromString("b"), 101L, 0), 0);
+      Map<Long, List<CommitMessage>> m = new HashMap<>();
+      m.put(43L, w.prepareCommit(false, 43L));
+      int committed = c.filterAndCommit(m);
+      System.out.println("filterAndCommit() new id:    " + committed);
+    }
+    System.out.println("after new identifier:        snapshot=" + snap() + " rows=" + rows());
+
+    /* Attempt 3: same identifier 42 but a DIFFERENT commitUser is a different lineage. */
+    try (TableWriteImpl<?> w = t.newWrite("other-user");
+         TableCommitImpl c = t.newCommit("other-user")) {
+      w.write(GenericRow.of(1, BinaryString.fromString("a"), 100L, 0), 0);
+      Map<Long, List<CommitMessage>> m = new HashMap<>();
+      m.put(42L, w.prepareCommit(false, 42L));
+      int committed = c.filterAndCommit(m);
+      System.out.println("filterAndCommit() other user:" + committed);
+    }
+    System.out.println("after other commitUser:      snapshot=" + snap() + " rows=" + rows());
+  }
+
+  static Long snap() { return t.snapshotManager().latestSnapshotId(); }
+
+  static String rows() throws Exception {
+    ReadBuilder rb = t.newReadBuilder();
+    List<Split> splits = rb.newScan().plan().splits();
+    List<String> out = new ArrayList<>();
+    try (RecordReader<InternalRow> reader = rb.newRead().createReader(splits)) {
+      RecordReader.RecordIterator<InternalRow> batch;
+      while ((batch = reader.readBatch()) != null) {
+        InternalRow r;
+        while ((r = batch.next()) != null)
+          out.add("(" + r.getInt(0) + "," + r.getString(1) + "," + r.getLong(2) + "," + r.getInt(3) + ")");
+        batch.releaseBatch();
+      }
+    }
+    return out.size() + " " + out;
+  }
+}
+```
+
+### Verdict: **REFUTED for `commit(identifier, messages)`; CONFIRMED for `filterAndCommit(Map)` under a `commitUser` stable across restarts**
+
+For the API the brief actually tested, the assumption **failed**: `commit(42L, messages)`
+replayed produced a second snapshot with duplicate data *and* duplicate changelog files,
+so replay through that method is not idempotent.
+
+The property the design needs does exist, but only through
+`TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`, and only when the
+`commitUser` is **stable across process restarts** — a random per-process UUID would
+silently defeat the dedup, as the `other-user` case above shows. Task 11 and Task 13 must
+be written against `filterAndCommit`, not `commit`.
 
 ---
 
-## Spike 5 (GATE 2) — `-U` survives a pre-merge read and loses the merge
+## Spike 5 (GATE 2) — `-U` survives in the changelog and loses the merge
 
 **Assumption under test.** A `-U`/`+U` pair in one commit for the same key, distinguished
 only by `_op_seq`, is both physically retained (so a changelog consumer sees it) and
 resolved by `sequence.field = _seq,_op_seq` so the `+U` value wins (spec §7).
+
+**Scope of the evidence — read this before citing this section.** What was measured is
+retention in the **changelog**: the `t$audit_log` streaming scan reads the changelog files
+that `changelog-producer = input` writes, *not* the data files. So this section establishes
+that a changelog consumer sees both `-U` and `+U`, and that a merged read resolves to `+U`.
+It does **not** by itself establish what is in the data files. The separate supporting
+evidence for the data files is the `_VALUE_KIND` Parquet schema dump under "Correction 3"
+below, which shows the row kind is physically stored per record in the data file — but no
+assertion in this spike reads those data-file values directly, because Paimon reserves the
+`_VALUE_KIND` name and shades its Parquet reader (see that section). A task that needs to
+assert on data-file contents pre-compaction will have to solve that separately.
 
 ### Command
 
@@ -462,7 +692,7 @@ SPIKE5 OK
 Both records are present pre-merge with their row kinds, and the merged read returns the
 single `+U` row with `v='new'`. The gate holds.
 
-### Ordering is by `sequence.field`, not by arrival order
+### Ordering is by `sequence.field`, not by arrival order (the strongest result here)
 
 The test above writes `-U` before `+U`, so passing it would also be consistent with
 "last writer wins". `Spike5d.java` (extra spike) writes each pair in **reverse** arrival
@@ -480,12 +710,18 @@ is exactly what §7 requires.
 
 ### Verdict: **CONFIRMED WITH CAVEAT**
 
-The ordering property is confirmed, including independence from arrival order. The caveat
-is about **how to read raw**, not about the result — see the next section. The brief's
-prescribed pre-merge read technique does not work against a Paimon-API-written primary-key
-table, and Task 15 (and the plan's step that cites
-`PaimonFeatureTest.java:308-346`) must use the `t$audit_log` streaming route recorded
-below instead.
+The ordering property is confirmed, including independence from arrival order, which is
+the load-bearing part for §7. Two caveats, neither of which touches that result:
+
+1. **How to read raw.** The brief's prescribed pre-merge read technique does not work
+   against a Paimon-API-written primary-key table. Task 15 (and the plan's step that cites
+   `PaimonFeatureTest.java:308-346`) must use the `t$audit_log` streaming route recorded
+   below instead.
+2. **What "retained" was shown of.** Retention was demonstrated in the changelog, not in
+   the data files — see "Scope of the evidence" above. This also means the assertion
+   depends on `changelog-producer = input` being set; it is in the Global Constraints, so
+   it holds today, but a future change to that option would break this test for reasons
+   unrelated to what it checks.
 
 ---
 
@@ -661,14 +897,19 @@ later task wants batched before/after pairs. `t$ro` exposes the value fields onl
 | --- | --- | --- |
 | 1 (gate) | `u` placeholder + old-tuple TOAST flattening under RI FULL | **CONFIRMED** |
 | 2 | pgoutput `Message` records reach PgJDBC | **CONFIRMED** |
-| 3 | commit-identifier dedup is a no-op on replay | **CONFIRMED WITH CAVEAT** — only via `filterAndCommit`, not `commit`; needs a stable `commitUser` |
+| 3 | commit-identifier dedup is a no-op on replay | **REFUTED** for `commit(identifier, messages)`; **CONFIRMED** for `filterAndCommit(Map)` under a `commitUser` stable across restarts |
 | 4 | per-change LSN | **CONFIRMED** |
-| 5 (gate) | `-U` survives pre-merge; `sequence.field` picks `+U` | **CONFIRMED WITH CAVEAT** — result holds, but the prescribed raw-read technique does not work; use `t$audit_log` streaming |
+| 5 (gate) | `-U` survives in the changelog; `sequence.field` picks `+U` | **CONFIRMED WITH CAVEAT** — result holds (and is independent of arrival order), but retention was shown in the *changelog*, not the data files, and the prescribed raw-read technique does not work; use `t$audit_log` streaming |
 
-Both gates pass. The design's load-bearing assumptions hold. Three corrections to the
+Both gates pass. The design's load-bearing assumptions hold, with one assumption holding
+only through a different API than the plan assumed (spike 3). Three corrections to the
 plan's Paimon usage are recorded above and must be picked up by Tasks 11, 13 and 15:
 explicit bucket on write, `filterAndCommit` for idempotent replay, and the
 `t$audit_log` streaming route for pre-merge assertions.
+
+The spike 3 result is the one that changes planned code rather than just confirming it:
+the plan as written would have used `commit(identifier, messages)` and silently lost
+idempotent replay.
 
 ### Throwaway artefacts kept for later tasks
 
@@ -680,10 +921,11 @@ Under `.superpowers/sdd/2026-10-09-logical-slot-writer/spike/` (git-ignored, not
 | `spike1.hex` | xxd-format dump of the same bytes |
 | `u-excerpt.txt` | the two `U` messages, formatted as in this note |
 | `spike2.txt` | spike 2 / spike 4 output |
+| `spike4b.txt` | spike 4's confirmation run: 5 transactions, 3 `R` messages |
 | `spike3.txt`, `spike3b.txt` | spike 3 output |
 | `spike5.txt`, `spike5d.txt` | spike 5 output |
 | `cp.txt` | the 185-entry Maven classpath |
-| `jdbc/Spike{2,3,3b,5,5b,5c,5d}.java` | the spike sources as actually run |
+| `jdbc/Spike{2,3,3b,4b,5,5b,5c,5d}.java` | the spike sources as actually run |
 | `pgdata/` | the PostgreSQL 18.6 cluster (stopped) |
 
 Restart the cluster with:
