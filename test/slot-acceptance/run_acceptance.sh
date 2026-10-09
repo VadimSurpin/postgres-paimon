@@ -91,6 +91,7 @@ load_extension() {
 
 start_writer() {
   echo ">> starting writer (log: $RUN/writer.log)"
+  # flush interval 500ms (default 1000): halves the smoke test's wait without making tiny commits
   # PGPAIMON_COMMIT_USER is left to its default (paimon-writer-<slot>): it must be stable.
   PGPAIMON_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB" \
   PGPAIMON_USER="$PGUSER" PGPAIMON_PASSWORD="" \
@@ -115,15 +116,18 @@ start_writer() {
 run_suites() {
   local args=(-f "$REPO/java/pom.xml" test)
   if [ "$#" -gt 0 ]; then
-    local IFS=,; args+=("-Dtest=$*")
+    # The smoke suite always runs: it proves a JDBC suite can see replicated changes.
+    local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
   fi
   echo ">> mvn ${args[*]}"
-  # The writer module's live IT drops the slot named by PGPAIMON_SLOT; point it at a
-  # different one so it can never kill the live writer's slot.
+  # The writer module's live IT (BackfillerTest) creates and then DROPS the slot named by
+  # PGPAIMON_SLOT, default "paimon" - the live writer's slot. Give suites a different name so
+  # it can never kill the running writer. Do not "simplify" this back to one name.
   local rc=0
   E2E_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
   PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
   PGPAIMON_IT_WAREHOUSE="$WAREHOUSE" \
+  PGPAIMON_HARNESS=1 \
   PGPAIMON_SLOT="${SLOT}_it" \
     mvn -B -ntp "${args[@]}" || rc=$?
   return "$rc"
