@@ -243,6 +243,17 @@ BEGIN
     END IF;
 
     /*
+     * Guardrail: the writer needs the complete old row, so a tracked table's
+     * replica identity must stay FULL.  This is why table_registry.replica_identity
+     * is always 'full': add_table() sets it and this check keeps it so.  Checked
+     * on the resulting pg_class.relreplident, which catches every spelling.
+     */
+    IF (SELECT relreplident FROM pg_class WHERE oid = v_relid) <> 'f' THEN
+        RAISE EXCEPTION 'paimon_slot: replica identity of a replicated table must stay FULL'
+              USING HINT = 'the writer needs the complete old row; see design spec section 5';
+    END IF;
+
+    /*
      * Everything below is derived from one before/after diff of the whole
      * statement's net effect (registry cols vs live cols, keyed by field
      * id), so combined actions such as DROP COLUMN x, ADD COLUMN y cannot

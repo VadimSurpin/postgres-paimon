@@ -214,4 +214,29 @@ SELECT paimon.peek_messages() - 'relid';
 DROP TABLE ren_t2;
 SELECT paimon.peek_messages() - 'relid';
 
+-- replica identity of a tracked table must stay FULL
+CREATE TABLE ri_t (id int PRIMARY KEY, u int NOT NULL);
+CREATE UNIQUE INDEX ri_t_u ON ri_t (u);
+SELECT paimon.add_table('ri_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ri_t REPLICA IDENTITY DEFAULT;          -- expect ERROR
+SELECT relreplident FROM pg_class WHERE oid = 'ri_t'::regclass;
+ALTER TABLE ri_t REPLICA IDENTITY NOTHING;          -- expect ERROR
+SELECT relreplident FROM pg_class WHERE oid = 'ri_t'::regclass;
+ALTER TABLE ri_t REPLICA IDENTITY USING INDEX ri_t_u;   -- expect ERROR
+SELECT relreplident FROM pg_class WHERE oid = 'ri_t'::regclass;
+ALTER TABLE ri_t REPLICA IDENTITY FULL;             -- allowed, no message
+SELECT relreplident FROM pg_class WHERE oid = 'ri_t'::regclass;
+SELECT paimon.peek_messages() - 'relid';
+-- untracked tables are never interfered with
+CREATE TABLE ri_plain (id int PRIMARY KEY, u int NOT NULL);
+CREATE UNIQUE INDEX ri_plain_u ON ri_plain (u);
+ALTER TABLE ri_plain REPLICA IDENTITY DEFAULT;
+ALTER TABLE ri_plain REPLICA IDENTITY NOTHING;
+ALTER TABLE ri_plain REPLICA IDENTITY USING INDEX ri_plain_u;
+SELECT relreplident FROM pg_class WHERE oid = 'ri_plain'::regclass;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE ri_t;
+SELECT paimon.peek_messages() - 'relid';
+
 SELECT pg_drop_replication_slot('paimon_test');
