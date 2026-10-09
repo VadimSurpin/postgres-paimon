@@ -96,6 +96,7 @@ DECLARE
     v_pk     text[];
     v_cols   jsonb;
     v_kind   "char";
+    v_has_rows boolean;
 BEGIN
     IF replica_identity <> 'full' THEN
         RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
@@ -140,6 +141,14 @@ BEGIN
     -- ALTER TABLE as a change to a tracked table, emits a spurious message and
     -- may trip the PK guardrail from inside the statement that establishes the
     -- table.  Do not "tidy" this order.
+    -- backfill_due reflects whether rows exist that the writer could have missed.
+    -- The SHARE ROW EXCLUSIVE lock taken above conflicts with ROW EXCLUSIVE, so no
+    -- concurrent INSERT/UPDATE/DELETE can commit between this check and the registry
+    -- row; the emptiness test is therefore reliable, not a race.  That is why the lock
+    -- must stay where it is.  An empty table has nothing to backfill: the create
+    -- message plus streaming covers it fully.
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s)', rel::text) INTO v_has_rows;
+
     EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', rel::text);
     EXECUTE format('ALTER PUBLICATION paimon_pub ADD TABLE %s', rel::text);
 
@@ -147,7 +156,7 @@ BEGIN
         (relid, schema_name, table_name, pk_cols, cols,
          backfill_due, replica_identity, changelog_producer)
     VALUES (v_relid, v_nsp, v_name, v_pk, v_cols,
-            true, replica_identity, changelog_producer);
+            v_has_rows, replica_identity, changelog_producer);
 
     PERFORM paimon.emit(jsonb_build_object(
         'v', 1, 'op', 'create', 'relid', v_relid,

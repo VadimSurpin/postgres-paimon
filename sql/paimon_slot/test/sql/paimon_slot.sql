@@ -244,6 +244,7 @@ SELECT pg_drop_replication_slot('paimon_test');
 -- Task 13: mark_backfilled.  The slot above was dropped; recreate the decoding slot.
 SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
 CREATE TABLE bf_t (id int PRIMARY KEY, v text);
+INSERT INTO bf_t VALUES (1, 'x');   -- non-empty, so backfill_due is true and mark_backfilled has work
 SELECT paimon.add_table('bf_t'::regclass);
 SELECT paimon.peek_messages() - 'relid';
 SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
@@ -255,4 +256,17 @@ SELECT paimon.mark_backfilled('no_pk_t'::regclass);
 SELECT count(*) FROM paimon.peek_messages();
 DROP TABLE bf_t;
 SELECT paimon.peek_messages() - 'relid';
+-- backfill_due follows whether the table has rows at registration
+CREATE TABLE bf_empty (id int PRIMARY KEY);
+CREATE TABLE bf_rows (id int PRIMARY KEY);
+INSERT INTO bf_rows VALUES (1);
+SELECT paimon.add_table('bf_empty'::regclass);
+SELECT paimon.add_table('bf_rows'::regclass);
+SELECT table_name, backfill_due FROM paimon.table_registry
+WHERE table_name IN ('bf_empty', 'bf_rows') ORDER BY table_name;
+SELECT j->>'op' AS op, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s
+ORDER BY 2;
+DROP TABLE bf_empty, bf_rows;
+SELECT paimon.peek_messages() - 'relid';
+
 SELECT pg_drop_replication_slot('paimon_test');

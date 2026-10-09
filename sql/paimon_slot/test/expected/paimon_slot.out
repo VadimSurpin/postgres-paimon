@@ -168,7 +168,7 @@ SELECT schema_name, table_name, pk_cols, backfill_due, replica_identity, changel
 FROM paimon.table_registry WHERE relid = 'reg_t'::regclass;
  schema_name | table_name | pk_cols | backfill_due | replica_identity | changelog_producer 
 -------------+------------+---------+--------------+------------------+--------------------
- public      | reg_t      | {id}    | t            | full             | input
+ public      | reg_t      | {id}    | f            | full             | input
 (1 row)
 
 SELECT relreplident FROM pg_class WHERE oid = 'reg_t'::regclass;
@@ -709,6 +709,7 @@ SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_de
 (1 row)
 
 CREATE TABLE bf_t (id int PRIMARY KEY, v text);
+INSERT INTO bf_t VALUES (1, 'x');   -- non-empty, so backfill_due is true and mark_backfilled has work
 SELECT paimon.add_table('bf_t'::regclass);
  add_table 
 -----------
@@ -764,6 +765,46 @@ SELECT paimon.peek_messages() - 'relid';
 -------------------------------------------------------------------
  {"v": 1, "op": "drop_table", "table": "bf_t", "schema": "public"}
 (1 row)
+
+-- backfill_due follows whether the table has rows at registration
+CREATE TABLE bf_empty (id int PRIMARY KEY);
+CREATE TABLE bf_rows (id int PRIMARY KEY);
+INSERT INTO bf_rows VALUES (1);
+SELECT paimon.add_table('bf_empty'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.add_table('bf_rows'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT table_name, backfill_due FROM paimon.table_registry
+WHERE table_name IN ('bf_empty', 'bf_rows') ORDER BY table_name;
+ table_name | backfill_due 
+------------+--------------
+ bf_empty   | f
+ bf_rows    | t
+(2 rows)
+
+SELECT j->>'op' AS op, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s
+ORDER BY 2;
+   op   |   tbl    
+--------+----------
+ create | bf_empty
+ create | bf_rows
+(2 rows)
+
+DROP TABLE bf_empty, bf_rows;
+SELECT paimon.peek_messages() - 'relid';
+                               ?column?                                
+-----------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "bf_rows", "schema": "public"}
+ {"v": 1, "op": "drop_table", "table": "bf_empty", "schema": "public"}
+(2 rows)
 
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
