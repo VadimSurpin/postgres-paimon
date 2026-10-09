@@ -139,7 +139,7 @@ public final class Backfiller implements AutoCloseable {
                 }
                 long chunks = (rows + chunk - 1) / chunk;
                 long truncId = truncateIdentifier(plan.consistentPoint(), chunks);
-                sink.truncate(relid, truncId);
+                requireApplied(sink.truncate(relid, truncId), qualified, truncId);
 
                 CopyOut copy = conn.unwrap(PGConnection.class).getCopyAPI().copyOut(
                     "COPY " + qualified + " (" + cols + ") TO STDOUT");
@@ -165,11 +165,11 @@ public final class Backfiller implements AutoCloseable {
                         plan.consistentPoint(), (int) (opSeq++ & Integer.MAX_VALUE), 0L));
                     loaded++;
                     if (batch.size() == chunk) {
-                        flushChunk(batch, plan, chunks, chunkIndex++);
+                        flushChunk(batch, qualified, plan, chunks, chunkIndex++);
                     }
                 }
                 if (!batch.isEmpty()) {
-                    flushChunk(batch, plan, chunks, chunkIndex++);
+                    flushChunk(batch, qualified, plan, chunks, chunkIndex++);
                 }
                 if (loaded != rows || chunkIndex != chunks) {
                     throw new IllegalStateException("snapshot count " + rows + " but COPY gave "
@@ -186,11 +186,24 @@ public final class Backfiller implements AutoCloseable {
         LOG.info("backfilled " + qualified + " at " + plan.consistentPoint());
     }
 
-    private void flushChunk(List<SinkRecord> batch, BackfillPlan plan, long chunks, long index)
+    private void flushChunk(List<SinkRecord> batch, String table, BackfillPlan plan, long chunks, long index)
             throws Exception {
         long id = chunkIdentifier(plan.consistentPoint(), chunks, index);
-        sink.flush(batch, id, id);
+        requireApplied(sink.flushApplied(batch, id, id), table, id);
         batch.clear();
+    }
+
+    /**
+     * Backfill identifiers are minted for this load, so a commit the sink filtered as already
+     * committed means an earlier attempt used an identifier at or above it. Carrying on would
+     * load nothing and still mark the table done: stale data, no error.
+     */
+    private static void requireApplied(boolean applied, String table, long id) {
+        if (!applied) {
+            throw new IllegalStateException("backfill commit " + id + " for " + table
+                + " was filtered as already committed by an earlier attempt; the table holds"
+                + " stale data. Delete the Paimon table and retry");
+        }
     }
 
     /** The overwrite that precedes the chunks; below every chunk identifier. */
@@ -234,7 +247,11 @@ public final class Backfiller implements AutoCloseable {
         return "'" + s.replace("'", "''") + "'";
     }
 
-    /** COPY TO STDOUT text format: tab-separated, \N = NULL, \t \n \r \\ escaped. */
+    /**
+     * COPY TO STDOUT text format: tab-separated, \N = NULL, and the escapes \t \n \r \\ \b \f
+     * \v. Octal (\ddd) and hex (\xhh) escapes are accepted by COPY FROM only: COPY TO writes
+     * every other control character (checked: 0x01, 0x1b, 0x7f) as the raw byte.
+     */
     static List<String> parseCopyLine(String line) {
         List<String> out = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
@@ -248,6 +265,9 @@ public final class Backfiller implements AutoCloseable {
                     case 't' -> cur.append('\t');
                     case 'n' -> cur.append('\n');
                     case 'r' -> cur.append('\r');
+                    case 'b' -> cur.append('\u0008');
+                    case 'f' -> cur.append('\u000c');
+                    case 'v' -> cur.append('\u000b');
                     case '\\' -> cur.append('\\');
                     default -> cur.append(c);
                 }

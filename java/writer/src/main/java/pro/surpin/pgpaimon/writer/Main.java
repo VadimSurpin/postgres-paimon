@@ -158,7 +158,11 @@ public final class Main {
         throw new IllegalStateException("slot '" + slotName + "' exists and " + dueCount
             + " of " + totalCount + " tracked table(s) are awaiting their initial backfill:"
             + " a table added while the writer's slot exists cannot be loaded consistently."
-            + " Remove and re-add it while no slot exists, or recreate the slot and reload all");
+            + " To reload everything: stop the writer, then run"
+            + " SELECT pg_drop_replication_slot('" + slotName + "');"
+            + " UPDATE paimon.table_registry SET backfill_due = true;"
+            + " and start the writer again (it creates the slot, truncates and reloads every"
+            + " table)");
     }
 
     /**

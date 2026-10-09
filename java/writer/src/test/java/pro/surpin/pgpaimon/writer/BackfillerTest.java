@@ -31,6 +31,13 @@ class BackfillerTest {
     }
 
     @Test
+    void backspaceFormFeedAndVerticalTabComeFromTheServersOwnOutput() {
+        // `COPY (select E'a\bb\fc\vd') TO STDOUT` prints: a\bb\fc\vd
+        assertEquals(List.of("a\u0008b\u000cc\u000bd"),
+                     Backfiller.parseCopyLine("a\\bb\\fc\\vd"));
+    }
+
+    @Test
     void carriageReturnIsUnescaped() {
         assertEquals(List.of("a\rb"), Backfiller.parseCopyLine("a\\rb"));
     }
@@ -151,6 +158,12 @@ class BackfillerTest {
         } finally {
             sink.close();
             catalog.close();
+            // a leaked logical slot retains WAL indefinitely and blocks the next run
+            try (Connection c = DriverManager.getConnection(jdbc);
+                 Statement st = c.createStatement()) {
+                st.execute("SELECT pg_drop_replication_slot(slot_name)"
+                    + " FROM pg_replication_slots WHERE slot_name = '" + cfg.slotName() + "'");
+            }
         }
 
         try (Connection c = DriverManager.getConnection(jdbc);

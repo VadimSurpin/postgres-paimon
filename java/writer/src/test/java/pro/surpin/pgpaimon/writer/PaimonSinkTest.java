@@ -113,6 +113,8 @@ class PaimonSinkTest {
         sink.flush(List.of(rec(RowKind.INSERT, "9", "z", 300L, 0)), 300L, 310L);
 
         assertEquals(after, latest(), "a replayed commitIdentifier must be a no-op");
+        assertFalse(sink.flushApplied(List.of(rec(RowKind.INSERT, "9", "z", 300L, 0)), 300L, 310L),
+                    "a filtered commit must be reported to the caller");
         assertEquals(kindsAfter, changelogKinds("s"), "no duplicate changelog entries");
         assertEquals(List.of("1=b", "9=z"), mergedValues());
     }
@@ -204,7 +206,7 @@ class PaimonSinkTest {
         assertEquals(550L, new OffsetStore(reg, cfg).highestCommittedLsn(List.of(RELID)),
                      "the truncate carries our user and its commit LSN");
         long snaps = latest();
-        sink.truncate(RELID, 550L);
+        assertFalse(sink.truncate(RELID, 550L), "a filtered truncate must be reported");
         assertEquals(snaps, latest(), "a replayed truncate is filtered, not a second snapshot");
         assertEquals(cfg.commitUser(),
             reg.table(RELID).snapshotManager().latestSnapshot().commitUser());

@@ -80,8 +80,19 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
 
     @Override
     public void flush(List<SinkRecord> records, long commitLsn, long endLsn) throws Exception {
+        flushApplied(records, commitLsn, endLsn);
+    }
+
+    /**
+     * As {@link #flush}, returning false if any table's commit was filtered as already
+     * committed. A replay may expect that; a caller minting fresh identifiers (the Backfiller)
+     * must treat it as an error.
+     */
+    public boolean flushApplied(List<SinkRecord> records, long commitLsn, long endLsn)
+            throws Exception {
+        boolean allApplied = true;
         if (records.isEmpty()) {
-            return;     // a DDL-only transaction: nothing to commit, no empty snapshot
+            return true;    // a DDL-only transaction: nothing to commit, no empty snapshot
         }
         Map<Long, List<SinkRecord>> byRelid = new LinkedHashMap<>();
         for (SinkRecord r : records) {
@@ -102,6 +113,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                 List<CommitMessage> msgs = e.write().prepareCommit(false, commitLsn);
                 int applied = e.commit().filterAndCommit(Map.of(commitLsn, msgs));
                 if (applied < 1) {
+                    allApplied = false;
                     LOG.info("commit identifier " + commitLsn + " for relation " + relid
                         + " was already committed; replay skipped (applied " + applied
                         + " of 1)");
@@ -124,6 +136,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                 throw ex;
             }
         }
+        return allApplied;
     }
 
     /**
@@ -135,20 +148,22 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
      * identifier {@code Long.MAX_VALUE}, which under our user would make filterAndCommit drop every
      * later commit and OffsetStore report an impossible offset.
      */
-    public void truncate(long relid, long commitLsn) throws Exception {
+    public boolean truncate(long relid, long commitLsn) throws Exception {
+        boolean applied = true;
         // The cached writer holds pre-truncate LSM files the overwrite is about to delete; reusing
         // it makes the next compaction fail with "File deletion conflicts detected".
         dropEntry(relid);
         FileStoreTable t = registry.table(relid);
         try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
-            int applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of()));
-            if (applied < 1) {
+            applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of())) >= 1;
+            if (!applied) {
                 LOG.info("truncate of relation " + relid + " at " + commitLsn
                     + " was already committed; replay skipped");
             }
         } finally {
             dropEntry(relid);
         }
+        return applied;
     }
 
     /** Closes any cached writer/committer for the relation; the next flush rebuilds them. */
