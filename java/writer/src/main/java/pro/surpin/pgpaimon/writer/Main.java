@@ -68,11 +68,15 @@ public final class Main {
         }
         long resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
-        // 5. initial backfill (and slot creation) for anything due
-        backfillIfDue(config, rows, slotExists);
+        PaimonSink sink = new PaimonSink(registry, config);
+
+        // 5. initial backfill (and slot creation) for anything due. A backfill moves the
+        //    committed offsets (each loaded table now stands at the slot's consistent point), so
+        //    resume is read again afterwards.
+        backfillIfDue(config, registry, sink, rows, slotExists);
+        resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
         // 6. the pipeline
-        PaimonSink sink = new PaimonSink(registry, config);
         PgOutputDecoder decoder = new PgOutputDecoder();
         SlotConsumer[] consumerRef = new SlotConsumer[1];
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry,
@@ -115,20 +119,90 @@ public final class Main {
         }
     }
 
-    /** Step 5. Task 13 replaces this with the Backfiller, which also creates the slot. */
-    private static void backfillIfDue(WriterConfig config, List<RegistryRow> rows,
-                                      boolean slotExists) {
-        List<String> due = new ArrayList<>();
+    /** What step 5 has to do, decided from the slot and the registry alone. */
+    enum BackfillAction { NONE, CREATE_SLOT_AND_BACKFILL, RECREATE_SLOT_AND_BACKFILL }
+
+    /**
+     * The slot and the due tables determine what is safe.
+     * <ul>
+     *   <li>slot present, nothing due: stream.</li>
+     *   <li>slot absent: every tracked table must be due. A table that is not due has Paimon
+     *       data whose stream position was the lost slot; a new slot cannot reconcile it, so
+     *       this is a refusal, not a guess.</li>
+     *   <li>slot present, every table due: no table has ever streamed (a table leaves the due
+     *       state only after its load, and the stream starts after all loads), so the slot
+     *       holds nothing of value. An interrupted first load lands here and its exported
+     *       snapshot is gone, so the slot is dropped and made again.</li>
+     *   <li>slot present, some due and some not: a table added to a running system. Its
+     *       snapshot cannot be made consistent with the existing slot.</li>
+     * </ul>
+     */
+    static BackfillAction decideBackfill(boolean slotExists, int dueCount, int totalCount,
+                                         String slotName) {
+        if (!slotExists) {
+            if (dueCount != totalCount) {
+                throw new IllegalStateException("slot '" + slotName + "' does not exist but "
+                    + (totalCount - dueCount) + " tracked table(s) were already backfilled; "
+                    + "their stream position is lost and a new slot cannot reconcile them."
+                    + " Re-register them (paimon.remove_table, delete the Paimon tables,"
+                    + " paimon.add_table) to load them afresh");
+            }
+            return BackfillAction.CREATE_SLOT_AND_BACKFILL;
+        }
+        if (dueCount == 0) {
+            return BackfillAction.NONE;
+        }
+        if (dueCount == totalCount) {
+            return BackfillAction.RECREATE_SLOT_AND_BACKFILL;
+        }
+        throw new IllegalStateException("slot '" + slotName + "' exists and " + dueCount
+            + " of " + totalCount + " tracked table(s) are awaiting their initial backfill:"
+            + " a table added while the writer's slot exists cannot be loaded consistently."
+            + " Remove and re-add it while no slot exists, or recreate the slot and reload all");
+    }
+
+    /**
+     * Step 5. The only place the slot is created, because the backfill must read the snapshot
+     * that the slot's creation exports. The replication connection holding that snapshot is
+     * kept open until every due table is loaded.
+     */
+    private static void backfillIfDue(WriterConfig config, SchemaRegistry registry,
+                                      PaimonSink sink, List<RegistryRow> rows,
+                                      boolean slotExists) throws Exception {
+        List<RegistryRow> due = new ArrayList<>();
         for (RegistryRow r : rows) {
             if (r.backfillDue()) {
-                due.add(r.schema() + "." + r.table());
+                due.add(r);
             }
         }
-        if (!slotExists || !due.isEmpty()) {
-            throw new IllegalStateException("slot '" + config.slotName()
-                + (slotExists ? "' exists" : "' does not exist") + " and backfill is due for "
-                + due + "; the initial backfill (Backfiller, which also creates the slot so as to"
-                + " read the snapshot its creation exports) is not wired in yet");
+        BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(),
+                                               config.slotName());
+        if (action == BackfillAction.NONE) {
+            return;
+        }
+        if (action == BackfillAction.RECREATE_SLOT_AND_BACKFILL) {
+            LOG.warning("slot '" + config.slotName() + "' exists but every table awaits its"
+                + " initial backfill (an interrupted first load): dropping and recreating it");
+            try (Connection conn = plainConnection(config);
+                 PreparedStatement ps = conn.prepareStatement(
+                     "SELECT pg_drop_replication_slot(?)")) {
+                ps.setString(1, config.slotName());
+                ps.execute();
+            }
+        }
+        try (Backfiller backfiller = new Backfiller(config, registry, sink)) {
+            Backfiller.BackfillPlan plan = backfiller.createSlotAndExportSnapshot();
+            for (RegistryRow r : due) {
+                List<String> names = new ArrayList<>();
+                List<Boolean> isKey = new ArrayList<>();
+                for (DdlMessage.Col c : r.cols()) {
+                    names.add(c.name());
+                    isKey.add(r.pk().contains(c.name()));
+                }
+                sink.setRelation(r.relid(),
+                    new RelationMeta(r.relid(), r.schema(), r.table(), names, isKey));
+                backfiller.backfill(plan, r.relid(), r.schema(), r.table(), names);
+            }
         }
     }
 

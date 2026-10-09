@@ -240,3 +240,19 @@ DROP TABLE ri_t;
 SELECT paimon.peek_messages() - 'relid';
 
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- Task 13: mark_backfilled.  The slot above was dropped; recreate the decoding slot.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+CREATE TABLE bf_t (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('bf_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
+SELECT paimon.mark_backfilled('bf_t'::regclass);
+SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
+-- idempotent, emits no message, and an untracked table is simply a no-op
+SELECT paimon.mark_backfilled('bf_t'::regclass);
+SELECT paimon.mark_backfilled('no_pk_t'::regclass);
+SELECT count(*) FROM paimon.peek_messages();
+DROP TABLE bf_t;
+SELECT paimon.peek_messages() - 'relid';
+SELECT pg_drop_replication_slot('paimon_test');

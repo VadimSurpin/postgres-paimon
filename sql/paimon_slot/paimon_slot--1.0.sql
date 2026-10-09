@@ -168,6 +168,12 @@ BEGIN
     DELETE FROM paimon.table_registry WHERE relid = rel::oid;
 END $$;
 
+-- Called by the writer once a table's initial load has committed.
+CREATE FUNCTION paimon.mark_backfilled(rel regclass) RETURNS void
+LANGUAGE sql AS $$
+    UPDATE paimon.table_registry SET backfill_due = false WHERE relid = rel::oid;
+$$;
+
 -- Test helper: decode paimon-prefixed logical messages through a private
 -- test_decoding slot.  Not used by the writer.
 CREATE FUNCTION paimon.peek_messages() RETURNS SETOF jsonb

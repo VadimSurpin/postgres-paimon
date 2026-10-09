@@ -218,14 +218,9 @@ class PaimonSinkTest {
      * is always empty and is discarded; the second carries the changelog.
      */
     private static Map<String, Long> changelogKinds(String table) throws Exception {
-        Table al = catalog.getTable(Identifier.create(cfg.database(), table + "$audit_log"))
-            .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
-        StreamTableScan scan = al.newReadBuilder().newStreamScan();
-        scan.plan();
-        List<Split> splits = scan.plan().splits();
         Map<String, Long> kinds = new HashMap<>();
-        try (RecordReader<InternalRow> r = al.newReadBuilder().newRead().createReader(splits)) {
-            r.forEachRemaining(row -> kinds.merge(row.getString(0).toString(), 1L, Long::sum));
+        for (RawRecord r : RawRead.read(catalog, cfg.database(), table)) {
+            kinds.merge(r.rowKind(), 1L, Long::sum);
         }
         return kinds;
     }

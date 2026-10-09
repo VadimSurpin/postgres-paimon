@@ -701,3 +701,73 @@ SELECT pg_drop_replication_slot('paimon_test');
  
 (1 row)
 
+-- Task 13: mark_backfilled.  The slot above was dropped; recreate the decoding slot.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+CREATE TABLE bf_t (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('bf_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                           ?column?                                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}], "table": "bf_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
+ backfill_due 
+--------------
+ t
+(1 row)
+
+SELECT paimon.mark_backfilled('bf_t'::regclass);
+ mark_backfilled 
+-----------------
+ 
+(1 row)
+
+SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
+ backfill_due 
+--------------
+ f
+(1 row)
+
+-- idempotent, emits no message, and an untracked table is simply a no-op
+SELECT paimon.mark_backfilled('bf_t'::regclass);
+ mark_backfilled 
+-----------------
+ 
+(1 row)
+
+SELECT paimon.mark_backfilled('no_pk_t'::regclass);
+ mark_backfilled 
+-----------------
+ 
+(1 row)
+
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE bf_t;
+SELECT paimon.peek_messages() - 'relid';
+                             ?column?                              
+-------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "bf_t", "schema": "public"}
+(1 row)
+
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
