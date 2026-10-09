@@ -547,6 +547,25 @@ counterpart here.
 | Paimon commit fails | LSN not advanced; transaction replayed on retry. |
 | Writer crash mid-batch | Uncommitted work discarded, replayed from last committed LSN. |
 | DDL arrives for an unregistered table | Message ignored with a warning. |
+| Writer restarts | `SchemaRegistry` is rebuilt from `paimon.table_registry` before the slot is consumed. See below. |
+
+### Registry bootstrap on startup
+
+`SchemaRegistry` learns a table's identity from a `create` DDL message, and `add_table()` emits
+that message exactly once. Nothing re-emits it. So a restarted writer that consumed the slot
+immediately would know about no table at all, would classify every replicated row as belonging to
+an untracked relation, and would discard it under the rule in the row above — silently, and for
+every tracked table, from the first restart onward.
+
+The writer therefore queries `paimon.table_registry` over its JDBC connection at startup, before
+it opens the replication stream, and reconstructs the equivalent of a `create` for each row. The
+registry table is the only place the `relid` → Paimon identity mapping is recorded: the Paimon
+catalog knows which tables exist but not which PostgreSQL OID each one belongs to, so the mapping
+cannot be recovered from the warehouse alone. This is also why `add_table()` writes the registry
+row inside the same transaction as the `create` message — the two must not diverge.
+
+Bootstrapping from the registry rather than from a replayed message stream also means the writer's
+startup cost is one query, independent of how much WAL the slot is holding.
 
 ### New limitations versus main
 
