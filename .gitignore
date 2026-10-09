@@ -27,3 +27,8 @@ java/org/
 
 # PR / devrel materials — local only
 /pr/
+
+# paimon_slot local extension staging and regress output
+sql/paimon_slot/_install/
+sql/paimon_slot/test/results/
+sql/paimon_slot/regression.*

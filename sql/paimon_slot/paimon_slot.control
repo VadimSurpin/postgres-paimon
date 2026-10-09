@@ -1,0 +1,6 @@
+# paimon_slot extension
+comment = 'Replicate PostgreSQL tables to Apache Paimon via a logical replication slot'
+default_version = '1.0'
+relocatable = false
+schema = paimon
+superuser = true

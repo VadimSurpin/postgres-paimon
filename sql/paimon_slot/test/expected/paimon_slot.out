@@ -1,0 +1,107 @@
+CREATE EXTENSION paimon_slot;
+-- type mapping, mirroring extension/type_map_pg.h
+SELECT paimon.pg_type_to_paimon('boolean'::regtype, -1, false)      AS b,
+       paimon.pg_type_to_paimon('smallint'::regtype, -1, true)      AS i2,
+       paimon.pg_type_to_paimon('integer'::regtype, -1, false)      AS i4,
+       paimon.pg_type_to_paimon('bigint'::regtype, -1, false)       AS i8,
+       paimon.pg_type_to_paimon('real'::regtype, -1, false)         AS f4,
+       paimon.pg_type_to_paimon('double precision'::regtype, -1, false) AS f8;
+    b    |        i2         | i4  |   i8   |  f4   |   f8   
+---------+-------------------+-----+--------+-------+--------
+ BOOLEAN | SMALLINT NOT NULL | INT | BIGINT | FLOAT | DOUBLE
+(1 row)
+
+SELECT paimon.pg_type_to_paimon('numeric'::regtype, -1, false)      AS num_default,
+       paimon.pg_type_to_paimon('numeric'::regtype, 655366, false)  AS num_10_2;
+   num_default   |    num_10_2    
+-----------------+----------------
+ DECIMAL(38, 18) | DECIMAL(10, 2)
+(1 row)
+
+SELECT paimon.pg_type_to_paimon('text'::regtype, -1, false)         AS t,
+       paimon.pg_type_to_paimon('varchar'::regtype, 24, false)      AS vc,
+       paimon.pg_type_to_paimon('uuid'::regtype, -1, false)         AS uu,
+       paimon.pg_type_to_paimon('bytea'::regtype, -1, false)        AS ba,
+       paimon.pg_type_to_paimon('date'::regtype, -1, false)         AS d,
+       paimon.pg_type_to_paimon('timestamp'::regtype, -1, false)    AS ts,
+       paimon.pg_type_to_paimon('timestamptz'::regtype, -1, false)  AS tstz;
+   t    |   vc   |   uu   |  ba   |  d   |    ts     |              tstz              
+--------+--------+--------+-------+------+-----------+--------------------------------
+ STRING | STRING | STRING | BYTES | DATE | TIMESTAMP | TIMESTAMP WITH LOCAL TIME ZONE
+(1 row)
+
+-- Review Focus 5: an unmapped type falls through to STRING, with a warning
+SET client_min_messages = warning;
+SELECT paimon.pg_type_to_paimon('int4[]'::regtype, -1, false)  AS arr,
+       paimon.pg_type_to_paimon('jsonb'::regtype, -1, false)   AS jb,
+       paimon.pg_type_to_paimon('inet'::regtype, -1, false)    AS inet;
+WARNING:  paimon_slot: type integer[] has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type jsonb has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type inet has no Paimon mapping, using STRING
+  arr   |   jb   |  inet  
+--------+--------+--------
+ STRING | STRING | STRING
+(1 row)
+
+RESET client_min_messages;
+-- column introspection
+CREATE TABLE reg_t (id int PRIMARY KEY, amount numeric(10,2) NOT NULL, note text);
+SELECT paimon.pk_cols('reg_t'::regclass);
+ pk_cols 
+---------
+ {id}
+(1 row)
+
+SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
+               jsonb_pretty                
+-------------------------------------------
+ [                                        +
+     {                                    +
+         "id": 1,                         +
+         "name": "id",                    +
+         "type": "INT NOT NULL"           +
+     },                                   +
+     {                                    +
+         "id": 2,                         +
+         "name": "amount",                +
+         "type": "DECIMAL(10, 2) NOT NULL"+
+     },                                   +
+     {                                    +
+         "id": 3,                         +
+         "name": "note",                  +
+         "type": "STRING"                 +
+     }                                    +
+ ]
+(1 row)
+
+-- dropped columns are excluded and attnums are not renumbered
+ALTER TABLE reg_t ADD COLUMN tmp int;
+ALTER TABLE reg_t DROP COLUMN tmp;
+ALTER TABLE reg_t ADD COLUMN kept int;
+SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
+               jsonb_pretty                
+-------------------------------------------
+ [                                        +
+     {                                    +
+         "id": 1,                         +
+         "name": "id",                    +
+         "type": "INT NOT NULL"           +
+     },                                   +
+     {                                    +
+         "id": 2,                         +
+         "name": "amount",                +
+         "type": "DECIMAL(10, 2) NOT NULL"+
+     },                                   +
+     {                                    +
+         "id": 3,                         +
+         "name": "note",                  +
+         "type": "STRING"                 +
+     },                                   +
+     {                                    +
+         "id": 5,                         +
+         "name": "kept",                  +
+         "type": "INT"                    +
+     }                                    +
+ ]
+(1 row)
+
