@@ -32,3 +32,6 @@ java/org/
 sql/paimon_slot/_install/
 sql/paimon_slot/test/results/
 sql/paimon_slot/regression.*
+
+# acceptance harness runtime state (cluster, logs, warehouse)
+test/slot-acceptance/run/
