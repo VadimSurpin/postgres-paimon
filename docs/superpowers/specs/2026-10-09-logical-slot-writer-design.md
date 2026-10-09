@@ -281,6 +281,21 @@ otherwise carry the same sequence value. §7 defines the two fields. `ignore-upd
 is set explicitly rather than left to its default: `-U` records are required by the
 acceptance suite, and `TableWriteImpl` carries a `rowKindFilter` that this option drives.
 
+No `bucket` option is written, matching `extension/paimon_schema.cpp:219-223` exactly. For a
+primary-key table that means Paimon's **dynamic bucket mode**, in which `TableWrite.write(row)`
+throws:
+
+```
+Can't extract bucket from row in dynamic bucket mode, you should use
+'TableWrite.write(InternalRow row, int bucket)' method.
+```
+
+The writer therefore always calls `write(row, 0)`. Every file lands under `bucket-0/`, which is
+where `extension/paimon_table_writer.cpp:155` puts it on main, so the layout the acceptance
+suite inspects is unchanged. A single-threaded writer gains nothing from bucket-level
+parallelism; if throughput ever demands it, moving to fixed buckets is a schema change and a
+new decision, not an implementation detail.
+
 `paimon.add_table()` issues `ALTER TABLE ... REPLICA IDENTITY FULL`. This takes a brief
 `ACCESS EXCLUSIVE` lock for the catalog update, and thereafter adds the size of the old row
 to the WAL written by every UPDATE and DELETE on that table. For a row carrying a large
@@ -490,12 +505,27 @@ never contains a transaction that has not committed.
 ### Effectively-once
 
 1. `TxnBatcher` accumulates complete transactions only — never a partial one.
-2. `PaimonSink` commits with `commitIdentifier = commit_lsn` under a fixed `commitUser`.
+2. `PaimonSink` commits with `commitIdentifier = commit_lsn` under a fixed `commitUser`,
+   through `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
 3. Only after the Paimon commit returns does `SlotConsumer` advance the flushed and
    applied LSN.
 4. On restart, `OffsetStore` reads the highest committed identifier for that `commitUser`
-   from the Paimon snapshots and resumes the slot from it. Paimon discards commits whose
-   identifier it has already seen, so replayed transactions are idempotent.
+   from the Paimon snapshots and resumes the slot from it. `filterAndCommit` discards
+   commits whose identifier that `commitUser` has already used, so replayed transactions
+   are idempotent.
+
+Two details carry the whole guarantee, and both were established by measurement rather than
+from the API's shape (§12, spike 3):
+
+- **`commit(identifier, messages)` does not deduplicate.** Replaying an already-committed
+  identifier through it produces a second snapshot carrying duplicate data *and* duplicate
+  changelog entries. Only `filterAndCommit` consults the committed-identifier set. The
+  distinction is invisible until a crash recovery replays a transaction, which is precisely
+  when it matters, so the plain `commit` overload must not appear in the writer.
+- **`commitUser` must be stable across process restarts.** Deduplication is scoped to the
+  user, so a per-process UUID — the obvious default for a Paimon writer — would make every
+  restart a fresh identity whose replay nothing filters. The writer derives it from the
+  replication slot name, which is already unique per writer (§4) and already durable.
 
 Commit identity remains the transaction's commit LSN even though sequencing uses
 per-change LSNs: the commit is the unit of atomicity, the per-change LSN the unit of
@@ -639,6 +669,41 @@ Each can invalidate part of the design, and each is cheap.
    change just read rather than a batch-level value, since `sequence.field` depends on it
    being per change. Load-bearing for §7.
 5. **`-U` survival** — write `-U` and `+U` for one key with `ignore-update-before = false`
-   and `sequence.field = _seq,_op_seq`; confirm both appear in a raw pre-compaction read
-   (what `PaimonFeatureTest` asserts) and that the post-compaction merge keeps the `+U`.
-   Load-bearing for §5 and §7, and for T2, E2E T2 and the offload tests.
+   and `sequence.field = _seq,_op_seq`; confirm both appear in a pre-merge read and that the
+   merge keeps the `+U`. Load-bearing for §5 and §7, and for T2, E2E T2 and the offload tests.
+
+### How a pre-merge read works here, and why it is not what main does
+
+Main's acceptance suite reads row kinds through `PaimonFeatureTest.readRows`, which rebuilds
+the stored schema with a `_row_kind` `TINYINT` field prepended at field id `-1`. That works on
+main only because main writes its own Parquet files and physically emits that column —
+`extension/paimon_parquet.cpp:50` prepends it and says so. Nothing in Paimon produces it.
+
+Writing through Paimon's own `TableWrite` stores the row kind as `_VALUE_KIND`, so the
+technique cannot be carried over, and it fails in two ways that are easy to misread:
+
+- Declaring `_row_kind` yields `Required column is missing in data file. Col: [_row_kind]`,
+  and declaring `_VALUE_KIND` is rejected outright — it is reserved, alongside `_ROW_ID`,
+  `rowkind`, `_LEVEL` and `_SEQUENCE_NUMBER`. No replicated column may map to these five
+  names, which §4's guardrails must reject.
+- Stripping `merge-engine`, `changelog-producer` and `sequence.field` from the options does
+  **not** bypass merging. With `primaryKeys` still set the table remains a
+  `PrimaryKeyFileStoreTable`, and removing `merge-engine` merely restores its default, which
+  is `deduplicate` — the same engine. `readRows` also swallows read failures in a
+  `catch (Exception)` that only warns, so a broken read of this kind reports zero rows rather
+  than failing, and an assertion on presence alone passes vacuously.
+
+The supported route is the `$audit_log` system table over a streaming scan, which reads the
+changelog that `changelog-producer = input` writes:
+
+```java
+Table al = cat.getTable(Identifier.create(db, table + "$audit_log"))
+              .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
+StreamTableScan scan = al.newReadBuilder().newStreamScan();
+scan.plan();                                  // first plan() is always empty — discard it
+List<Split> splits = scan.plan().splits();    // second plan() carries the changelog
+```
+
+Discarding the first `plan()` is required, not defensive. A merged batch read is the wrong
+instrument for a different reason: it reports `rowKind = INSERT` for every surviving row, even
+where the latest input for that key was `+U`, so row kinds must never be asserted on one.
