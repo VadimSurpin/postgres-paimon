@@ -227,3 +227,174 @@ SELECT pg_drop_replication_slot('paimon_test');
  
 (1 row)
 
+-- Task 4: the slots above were dropped; recreate the decoding slot
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+CREATE TABLE ddl_t (id int PRIMARY KEY, a text);
+SELECT paimon.add_table('ddl_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';   -- drain the create message
+                                                                                                           ?column?                                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+-- blocked: primary key changes
+ALTER TABLE ddl_t DROP CONSTRAINT ddl_t_pkey;                 -- expect ERROR
+ERROR:  paimon_slot: cannot change the primary key of public.ddl_t
+HINT:  the Paimon table key is fixed at add_table() time
+CREATE TABLE ddl_u (id int, a text, PRIMARY KEY (id));
+SELECT paimon.add_table('ddl_u'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                           ?column?                                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_u", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+ALTER TABLE ddl_u ADD COLUMN b int;                           -- allowed
+SELECT paimon.peek_messages() - 'relid';
+                                ?column?                                 
+-------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 3, "name": "b", "type": "INT"}}
+(1 row)
+
+-- blocked: Paimon's reserved field names (ruling R4)
+ALTER TABLE ddl_t ADD COLUMN "_VALUE_KIND" int;               -- expect ERROR
+ERROR:  paimon_slot: column name "_VALUE_KIND" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+ALTER TABLE ddl_t ADD COLUMN rowkind int;                     -- expect ERROR
+ERROR:  paimon_slot: column name "rowkind" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+ALTER TABLE ddl_t ADD COLUMN "_Level" int;                    -- expect ERROR, case-insensitive
+ERROR:  paimon_slot: column name "_Level" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+ALTER TABLE ddl_t RENAME COLUMN a TO _sequence_number;        -- expect ERROR
+ERROR:  paimon_slot: column name "_sequence_number" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+CREATE TABLE reserved_t (id int PRIMARY KEY, _row_id text);
+SELECT paimon.add_table('reserved_t'::regclass);              -- expect ERROR
+ERROR:  paimon_slot: column name "_row_id" is reserved by Paimon and cannot be replicated
+HINT:  choose a different column name
+-- blocked: NOT NULL without a default
+ALTER TABLE ddl_t ADD COLUMN nn int NOT NULL;                 -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN ... NOT NULL without a default is not supported (public.ddl_t.nn)
+-- blocked: any default (gaps.md item 2 carried over)
+ALTER TABLE ddl_t ADD COLUMN wd int DEFAULT 7;                -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.ddl_t.wd)
+HINT:  add the column without a default, then UPDATE it
+ALTER TABLE ddl_t ADD COLUMN wd2 int NOT NULL DEFAULT 7;      -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.ddl_t.wd2)
+HINT:  add the column without a default, then UPDATE it
+-- the guardrail rolled the statement back, so the columns are absent
+SELECT count(*) FROM pg_attribute
+WHERE attrelid = 'ddl_t'::regclass AND attname IN ('nn','wd','wd2');
+ count 
+-------
+     0
+(1 row)
+
+-- allowed and propagated; relid is an unstable oid, so check it separately
+ALTER TABLE ddl_t ADD COLUMN extra bigint;
+SELECT (j->>'relid')::oid = 'ddl_t'::regclass AS relid_ok, j - 'relid' AS msg
+FROM (SELECT paimon.peek_messages() AS j) s;
+ relid_ok |                                      msg                                       
+----------+--------------------------------------------------------------------------------
+ t        | {"v": 1, "op": "add_col", "col": {"id": 3, "name": "extra", "type": "BIGINT"}}
+(1 row)
+
+ALTER TABLE ddl_t RENAME COLUMN extra TO renamed;
+SELECT paimon.peek_messages() - 'relid';
+                                ?column?                                 
+-------------------------------------------------------------------------
+ {"v": 1, "id": 3, "op": "rename_col", "to": "renamed", "from": "extra"}
+(1 row)
+
+ALTER TABLE ddl_t ALTER COLUMN a TYPE varchar(64);   -- STRING -> STRING: no message
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+ALTER TABLE ddl_t ADD COLUMN n int;
+ALTER TABLE ddl_t ALTER COLUMN n TYPE bigint;
+SELECT paimon.peek_messages() - 'relid';
+                                ?column?                                 
+-------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 4, "name": "n", "type": "INT"}}
+ {"v": 1, "id": 4, "op": "alter_col", "name": "n", "type": "BIGINT"}
+(2 rows)
+
+ALTER TABLE ddl_t DROP COLUMN n;
+SELECT paimon.peek_messages() - 'relid';
+                ?column?                 
+-----------------------------------------
+ {"v": 1, "op": "drop_col", "name": "n"}
+(1 row)
+
+ALTER TABLE ddl_t DROP COLUMN renamed;
+SELECT paimon.peek_messages() - 'relid';
+                   ?column?                    
+-----------------------------------------------
+ {"v": 1, "op": "drop_col", "name": "renamed"}
+(1 row)
+
+-- the registry tracked every change
+SELECT jsonb_pretty(cols) FROM paimon.table_registry WHERE relid = 'ddl_t'::regclass;
+          jsonb_pretty          
+--------------------------------
+ [                             +
+     {                         +
+         "id": 1,              +
+         "name": "id",         +
+         "type": "INT NOT NULL"+
+     },                        +
+     {                         +
+         "id": 2,              +
+         "name": "a",          +
+         "type": "STRING"      +
+     }                         +
+ ]
+(1 row)
+
+-- DROP TABLE
+DROP TABLE ddl_t;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                              
+--------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "ddl_t", "schema": "public"}
+(1 row)
+
+SELECT count(*) FROM paimon.table_registry WHERE relid IS NOT NULL
+  AND table_name = 'ddl_t';
+ count 
+-------
+     0
+(1 row)
+
+-- untracked tables are untouched (D9)
+CREATE TABLE plain_t (id int PRIMARY KEY);
+ALTER TABLE plain_t ADD COLUMN whatever int NOT NULL DEFAULT 1;
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+

@@ -83,3 +83,65 @@ SELECT count(*) FROM pg_publication_tables
 WHERE pubname = 'paimon_pub' AND tablename = 'reg_t';
 SELECT pg_drop_replication_slot('paimon');
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- Task 4: the slots above were dropped; recreate the decoding slot
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+CREATE TABLE ddl_t (id int PRIMARY KEY, a text);
+SELECT paimon.add_table('ddl_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';   -- drain the create message
+
+-- blocked: primary key changes
+ALTER TABLE ddl_t DROP CONSTRAINT ddl_t_pkey;                 -- expect ERROR
+CREATE TABLE ddl_u (id int, a text, PRIMARY KEY (id));
+SELECT paimon.add_table('ddl_u'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ddl_u ADD COLUMN b int;                           -- allowed
+SELECT paimon.peek_messages() - 'relid';
+
+-- blocked: Paimon's reserved field names (ruling R4)
+ALTER TABLE ddl_t ADD COLUMN "_VALUE_KIND" int;               -- expect ERROR
+ALTER TABLE ddl_t ADD COLUMN rowkind int;                     -- expect ERROR
+ALTER TABLE ddl_t ADD COLUMN "_Level" int;                    -- expect ERROR, case-insensitive
+ALTER TABLE ddl_t RENAME COLUMN a TO _sequence_number;        -- expect ERROR
+CREATE TABLE reserved_t (id int PRIMARY KEY, _row_id text);
+SELECT paimon.add_table('reserved_t'::regclass);              -- expect ERROR
+
+-- blocked: NOT NULL without a default
+ALTER TABLE ddl_t ADD COLUMN nn int NOT NULL;                 -- expect ERROR
+-- blocked: any default (gaps.md item 2 carried over)
+ALTER TABLE ddl_t ADD COLUMN wd int DEFAULT 7;                -- expect ERROR
+ALTER TABLE ddl_t ADD COLUMN wd2 int NOT NULL DEFAULT 7;      -- expect ERROR
+-- the guardrail rolled the statement back, so the columns are absent
+SELECT count(*) FROM pg_attribute
+WHERE attrelid = 'ddl_t'::regclass AND attname IN ('nn','wd','wd2');
+
+-- allowed and propagated; relid is an unstable oid, so check it separately
+ALTER TABLE ddl_t ADD COLUMN extra bigint;
+SELECT (j->>'relid')::oid = 'ddl_t'::regclass AS relid_ok, j - 'relid' AS msg
+FROM (SELECT paimon.peek_messages() AS j) s;
+ALTER TABLE ddl_t RENAME COLUMN extra TO renamed;
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ddl_t ALTER COLUMN a TYPE varchar(64);   -- STRING -> STRING: no message
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ddl_t ADD COLUMN n int;
+ALTER TABLE ddl_t ALTER COLUMN n TYPE bigint;
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ddl_t DROP COLUMN n;
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ddl_t DROP COLUMN renamed;
+SELECT paimon.peek_messages() - 'relid';
+
+-- the registry tracked every change
+SELECT jsonb_pretty(cols) FROM paimon.table_registry WHERE relid = 'ddl_t'::regclass;
+
+-- DROP TABLE
+DROP TABLE ddl_t;
+SELECT paimon.peek_messages() - 'relid';
+SELECT count(*) FROM paimon.table_registry WHERE relid IS NOT NULL
+  AND table_name = 'ddl_t';
+
+-- untracked tables are untouched (D9)
+CREATE TABLE plain_t (id int PRIMARY KEY);
+ALTER TABLE plain_t ADD COLUMN whatever int NOT NULL DEFAULT 1;
+SELECT paimon.peek_messages() - 'relid';
+SELECT pg_drop_replication_slot('paimon_test');
