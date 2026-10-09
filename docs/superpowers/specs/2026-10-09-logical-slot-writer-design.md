@@ -42,7 +42,8 @@ Three suites change meaningfully and are expected to differ (see §9).
 
 - `wal_level = logical` is acceptable.
 - The writer initially runs on the same host as PostgreSQL.
-- `gaps.md` items 1–3 are in scope to fix properly, not to carry over.
+- `gaps.md` items 1 and 3 are in scope to fix properly. Item 2 is carried over: column
+  defaults stay blocked, for the reason given in §4.
 
 ---
 
@@ -164,19 +165,19 @@ Blocked, matching main:
   and `:237`.
 - `ADD COLUMN ... NOT NULL` without a default — new column with `attnotnull` and no
   default. Replaces `extension/paimon_ddl.cpp:102`.
+- `ADD COLUMN ... DEFAULT` — any new column carrying a default, matching main's rejection
+  (commits `abb792b`, `7529932`). Detected from `pg_attribute.atthasdef` on the new column
+  at `ddl_command_end`, which is more reliable than main's parse-tree walk over
+  `ColumnDef->constraints` for `CONSTR_DEFAULT`.
 
-**No longer blocked: `ADD COLUMN ... DEFAULT`.** Main rejects column defaults outright
-(commits `abb792b`, `7529932`) because `gaps.md` item 2 has no cheap fix there. Here the
-handler emits `add_col` and sets `backfill_due = true`; the writer then refills the table
-from an exported snapshot (§6), writing complete `+I` rows stamped with the snapshot LSN so
-that concurrent higher-LSN streaming events win.
-
-The refill is O(table) for a DDL that PostgreSQL performs in O(1) with its fast-default
-mechanism, and that cost is accepted deliberately. `merge-engine = deduplicate` offers no
-cheaper route: populating one column on existing records requires rewriting whole rows,
-because nothing short of a partial-update engine can write a column in isolation — and
-§5 records why partial-update was rejected. Narrowing the refill is a later optimisation,
-not a v1 requirement.
+`merge-engine = deduplicate` offers no cheap way to populate one column on existing
+records: that requires rewriting whole rows, because nothing short of a partial-update
+engine can write a column in isolation, and §5 records why partial-update was rejected.
+A full table refill through the `Backfiller` would work and is O(table) for a DDL that
+PostgreSQL performs in O(1) with its fast-default mechanism. Rather than impose that
+silently, the guardrail stays and `gaps.md` item 2 is carried over rather than fixed. The
+documented workaround is the one main already requires: add the column without a default,
+then `UPDATE` it, which streams as ordinary DML.
 
 ### Primary key is required
 
@@ -197,7 +198,7 @@ Supporting PK-less tables means a second write path onto an append table with
 | Gap | Resolution |
 |---|---|
 | 1. DROP COLUMN not propagated | `SchemaChange.dropColumn` via the official Paimon API |
-| 2. Defaults not backfilled on ADD COLUMN | `add_col` + table refill via `Backfiller`, per above |
+| 2. Defaults not backfilled on ADD COLUMN | **not fixed** — defaults stay blocked, per above |
 | 3. DROP TABLE leaves warehouse data | `Catalog.dropTable(identifier, true)` |
 
 ---
