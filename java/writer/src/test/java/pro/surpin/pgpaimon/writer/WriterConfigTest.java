@@ -84,4 +84,14 @@ class WriterConfigTest {
     void columnValueOfNullIsRejected() {
         assertThrows(IllegalArgumentException.class, () -> ColumnValue.of(null));
     }
+
+    @Test
+    void relidAboveIntMaxIsHeldUnsigned() {
+        long oid = 3_000_000_000L;
+        RelationMeta m = new RelationMeta(oid, "public", "t", List.of("id"), List.of(true));
+        // pgoutput binary route and DDL JSON string route land on the same value
+        assertEquals(m.relid(), Integer.toUnsignedLong((int) oid));
+        assertEquals(m.relid(), Long.parseLong("3000000000"));
+        assertTrue(m.relid() > 0);
+    }
 }

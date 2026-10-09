@@ -4,5 +4,6 @@ package pro.surpin.pgpaimon.writer;
 import java.util.List;
 import org.apache.paimon.types.RowKind;
 
-/** values: a null element is SQL NULL. */
-public record PartialRecord(int relid, RowKind kind, List<String> values) {}
+/** relid: unsigned 32-bit OID widened to long; see RelationMeta.
+ *  values: a null element is SQL NULL. */
+public record PartialRecord(long relid, RowKind kind, List<String> values) {}
