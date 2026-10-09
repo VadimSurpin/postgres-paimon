@@ -275,4 +275,47 @@ class PaimonSinkTest {
         assertEquals(30, mergedValues().size());
         assertEquals(1029L, new OffsetStore(reg, cfg).highestCommittedLsn(List.of(RELID)));
     }
+
+    /** Self-contained: own warehouse, catalog, registry and sink; depends on no other test. */
+    @Test @Order(14)
+    void aFilteredReplayDoesNotPoisonTheWriter(@TempDir java.nio.file.Path ownWh) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", ownWh.toString());
+        Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
+        WriterConfig c = WriterConfig.fromEnv(Map.of(
+            "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+            "PGPAIMON_WAREHOUSE", ownWh.toString()));
+        SchemaRegistry r = new SchemaRegistry(cat, c);
+        new DdlMessageHandler(r, "paimon").handle(msg("""
+             {"v":1,"op":"create","relid":16600,"schema":"public","table":"iso",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"}],
+              "options":{"changelog-producer":"input"}}"""));
+        try (PaimonSink s = new PaimonSink(r, c)) {
+            s.setRelation(16600, new RelationMeta(16600, "public", "iso",
+                List.of("id", "v"), List.of(true, false)));
+            java.util.function.LongFunction<List<SinkRecord>> one = lsn -> List.of(
+                new SinkRecord(16600, RowKind.INSERT,
+                    Arrays.asList(String.valueOf(lsn), "x"), lsn, 0, 1L));
+            for (long lsn = 1; lsn <= 12; lsn++) {
+                s.flush(one.apply(lsn), lsn, lsn + 1);
+            }
+            long snaps = r.table(16600).snapshotManager().latestSnapshotId();
+            s.flush(one.apply(12), 12, 13);     // filtered replay on the same sink
+            assertEquals(snaps, r.table(16600).snapshotManager().latestSnapshotId());
+            assertDoesNotThrow(() -> {
+                for (long lsn = 13; lsn < 43; lsn++) {
+                    s.flush(one.apply(lsn), lsn, lsn + 1);
+                }
+            });
+            ReadBuilder rb = r.table(16600).newReadBuilder();
+            int[] n = { 0 };
+            try (RecordReader<InternalRow> rr =
+                     rb.newRead().createReader(rb.newScan().plan().splits())) {
+                rr.forEachRemaining(row -> n[0]++);
+            }
+            assertEquals(42, n[0]);
+            assertEquals(42L, new OffsetStore(r, c).highestCommittedLsn(List.of(16600L)));
+        }
+    }
 }

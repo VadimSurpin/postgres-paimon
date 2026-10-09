@@ -105,10 +105,18 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     LOG.info("commit identifier " + commitLsn + " for relation " + relid
                         + " was already committed; replay skipped (applied " + applied
                         + " of 1)");
-                    // The writer already holds this transaction's files in its LSM tree but they
-                    // were never committed; reusing it makes a later compaction delete files the
-                    // table never saw ("File deletion conflicts detected"). Discard both.
-                    e.commit().abort(msgs);
+                    // The writer already holds this transaction's files in its LSM tree but the
+                    // table never saw them; reusing it makes a later compaction delete files the
+                    // table does not know ("File deletion conflicts detected"). Dropping the
+                    // writer is what fixes that.
+                    //
+                    // Deliberately NOT calling commit.abort(msgs) to delete the orphan files:
+                    // in Paimon 1.4.1 abort deletes each message's newFiles, changelog files and
+                    // compactAfter without excluding files also in compactBefore. A compaction
+                    // finishing inside prepareCommit as an upgrade in place (same file name,
+                    // higher level) puts an already-committed file in compactAfter, and abort
+                    // would delete committed data. Unproven, but bounded orphan waste beats a
+                    // possible silent loss.
                     dropEntry(relid);
                 }
             } catch (Exception | Error ex) {
