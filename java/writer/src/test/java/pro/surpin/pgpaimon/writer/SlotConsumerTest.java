@@ -209,8 +209,6 @@ class SlotConsumerTest {
         List<List<SinkRecord>> out = new ArrayList<>();
         Fixture f = new Fixture();
         f.handler.onEvent(new PgEvent.Relation(ALL_KEY), 0L);
-        assertEquals(List.of(true, false, false), f.lastMeta.isKey(),
-            "the registry's primary key replaces pgoutput's all-true flags");
         f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
         f.handler.onEvent(update(oldV, newV), 41L);
         f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
@@ -221,6 +219,15 @@ class SlotConsumerTest {
 
     record RowKindAt(String kind) {}
 
+    /** Guards the flag rebuild itself, independently of what the resolver does with it. */
+    @Test
+    void theRegistrysPrimaryKeyReplacesPgoutputsAllTrueFlags() throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Relation(ALL_KEY), 0L);
+        assertEquals(List.of(true, false, false), f.lastMeta.isKey());
+    }
+
+    /** Guards the key-change rule: only the primary key column decides -U/+U versus -D/+I. */
     @Test
     void updateOfANonKeyColumnIsUpdateBeforeAfterNotDeleteInsert() throws Exception {
         assertEquals(List.of(new RowKindAt("-U"), new RowKindAt("+U")),

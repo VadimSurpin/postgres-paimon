@@ -43,11 +43,13 @@ class SlotHarnessSmokeIT {
         }
         assumeTrue(jdbc != null && wh != null, "no live stack: run test/slot-acceptance/run_acceptance.sh");
 
-        // setup.sql seeded ids 1 and 2 (backfilled). Stream: insert 3, update 3, delete 2.
+        // setup.sql seeded ids 1 and 2 (backfilled). Stream: insert 3, update 3, delete 2,
+        // and a primary-key update 1 -> 10.
         try (Connection c = DriverManager.getConnection(jdbc); Statement st = c.createStatement()) {
             st.execute("INSERT INTO harness_smoke VALUES (3, 'three', 3.00)");
             st.execute("UPDATE harness_smoke SET label = 'three-b', amt = 3.75 WHERE id = 3");
             st.execute("DELETE FROM harness_smoke WHERE id = 2");
+            st.execute("UPDATE harness_smoke SET id = 10 WHERE id = 1");
         }
         Map<Integer, String> expected = new TreeMap<>();
         try (Connection c = DriverManager.getConnection(jdbc); Statement st = c.createStatement();
@@ -56,7 +58,7 @@ class SlotHarnessSmokeIT {
                 expected.put(rs.getInt(1), rs.getString(2) + "|" + rs.getBigDecimal(3).toPlainString());
             }
         }
-        assertEquals(Map.of(1, "one|1.50", 3, "three-b|3.75"), expected, "PostgreSQL itself is wrong");
+        assertEquals(Map.of(10, "one|1.50", 3, "three-b|3.75"), expected, "PostgreSQL itself is wrong");
 
         Options o = new Options();
         o.set("warehouse", wh);
@@ -73,7 +75,7 @@ class SlotHarnessSmokeIT {
                 Thread.sleep(250);
             }
             assertEquals(expected, actual, "Paimon did not converge to PostgreSQL's contents within "
-                + TIMEOUT_MS + "ms (waiting for the insert of 3, its update and the delete of 2)");
+                + TIMEOUT_MS + "ms (waiting for the insert of 3, its update, the delete of 2 and the key update 1 -> 10)");
 
             // The changelog must show each operation, not only the merged result.
             Set<String> kinds = changelogKinds(catalog);
@@ -86,6 +88,11 @@ class SlotHarnessSmokeIT {
             assertTrue(kinds.contains("3:+U:three-b"),
                 "update of id 3 must produce +U with the after-image: " + kinds);
             assertFalse(kinds.contains("3:-D:three"), "update of id 3 was decomposed into -D/+I: " + kinds);
+            // A primary-key update is a delete of the old key and an insert of the new, never -U/+U.
+            assertTrue(kinds.contains("1:-D:one"), "old key 1 must be deleted: " + kinds);
+            assertTrue(kinds.contains("10:+I:one"), "new key 10 must be inserted: " + kinds);
+            assertFalse(kinds.contains("1:-U:one") || kinds.contains("10:+U:one"),
+                "a primary-key update must not be -U/+U: " + kinds);
         }
     }
 
