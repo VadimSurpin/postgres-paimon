@@ -199,10 +199,15 @@ class PaimonSinkTest {
 
     @Test @Order(11)
     void truncateEmptiesTheTableButNotTheOffset() throws Exception {
-        sink.truncate(RELID);
+        sink.truncate(RELID, 550L);
         assertEquals(List.of(), mergedValues());
-        assertEquals(500L, new OffsetStore(reg, cfg).highestCommittedLsn(List.of(RELID)),
-                     "the truncate snapshot must not hide the last data commit");
+        assertEquals(550L, new OffsetStore(reg, cfg).highestCommittedLsn(List.of(RELID)),
+                     "the truncate carries our user and its commit LSN");
+        long snaps = latest();
+        sink.truncate(RELID, 550L);
+        assertEquals(snaps, latest(), "a replayed truncate is filtered, not a second snapshot");
+        assertEquals(cfg.commitUser(),
+            reg.table(RELID).snapshotManager().latestSnapshot().commitUser());
         sink.flush(List.of(new SinkRecord(RELID, RowKind.INSERT,
             Arrays.asList("6", "after", "1"), 600L, 0, 4711L)), 600L, 610L);
         assertEquals(List.of("6=after"), mergedValues());
@@ -223,5 +228,31 @@ class PaimonSinkTest {
             r.forEachRemaining(row -> kinds.merge(row.getString(0).toString(), 1L, Long::sum));
         }
         return kinds;
+    }
+
+    @Test @Order(12)
+    void aPartlyCommittedTransactionResumesBeforeIt() throws Exception {
+        long relB = 16501;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16501,"schema":"public","table":"s2",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"}],
+              "options":{"changelog-producer":"input"}}"""));
+        OffsetStore store = new OffsetStore(reg, cfg);
+        assertEquals(0L, store.highestCommittedLsn(List.of(RELID, relB)),
+                     "B has never committed: resume from the start");
+        // transaction at 700 reached A only (crash before B)
+        sink.flush(List.of(new SinkRecord(RELID, RowKind.INSERT, Arrays.asList("7", "x", null), 700L, 0, 4711L)), 700L, 710L);
+        long resume = store.highestCommittedLsn(List.of(RELID, relB));
+        assertTrue(resume < 700L, "must replay 700, got " + resume);
+        // replay: A's commit is filtered, B's proceeds
+        sink.setRelation(relB, new RelationMeta(relB, "public", "s2",
+            List.of("id", "v"), List.of(true, false)));
+        long aSnaps = latest();
+        sink.flush(List.of(new SinkRecord(RELID, RowKind.INSERT, Arrays.asList("7", "x", null), 700L, 0, 4711L),
+            new SinkRecord(relB, RowKind.INSERT, Arrays.asList("7", "x"), 700L, 1, 4711L)),
+            700L, 710L);
+        assertEquals(aSnaps, latest());
+        assertEquals(700L, store.highestCommittedLsn(List.of(RELID, relB)));
     }
 }

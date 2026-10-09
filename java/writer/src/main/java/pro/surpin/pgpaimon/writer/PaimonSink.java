@@ -113,10 +113,24 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         }
     }
 
-    /** Empties the table with a real truncate (an overwrite commit with no data). */
-    public void truncate(long relid) throws Exception {
-        dropEntry(relid);
-        registry.table(relid).newBatchWriteBuilder().newCommit().truncateTable();
+    /**
+     * Empties the table with an empty overwrite commit under our own commitUser and
+     * {@code commitIdentifier = commitLsn}, through the same {@code filterAndCommit} path as data,
+     * so a replayed truncate is filtered and every snapshot this writer creates carries our user.
+     *
+     * <p>{@code TableCommitImpl.truncateTable()} is deliberately not used: it hard-codes the
+     * identifier {@code Long.MAX_VALUE}, which under our user would make filterAndCommit drop every
+     * later commit and OffsetStore report an impossible offset.
+     */
+    public void truncate(long relid, long commitLsn) throws Exception {
+        FileStoreTable t = registry.table(relid);
+        try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
+            int applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of()));
+            if (applied < 1) {
+                LOG.info("truncate of relation " + relid + " at " + commitLsn
+                    + " was already committed; replay skipped");
+            }
+        }
     }
 
     /** Closes any cached writer/committer for the relation; the next flush rebuilds them. */

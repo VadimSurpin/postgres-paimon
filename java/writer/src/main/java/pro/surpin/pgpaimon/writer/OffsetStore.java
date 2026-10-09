@@ -10,7 +10,7 @@ import org.apache.paimon.utils.SnapshotManager;
  * Reads back where to resume: the highest {@code commitIdentifier} (a commit LSN) among Paimon
  * snapshots written by this writer's {@code commitUser}.
  *
- * <p>Snapshots by other users (a truncate goes through a batch committer with its own user) are
+ * <p>Snapshots by other users (compaction, other writers) are
  * skipped, so the scan walks back from the latest snapshot to the newest one that is ours.
  * Identifiers are monotone per user, so that snapshot carries the maximum.
  */
@@ -24,9 +24,19 @@ public final class OffsetStore {
         this.config = config;
     }
 
-    /** 0 when nothing has been committed. Relations not tracked by the registry contribute nothing. */
+    /**
+     * The MINIMUM over the tracked relations of each one's highest committed identifier; 0 if any
+     * tracked relation has no snapshot from our commitUser (and 0 for no relations).
+     *
+     * <p>The sink commits table by table, so a crash can leave one transaction applied to A but
+     * not B. Resuming earlier than necessary is always safe: filterAndCommit turns every
+     * already-applied commit into a per-table no-op, costing only some re-read WAL. Resuming later
+     * than necessary silently drops what B missed. Hence min, not max. Relations not tracked by
+     * the registry are skipped.
+     */
     public long highestCommittedLsn(Collection<Long> relids) {
-        long highest = 0;
+        long lowest = Long.MAX_VALUE;
+        boolean any = false;
         for (long relid : relids) {
             if (!registry.tracked(relid)) {
                 continue;
@@ -35,20 +45,20 @@ public final class OffsetStore {
             SnapshotManager sm = t.snapshotManager();
             Long latest = sm.latestSnapshotId();
             Long earliest = sm.earliestSnapshotId();
-            if (latest == null || earliest == null) {
-                continue;
-            }
-            for (long id = latest; id >= earliest; id--) {
+            any = true;
+            long tableHighest = 0;
+            if (latest != null && earliest != null) for (long id = latest; id >= earliest; id--) {
                 if (!sm.snapshotExists(id)) {
                     continue;
                 }
                 Snapshot s = sm.snapshot(id);
                 if (config.commitUser().equals(s.commitUser())) {
-                    highest = Math.max(highest, s.commitIdentifier());
+                    tableHighest = s.commitIdentifier();
                     break;
                 }
             }
+            lowest = Math.min(lowest, tableHighest);
         }
-        return highest;
+        return any ? lowest : 0;
     }
 }
