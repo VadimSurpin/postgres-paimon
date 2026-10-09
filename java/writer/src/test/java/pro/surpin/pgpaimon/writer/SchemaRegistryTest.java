@@ -18,6 +18,7 @@ class SchemaRegistryTest {
     @TempDir static Path warehouse;
     static Catalog catalog;
     static SchemaRegistry reg;
+    static WriterConfig cfg;
     static DdlMessageHandler handler;
 
     static final long RELID = 16412L;
@@ -30,7 +31,8 @@ class SchemaRegistryTest {
         Map<String, String> env = new HashMap<>();
         env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost:5432/testdb");
         env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
-        reg = new SchemaRegistry(catalog, WriterConfig.fromEnv(env));
+        cfg = WriterConfig.fromEnv(env);
+        reg = new SchemaRegistry(catalog, cfg);
         handler = new DdlMessageHandler(reg, "paimon");
     }
 
@@ -127,8 +129,8 @@ class SchemaRegistryTest {
              "schema":"public","table":"orders"}"""));
         // Catalog.tableExists does not exist in Paimon 1.4.1; getTable must now fail.
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create("default", "orders")));
-        assertFalse(java.nio.file.Files.exists(warehouse.resolve("default.db").resolve("orders")),
+            () -> catalog.getTable(Identifier.create(cfg.database(), "orders")));
+        assertFalse(java.nio.file.Files.exists(warehouse.resolve(cfg.database() + ".db").resolve("orders")),
             "the table directory must be purged from the warehouse");
         assertFalse(reg.tracked(RELID));
     }
@@ -298,5 +300,59 @@ class SchemaRegistryTest {
         assertEquals("INT NOT NULL", SchemaRegistry.parseType("INT NOT NULL").asSQLString());
         assertEquals(SchemaRegistry.parseType("DECIMAL(10,2)"),
                      SchemaRegistry.parseType("DECIMAL(10, 2)"));
+    }
+
+    private static List<LogRecord> captureWarnings(Class<?> c, Runnable r) {
+        List<LogRecord> logged = new ArrayList<>();
+        Logger log = Logger.getLogger(c.getName());
+        Handler h = new Handler() {
+            public void publish(LogRecord x) { logged.add(x); }
+            public void flush() {}
+            public void close() {}
+        };
+        log.addHandler(h);
+        try { r.run(); } finally { log.removeHandler(h); }
+        return logged;
+    }
+
+    @Test @Order(30)
+    void xidColumnIsCreatedWhenConfigured() throws Exception {
+        Map<String, String> env = new HashMap<>();
+        env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost:5432/testdb");
+        env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
+        env.put("PGPAIMON_XID_FIELD", "_xid");
+        SchemaRegistry xr = new SchemaRegistry(catalog, WriterConfig.fromEnv(env));
+        xr.createTable(40001L, "public", "xid_t", List.of("id"),
+            List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")));
+        assertEquals(List.of("id", "_seq", "_op_seq", "_xid"),
+            xr.table(40001L).schema().fieldNames());
+        assertEquals("BIGINT", xr.table(40001L).rowType().getField("_xid").type().asSQLString());
+    }
+
+    @Test @Order(31)
+    void replayedCreateThatDriftsWarnsNamingTheDifference() throws Exception {
+        handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t")));
+        long ver = reg.table(40002L).schema().id();
+
+        List<LogRecord> a = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t")
+                .replace("DECIMAL(10, 2)", "DECIMAL(12, 2)"))));
+        assertEquals(1, a.size());
+        assertEquals(Level.WARNING, a.get(0).getLevel());
+        assertTrue(a.get(0).getMessage().contains("'price'"), a.get(0).getMessage());
+        assertTrue(a.get(0).getMessage().contains("DECIMAL(10, 2)"));
+
+        List<LogRecord> b = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t")
+                .replace("\"pk\":[\"id\"]", "\"pk\":[\"id\",\"qty\"]"))));
+        assertEquals(1, b.size());
+        assertTrue(b.get(0).getMessage().contains("primary key"), b.get(0).getMessage());
+        assertTrue(b.get(0).getMessage().contains("qty"));
+
+        assertEquals(ver, reg.table(40002L).schema().id(), "drift must not alter the table");
+
+        List<LogRecord> clean = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t"))));
+        assertTrue(clean.isEmpty(), "an identical replay must not warn");
     }
 }

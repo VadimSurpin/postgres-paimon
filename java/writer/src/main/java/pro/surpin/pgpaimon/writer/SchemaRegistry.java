@@ -5,11 +5,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypeJsonParser;
@@ -28,6 +30,8 @@ import org.apache.paimon.types.TimestampType;
  * process is untracked.
  */
 public final class SchemaRegistry {
+
+    private static final Logger LOG = Logger.getLogger(SchemaRegistry.class.getName());
 
     private final Catalog catalog;
     private final WriterConfig config;
@@ -80,12 +84,62 @@ public final class SchemaRegistry {
         Identifier id = Identifier.create(config.database(), table);
         try {
             catalog.createDatabase(config.database(), true);
-            catalog.createTable(id, b.build(), true);
+            Schema wanted = b.build();
+            Table existing = null;
+            try {
+                existing = catalog.getTable(id);
+            } catch (Catalog.TableNotExistException e) {
+                // normal first-time case
+            }
+            if (existing != null) {
+                warnOnDrift(id, existing, pk, cols);
+            }
+            catalog.createTable(id, wanted, true);
         } catch (Exception e) {
             throw new IllegalStateException("cannot create Paimon table " + id, e);
         }
         identifiers.put(relid, id);
         forget0(relid);
+    }
+
+    /**
+     * A repeated create for an existing table stays a no-op (restart bootstrap replays every
+     * registry row), but disagreement between the incoming definition and the stored schema is
+     * logged as a WARNING naming each difference. Never throws: drift must not block a restart.
+     */
+    private void warnOnDrift(Identifier id, Table existing, List<String> pk,
+                             List<DdlMessage.Col> cols) {
+        List<String> diffs = new ArrayList<>();
+        if (!existing.primaryKeys().equals(pk)) {
+            diffs.add("primary key is " + existing.primaryKeys() + " in Paimon but " + pk
+                + " in the create message");
+        }
+        Map<String, DataType> have = new java.util.LinkedHashMap<>();
+        for (DataField f : existing.rowType().getFields()) {
+            have.put(f.name(), f.type());
+        }
+        for (DdlMessage.Col c : cols) {
+            DataType t = have.remove(c.name());
+            if (t == null) {
+                diffs.add("column '" + c.name() + "' is missing from Paimon");
+            } else if (!t.equals(parseType(c.type()))) {
+                diffs.add("column '" + c.name() + "' is " + t.asSQLString()
+                    + " in Paimon but " + parseType(c.type()).asSQLString()
+                    + " in the create message");
+            }
+        }
+        have.remove(config.seqField());
+        have.remove(config.opSeqField());
+        if (config.xidField() != null) {
+            have.remove(config.xidField());
+        }
+        for (String extra : have.keySet()) {
+            diffs.add("column '" + extra + "' exists in Paimon but not in the create message");
+        }
+        if (!diffs.isEmpty()) {
+            LOG.warning("create for existing table " + id + " differs from its Paimon schema: "
+                + String.join("; ", diffs));
+        }
     }
 
     public void addColumn(long relid, DdlMessage.Col col) {
