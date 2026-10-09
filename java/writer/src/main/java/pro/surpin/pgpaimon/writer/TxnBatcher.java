@@ -73,10 +73,12 @@ public final class TxnBatcher {
     public void onEvent(PgEvent event, long changeLsn, RelationMeta meta) throws Exception {
         if (event instanceof PgEvent.Begin b) {
             if (open != null) {
-                // Deliberately leaves the open batch untouched; the caller must treat this as
-                // fatal (or call discardOpenTransaction()).
-                throw new IllegalStateException("Begin arrived while transaction " + xid
-                    + " is still open; its Commit was never seen");
+                // The first transaction's Commit was never seen, so its LSNs are unknown and
+                // the batch cannot be trusted; discard it rather than keep it.
+                String msg = "Begin arrived while transaction " + xid
+                    + " is still open; its Commit was never seen";
+                discardOpenTransaction();
+                throw new IllegalStateException(msg);
             }
             open = new ArrayList<>();
             xid = b.xid();
@@ -95,7 +97,7 @@ public final class TxnBatcher {
             return;    // handled elsewhere; contributes no records
         }
 
-        // Invariant: after any exception from the Truncate or row-change paths below, no
+        // Invariant (unconditional, for every path of onEvent): after any exception no
         // transaction is open. A throw partway through must never leave earlier records
         // buffered, or a later Commit would flush a partial batch under the full
         // transaction's commitLsn/endLsn and the slot would advance past the missing records.

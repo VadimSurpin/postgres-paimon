@@ -283,16 +283,16 @@ class TxnBatcherTest {
     }
 
     @Test
-    void nestedBeginLeavesTheOpenBatchIntact() throws Exception {
+    void nestedBeginDiscardsTheOpenBatchAndCommitFlushesNothing() throws Exception {
         Recorder rec = new Recorder();
         TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
         b.onEvent(new PgEvent.Begin(2100L, 0L, 1L), 2100L, null);
         b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 2110L, META);
         assertThrows(IllegalStateException.class,
             () -> b.onEvent(new PgEvent.Begin(2200L, 0L, 2L), 2200L, null));
-        assertTrue(b.hasOpenTransaction());
-        b.onEvent(new PgEvent.Commit(2100L, 2120L, 0L), 2120L, null);
-        assertEquals(1, rec.batches.get(0).size());
-        assertEquals(1L, rec.batches.get(0).get(0).xid());
+        assertFalse(b.hasOpenTransaction());
+        assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Commit(2200L, 2210L, 0L), 2210L, null));
+        assertTrue(rec.batches.isEmpty(), "records of the first txn must not be flushed");
     }
 }
