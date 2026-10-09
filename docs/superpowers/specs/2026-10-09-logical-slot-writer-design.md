@@ -302,6 +302,16 @@ to the WAL written by every UPDATE and DELETE on that table. For a row carrying 
 `jsonb` column that is updated often, the flattened value is written to WAL on each
 otherwise-unrelated update — see the second escape below for that case.
 
+**The key columns come from the registry, never from pgoutput's `Relation` flags.** Under
+`REPLICA IDENTITY FULL` pgoutput marks **every** column as a key column — verified against a real
+server, where `public.t (id int PRIMARY KEY, n int, body text)` arrives as three columns all with
+`flags=1`. A writer that trusted those flags would compare every column when deciding whether the
+key moved, so **any** update would look like a key change and be decomposed into `-D` + `+I`,
+producing no `-U` at all. That defeats the reason this design chose `REPLICA IDENTITY FULL` with
+`changelog-producer = input` over Paimon's `lookup` producer, and it is invisible in the merged
+table: the row ends up correct and only the changelog is wrong. `paimon.table_registry.pk_cols` is
+the authority, and the writer rebuilds each `Relation`'s key flags from it.
+
 Write rules, per decoded message:
 
 | pgoutput message | Emitted to Paimon |
