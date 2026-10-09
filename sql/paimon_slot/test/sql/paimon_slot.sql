@@ -1,4 +1,4 @@
-\set VERBOSITY terse
+\set SHOW_CONTEXT never
 CREATE EXTENSION paimon_slot;
 
 -- type mapping, mirroring extension/type_map_pg.h

@@ -1,4 +1,4 @@
-\set VERBOSITY terse
+\set SHOW_CONTEXT never
 CREATE EXTENSION paimon_slot;
 -- type mapping, mirroring extension/type_map_pg.h
 SELECT paimon.pg_type_to_paimon('boolean'::regtype, -1, false)      AS b,
@@ -137,11 +137,14 @@ SELECT paimon.table_cols('no_cols_t'::regclass) AS cols,
 CREATE TABLE nopk (a int);
 SELECT paimon.add_table('nopk'::regclass);        -- expect ERROR
 ERROR:  paimon_slot: nopk has no primary key
+HINT:  a primary key is required; see design spec section 4
 -- the v1 escapes are accepted but not implemented
 SELECT paimon.add_table('reg_t'::regclass, 'default');          -- expect ERROR
 ERROR:  paimon_slot: replica_identity => default is not implemented in v1
+HINT:  only 'full' is supported; see design spec section 5
 SELECT paimon.add_table('reg_t'::regclass, 'full', 'lookup');   -- expect ERROR
 ERROR:  paimon_slot: changelog_producer => lookup is not implemented in v1
+HINT:  only 'input' is supported; see design spec section 5
 -- happy path
 SELECT slot_name FROM pg_create_logical_replication_slot('paimon', 'pgoutput');
  slot_name 
