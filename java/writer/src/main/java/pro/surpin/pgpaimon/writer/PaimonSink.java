@@ -105,6 +105,11 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     LOG.info("commit identifier " + commitLsn + " for relation " + relid
                         + " was already committed; replay skipped (applied " + applied
                         + " of 1)");
+                    // The writer already holds this transaction's files in its LSM tree but they
+                    // were never committed; reusing it makes a later compaction delete files the
+                    // table never saw ("File deletion conflicts detected"). Discard both.
+                    e.commit().abort(msgs);
+                    dropEntry(relid);
                 }
             } catch (Exception | Error ex) {
                 dropEntry(relid);   // never reuse a writer holding half-written buffers
@@ -123,6 +128,9 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
      * later commit and OffsetStore report an impossible offset.
      */
     public void truncate(long relid, long commitLsn) throws Exception {
+        // The cached writer holds pre-truncate LSM files the overwrite is about to delete; reusing
+        // it makes the next compaction fail with "File deletion conflicts detected".
+        dropEntry(relid);
         FileStoreTable t = registry.table(relid);
         try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
             int applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of()));
@@ -130,6 +138,8 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                 LOG.info("truncate of relation " + relid + " at " + commitLsn
                     + " was already committed; replay skipped");
             }
+        } finally {
+            dropEntry(relid);
         }
     }
 

@@ -255,4 +255,24 @@ class PaimonSinkTest {
         assertEquals(aSnaps, latest());
         assertEquals(700L, store.highestCommittedLsn(List.of(RELID, relB)));
     }
+
+    @Test @Order(13)
+    void manyCommitsAfterATruncateSurviveCompaction() throws Exception {
+        for (int i = 0; i < 12; i++) {
+            long lsn = 800 + i;
+            sink.flush(List.of(new SinkRecord(RELID, RowKind.INSERT,
+                Arrays.asList(String.valueOf(100 + i), "p", null), lsn, 0, 4711L)), lsn, lsn + 1);
+        }
+        sink.truncate(RELID, 900L);
+        assertDoesNotThrow(() -> {
+            for (int i = 0; i < 30; i++) {
+                long lsn = 1000 + i;
+                sink.flush(List.of(new SinkRecord(RELID, RowKind.INSERT,
+                    Arrays.asList(String.valueOf(200 + i), "q", null), lsn, 0, 4711L)),
+                    lsn, lsn + 1);
+            }
+        });
+        assertEquals(30, mergedValues().size());
+        assertEquals(1029L, new OffsetStore(reg, cfg).highestCommittedLsn(List.of(RELID)));
+    }
 }
