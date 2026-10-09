@@ -98,6 +98,7 @@ public final class Main {
                     mainThread.join(30_000);   // let an in-flight flush finish before closing
                 }
                 sink.close();
+                catalog.close();
             } catch (Exception e) {
                 LOG.warning("error while closing the sink: " + e);
             }

@@ -162,4 +162,30 @@ class SlotConsumerTest {
         assertEquals(List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
                              new DdlMessage.Col(2, "v", "STRING")), cols);
     }
+
+    @Test
+    void onlyAPlainConnectionSqlExceptionIsRetryable() {
+        assertTrue(SlotConsumer.isConnectionLoss(new java.sql.SQLException("lost", "08006")));
+        assertTrue(SlotConsumer.isConnectionLoss(new java.sql.SQLException("no state")));
+        assertTrue(SlotConsumer.isConnectionLoss(
+            new java.sql.SQLException("slot is active for PID 5", "55006")));
+        assertFalse(SlotConsumer.isConnectionLoss(new IllegalStateException("bad setting")));
+        assertFalse(SlotConsumer.isConnectionLoss(new RuntimeException("decoder")));
+    }
+
+    @Test
+    void aMissingOrInvalidatedSlotIsFatal() {
+        assertFalse(SlotConsumer.isConnectionLoss(new java.sql.SQLException(
+            "replication slot \"paimon\" does not exist", "42704")));
+        assertFalse(SlotConsumer.isConnectionLoss(new java.sql.SQLException(
+            "can no longer get changes from replication slot", "55000")));
+    }
+
+    @Test
+    void aHandlerFailureWrappingASqlExceptionIsNotRetryable() {
+        Throwable wrapped = new SlotConsumer.HandlerFailure(
+            new java.sql.SQLException("paimon side", "08006"));
+        assertFalse(SlotConsumer.isConnectionLoss(wrapped));
+        assertInstanceOf(java.sql.SQLException.class, wrapped.getCause());
+    }
 }

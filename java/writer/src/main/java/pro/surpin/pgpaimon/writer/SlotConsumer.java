@@ -77,8 +77,17 @@ public final class SlotConsumer {
                         continue;
                     }
                     long changeLsn = stream.getLastReceiveLSN().asLong();
-                    // Not inside the connection-loss handling: failures here are fatal.
-                    handler.onEvent(decoder.decode(buf), changeLsn);
+                    // Wrapped so that nothing from here, a SQLException included, can be taken
+                    // for connection loss: failures here are fatal. Decoder errors are already
+                    // unchecked and likewise never match the SQLException handler below.
+                    PgEvent event = decoder.decode(buf);
+                    try {
+                        handler.onEvent(event, changeLsn);
+                    } catch (RuntimeException e) {
+                        throw e;
+                    } catch (Exception e) {
+                        throw new HandlerFailure(e);
+                    }
                 }
                 // Clean stop: report the confirmed position now rather than at the next interval.
                 try {
@@ -89,6 +98,9 @@ public final class SlotConsumer {
             } catch (SQLException e) {
                 if (!running) {
                     return;
+                }
+                if (!isConnectionLoss(e)) {
+                    throw e;    // a missing or invalidated slot cannot resolve itself
                 }
                 LOG.warning("replication stream lost: " + e
                             + "; discarding any open transaction and reconnecting in "
@@ -101,6 +113,29 @@ public final class SlotConsumer {
                 stream = null;
             }
         }
+    }
+
+    /** Wraps a checked exception from {@link Handler#onEvent}; never retried. */
+    static final class HandlerFailure extends RuntimeException {
+        HandlerFailure(Throwable cause) {
+            super("event handler failed: " + cause, cause);
+        }
+    }
+
+    /**
+     * Whether a failure should reconnect with backoff. Only a {@link SQLException} from the
+     * connection itself qualifies, and not every one: a missing slot (42704) is fatal because
+     * nothing creates it but the Backfiller, and an invalidated slot (55000, "can no longer get
+     * changes") is unrecoverable without a re-bootstrap. Retrying either is a loop, not
+     * resilience. The cause chain is deliberately not searched, so a failure wrapped by the
+     * handler boundary is never retryable.
+     */
+    static boolean isConnectionLoss(Throwable t) {
+        if (!(t instanceof SQLException e)) {
+            return false;
+        }
+        String state = e.getSQLState();
+        return !("42704".equals(state) || "55000".equals(state));
     }
 
     private Connection connect() throws SQLException {
