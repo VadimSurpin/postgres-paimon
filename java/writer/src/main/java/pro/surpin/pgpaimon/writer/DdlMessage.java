@@ -81,6 +81,24 @@ public record DdlMessage(int version, String op, long relid, String schema, Stri
             text(n, "from"), text(n, "to"), text(n, "name"), text(n, "type"), options);
     }
 
+    /** Parses the {@code cols} jsonb of a {@code paimon.table_registry} row (a JSON array). */
+    public static List<Col> parseCols(String json) {
+        JsonNode n;
+        try {
+            n = MAPPER.readTree(json);
+        } catch (IOException e) {
+            throw new IllegalStateException("registry cols is not valid JSON", e);
+        }
+        if (n == null || !n.isArray()) {
+            throw new IllegalStateException("registry cols is not a JSON array");
+        }
+        List<Col> cols = new ArrayList<>();
+        for (JsonNode c : n) {
+            cols.add(col(c));
+        }
+        return cols;
+    }
+
     private static Col col(JsonNode c) {
         return new Col(c.hasNonNull("id") ? c.get("id").asInt() : 0,
                        text(c, "name"), text(c, "type"));

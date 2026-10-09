@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: Apache-2.0
+package pro.surpin.pgpaimon.writer;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.*;
+import org.junit.jupiter.api.Test;
+
+class SlotConsumerTest {
+
+    @Test
+    void lsnTextFormRoundTrips() {
+        assertEquals(0x16B374D8L, SlotConsumer.parseLsn("0/16B374D8"));
+        assertEquals(0x100000000L, SlotConsumer.parseLsn("1/0"));
+        assertEquals("0/16B374D8", SlotConsumer.formatLsn(0x16B374D8L));
+        assertEquals("1/00000000", SlotConsumer.formatLsn(0x100000000L));
+    }
+
+    @Test
+    void zeroLsnMeansStartFromTheSlotsOwnPosition() {
+        assertEquals("0/00000000", SlotConsumer.formatLsn(0L));
+    }
+
+    /** Review Focus 4: a disconnect mid-transaction discards, never flushes. */
+    @Test
+    void disconnectDiscardsAnOpenTransaction() throws Exception {
+        List<List<SinkRecord>> flushed = new ArrayList<>();
+        TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null,
+            (records, commitLsn, endLsn) -> flushed.add(List.copyOf(records)));
+
+        RelationMeta meta = new RelationMeta(1, "public", "t",
+            List.of("id"), List.of(true));
+        batcher.onEvent(new PgEvent.Begin(10L, 0L, 1L), 10L, null);
+        batcher.onEvent(new PgEvent.Insert(1,
+            new TupleData(List.of(ColumnValue.of("1")))), 11L, meta);
+
+        assertTrue(batcher.hasOpenTransaction());
+        batcher.discardOpenTransaction();          // what onDisconnect() does
+        assertFalse(batcher.hasOpenTransaction());
+        assertTrue(flushed.isEmpty(),
+                   "a transaction PostgreSQL may still abort must never be committed");
+    }
+
+    // ---- the real handler wiring (Main.PipelineHandler) -----------------------------------
+
+    static final RelationMeta META = new RelationMeta(1, "public", "t",
+        List.of("id"), List.of(true));
+
+    /** Records every call the handler makes, in order. */
+    static final class Fixture implements Main.PipelineHandler.Target {
+        final List<String> calls = new ArrayList<>();
+        final List<List<SinkRecord>> flushed = new ArrayList<>();
+        final List<Long> confirmed = new ArrayList<>();
+        final Set<Long> tracked = new HashSet<>(Set.of(1L, 2L));
+        final TxnBatcher batcher;
+        final Main.PipelineHandler handler;
+
+        Fixture() {
+            TxnBatcher.Flusher inner = (records, commitLsn, endLsn) -> {
+                calls.add("flush@" + commitLsn);
+                flushed.add(List.copyOf(records));
+            };
+            batcher = new TxnBatcher(new ToastResolver(), null,
+                Main.confirmingFlusher(inner, confirmed::add));
+            handler = new Main.PipelineHandler(tracked::contains, m -> calls.add("ddl"),
+                this, batcher);
+        }
+
+        @Override public void setRelation(long relid, RelationMeta meta) {
+            calls.add("relation" + relid);
+        }
+        @Override public void truncate(long relid, long commitLsn) {
+            calls.add("truncate" + relid + "@" + commitLsn);
+        }
+    }
+
+    static PgEvent.Insert insert(long relid, String id) {
+        return new PgEvent.Insert(relid, new TupleData(List.of(ColumnValue.of(id))));
+    }
+
+    @Test
+    void aTruncateIsBufferedAndAppliedAtCommitUnderTheCommitLsn() throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(1L, 99L), false, false), 41L);
+        assertEquals(List.of(), f.calls, "nothing may be applied before the Commit is known");
+        f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
+        // the untracked relation 99 is dropped; the truncate precedes the confirm
+        assertEquals(List.of("truncate1@50", "flush@50"), f.calls);
+        assertEquals(List.of(55L), f.confirmed);
+    }
+
+    /** Review Focus 4, asserting the discard itself: buffered truncates and rows both vanish. */
+    @Test
+    void reconnectMidTransactionDiscardsRowsAndTruncatesThenReplaysWhole() throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(2L), false, false), 41L);
+        f.handler.onEvent(insert(1, "1"), 42L);
+        assertTrue(f.batcher.hasOpenTransaction());
+
+        f.handler.onDisconnect();
+
+        assertFalse(f.batcher.hasOpenTransaction(), "the open batch was discarded");
+        assertEquals(List.of("relation1"), f.calls, "no truncate, no flush");
+        assertTrue(f.flushed.isEmpty());
+        assertTrue(f.confirmed.isEmpty(), "nothing partial may be confirmed");
+
+        // The server replays the transaction whole from the last confirmed LSN. Had the
+        // truncate buffer survived, relation 2 would be truncated twice (or relation 2 would
+        // appear here without having been replayed); the commit must see exactly one.
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(insert(1, "1"), 42L);
+        f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
+        assertEquals(List.of("relation1", "flush@50"), f.calls,
+            "the stale truncate of relation 2 must not survive the disconnect");
+        assertEquals(1, f.flushed.size());
+        assertEquals(1, f.flushed.get(0).size());
+        assertEquals(List.of(55L), f.confirmed);
+    }
+
+    @Test
+    void aFailedFlushIsNotConfirmedAndPropagates() {
+        List<Long> confirmed = new ArrayList<>();
+        TxnBatcher.Flusher f = Main.confirmingFlusher(
+            (r, c, e) -> { throw new java.io.IOException("commit failed"); }, confirmed::add);
+        assertThrows(java.io.IOException.class, () -> f.flush(List.of(), 1L, 2L));
+        assertTrue(confirmed.isEmpty(), "confirm only after the Paimon commit returned");
+    }
+
+    @Test
+    void aBatcherFailurePropagatesRatherThanBeingSwallowed() throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 41L);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        // truncate then DML on the same table: the batcher refuses; the handler must not hide it
+        assertThrows(IllegalStateException.class, () -> f.handler.onEvent(insert(1, "1"), 42L));
+        assertFalse(f.batcher.hasOpenTransaction());
+    }
+
+    @Test
+    void relationAndDdlMessagesReachTheirConsumers() throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        f.handler.onEvent(new PgEvent.Message(true, 5L, "paimon", new byte[0]), 5L);
+        assertEquals(List.of("relation1", "ddl"), f.calls);
+    }
+
+    @Test
+    void relidOfIsMinusOneForNonRowEvents() {
+        assertEquals(5L, Main.relidOf(insert(5, "1")));
+        assertEquals(-1L, Main.relidOf(new PgEvent.Begin(1L, 0L, 1L)));
+    }
+
+    @Test
+    void registryColsJsonParses() {
+        List<DdlMessage.Col> cols = DdlMessage.parseCols(
+            "[{\"id\":1,\"name\":\"id\",\"type\":\"INT NOT NULL\"},"
+            + "{\"id\":2,\"name\":\"v\",\"type\":\"STRING\"}]");
+        assertEquals(List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
+                             new DdlMessage.Col(2, "v", "STRING")), cols);
+    }
+}
