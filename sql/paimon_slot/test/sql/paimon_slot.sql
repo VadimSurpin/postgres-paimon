@@ -17,7 +17,7 @@ SELECT paimon.pg_type_to_paimon('text'::regtype, -1, false)         AS t,
        paimon.pg_type_to_paimon('timestamp'::regtype, -1, false)    AS ts,
        paimon.pg_type_to_paimon('timestamptz'::regtype, -1, false)  AS tstz;
 
--- Review Focus 5: an unmapped type falls through to STRING, with a warning
+-- types with no Paimon mapping fall through to STRING, each with a WARNING
 SET client_min_messages = warning;
 SELECT paimon.pg_type_to_paimon('int4[]'::regtype, -1, false)  AS arr,
        paimon.pg_type_to_paimon('jsonb'::regtype, -1, false)   AS jb,
@@ -34,3 +34,18 @@ ALTER TABLE reg_t ADD COLUMN tmp int;
 ALTER TABLE reg_t DROP COLUMN tmp;
 ALTER TABLE reg_t ADD COLUMN kept int;
 SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
+
+-- composite PK declared in non-catalog order: pk_cols must follow index order {c,a}, not column order {a,c}
+CREATE TABLE pk_order_t (a int, b int, c int, PRIMARY KEY (c, a));
+SELECT paimon.pk_cols('pk_order_t'::regclass);
+
+-- no primary key: pk_cols returns an empty array, never NULL
+CREATE TABLE no_pk_t (x int);
+SELECT paimon.pk_cols('no_pk_t'::regclass) AS pk,
+       paimon.pk_cols('no_pk_t'::regclass) IS NULL AS is_null,
+       cardinality(paimon.pk_cols('no_pk_t'::regclass)) AS len;
+
+-- no user columns: table_cols returns an empty JSON array, never NULL
+CREATE TABLE no_cols_t ();
+SELECT paimon.table_cols('no_cols_t'::regclass) AS cols,
+       paimon.table_cols('no_cols_t'::regclass) IS NULL AS is_null;
