@@ -2,6 +2,7 @@
 package pro.surpin.pgpaimon.writer;
 
 import org.junit.jupiter.api.Test;
+import java.nio.ByteBuffer;
 import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -87,11 +88,50 @@ class WriterConfigTest {
 
     @Test
     void oidAboveIntMaxIsHeldUnsignedAsLong() {
-        long oid = 3_000_000_000L;
-        RelationMeta m = new RelationMeta(oid, "public", "t", List.of("id"), List.of(true));
-        // pgoutput binary route and DDL JSON string route land on the same value
-        assertEquals(m.relid(), Integer.toUnsignedLong((int) oid));
-        assertEquals(m.relid(), Long.parseLong("3000000000"));
-        assertTrue(m.relid() > 0);
+        // binary protocol route: 4 bytes through a real ByteBuffer
+        ByteBuffer buf = ByteBuffer.allocate(4).putInt((int) 3_000_000_000L);
+        buf.flip();
+        long fromBinary = Integer.toUnsignedLong(buf.getInt());
+        // DDL JSON route: decimal string
+        long fromJson = Long.parseLong("3000000000");
+        assertEquals(fromJson, fromBinary);
+        assertEquals(3_000_000_000L, fromBinary);
+
+        RelationMeta m = new RelationMeta(fromBinary, "public", "t", List.of("id"), List.of(true));
+        PgEvent.Insert ins = new PgEvent.Insert(fromJson, new TupleData(List.of(ColumnValue.of("1"))));
+        PgEvent.Truncate tr = new PgEvent.Truncate(List.of(fromBinary), false, false);
+        PgEvent.TypeMsg ty = new PgEvent.TypeMsg(fromBinary, "public", "my_type");
+        assertEquals(3_000_000_000L, m.relid());
+        assertEquals(3_000_000_000L, ins.relid());
+        assertEquals(3_000_000_000L, tr.relids().get(0));
+        assertEquals(3_000_000_000L, ty.typeOid());
+    }
+
+    @Test
+    void invalidColumnValueCombinationsThrow() {
+        assertThrows(IllegalArgumentException.class, () -> new ColumnValue(ColState.TEXT, null));
+        assertThrows(IllegalArgumentException.class, () -> new ColumnValue(ColState.NULL, ""));
+        assertThrows(IllegalArgumentException.class, () -> new ColumnValue(ColState.UNCHANGED, "x"));
+        assertThrows(IllegalArgumentException.class, () -> new ColumnValue(null, "x"));
+        assertEquals(ColState.TEXT, new ColumnValue(ColState.TEXT, "").state());
+    }
+
+    @Test
+    void malformedNumberNamesTheVariable() {
+        Map<String, String> e = minimal();
+        e.put("PGPAIMON_FLUSH_MAX_RECORDS", "lots");
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> WriterConfig.fromEnv(e));
+        assertTrue(ex.getMessage().contains("PGPAIMON_FLUSH_MAX_RECORDS"));
+        assertTrue(ex.getMessage().contains("lots"));
+
+        Map<String, String> e2 = minimal();
+        e2.put("PGPAIMON_FLUSH_MAX_INTERVAL_MS", "1s");
+        ex = assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(e2));
+        assertTrue(ex.getMessage().contains("PGPAIMON_FLUSH_MAX_INTERVAL_MS"));
+
+        Map<String, String> e3 = minimal();
+        e3.put("PGPAIMON_FLUSH_MAX_RECORDS", "99999999999");
+        assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(e3));
     }
 }

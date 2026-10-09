@@ -39,8 +39,8 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             getOrDefault(env, "PGPAIMON_SEQ_FIELD", "_seq"),
             getOrDefault(env, "PGPAIMON_OP_SEQ_FIELD", "_op_seq"),
             get(env, "PGPAIMON_XID_FIELD"),
-            Integer.parseInt(getOrDefault(env, "PGPAIMON_FLUSH_MAX_RECORDS", "10000")),
-            Long.parseLong(getOrDefault(env, "PGPAIMON_FLUSH_MAX_INTERVAL_MS", "1000")),
+            (int) parseNumber(env, "PGPAIMON_FLUSH_MAX_RECORDS", "10000", Integer.MAX_VALUE),
+            parseNumber(env, "PGPAIMON_FLUSH_MAX_INTERVAL_MS", "1000", Long.MAX_VALUE),
             Map.copyOf(cat));
     }
 
@@ -53,6 +53,19 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
     private static String getOrDefault(Map<String, String> env, String key, String dflt) {
         String v = get(env, key);
         return v == null ? dflt : v;
+    }
+
+    private static long parseNumber(Map<String, String> env, String key, String dflt, long max) {
+        String v = getOrDefault(env, key, dflt);
+        try {
+            long n = Long.parseLong(v.trim());
+            if (n > max) {
+                throw new NumberFormatException("out of range");
+            }
+            return n;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(key + " must be a number, got '" + v + "'", e);
+        }
     }
 
     private static String require(Map<String, String> env, String key) {
