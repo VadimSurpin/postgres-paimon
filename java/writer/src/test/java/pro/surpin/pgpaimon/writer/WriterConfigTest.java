@@ -26,8 +26,17 @@ class WriterConfigTest {
         assertEquals("_seq", c.seqField());
         assertEquals("_op_seq", c.opSeqField());
         assertNull(c.xidField(), "_xid is optional and off by default");
-        assertEquals("paimon-writer", c.commitUser());
+        assertEquals("paimon-writer-paimon", c.commitUser());
         assertEquals("default", c.database());
+    }
+
+    @Test
+    void commitUserIsDerivedFromTheSlotAndOverridable() {
+        Map<String, String> env = new HashMap<>(minimal());
+        env.put("PGPAIMON_SLOT", "other_slot");
+        assertEquals("paimon-writer-other_slot", WriterConfig.fromEnv(env).commitUser());
+        env.put("PGPAIMON_COMMIT_USER", "explicit");
+        assertEquals("explicit", WriterConfig.fromEnv(env).commitUser());
     }
 
     @Test
