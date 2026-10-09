@@ -472,6 +472,151 @@ SELECT paimon.peek_messages() - 'relid';
  {"v": 1, "op": "drop_table", "table": "t", "schema": "s4"}
 (1 row)
 
+-- columns lost to a cascade from another object are synced in the same statement
+CREATE DOMAIN dd AS int;
+CREATE TYPE ct AS (f int);
+CREATE TABLE casc_t (id int PRIMARY KEY, a int);
+SELECT paimon.add_table('casc_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE casc_t ADD COLUMN dcol dd;
+WARNING:  paimon_slot: type dd has no Paimon mapping, using STRING
+ALTER TABLE casc_t ADD COLUMN tcol ct;
+WARNING:  paimon_slot: type dd has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type ct has no Paimon mapping, using STRING
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                          ?column?                                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}], "table": "casc_t", "schema": "public", "options": {"changelog-producer": "input"}}
+ {"v": 1, "op": "add_col", "col": {"id": 3, "name": "dcol", "type": "STRING"}}
+ {"v": 1, "op": "add_col", "col": {"id": 4, "name": "tcol", "type": "STRING"}}
+(3 rows)
+
+DROP DOMAIN dd CASCADE;
+NOTICE:  drop cascades to column dcol of table casc_t
+WARNING:  paimon_slot: type ct has no Paimon mapping, using STRING
+SELECT paimon.peek_messages() - 'relid';
+                  ?column?                  
+--------------------------------------------
+ {"v": 1, "op": "drop_col", "name": "dcol"}
+(1 row)
+
+DROP TYPE ct CASCADE;
+NOTICE:  drop cascades to column tcol of table casc_t
+SELECT paimon.peek_messages() - 'relid';
+                  ?column?                  
+--------------------------------------------
+ {"v": 1, "op": "drop_col", "name": "tcol"}
+(1 row)
+
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid = 'casc_t'::regclass;
+ jsonb_path_query_array 
+------------------------
+ ["id", "a"]
+(1 row)
+
+-- same, for a table whose only cascaded column is a non-PK one
+CREATE TYPE ct2 AS (f int);
+CREATE TABLE casc2_t (id int PRIMARY KEY, c ct2);
+SELECT paimon.add_table('casc2_t'::regclass);
+WARNING:  paimon_slot: type ct2 has no Paimon mapping, using STRING
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                            ?column?                                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "casc2_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+DROP TYPE ct2 CASCADE;
+NOTICE:  drop cascades to column c of table casc2_t
+SELECT paimon.peek_messages() - 'relid';
+                ?column?                 
+-----------------------------------------
+ {"v": 1, "op": "drop_col", "name": "c"}
+(1 row)
+
+DROP TABLE casc_t;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                               
+---------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "casc_t", "schema": "public"}
+(1 row)
+
+-- a table dropped in the same cascade as the type its column uses: drop_table only
+CREATE SCHEMA s5;
+CREATE DOMAIN s5.d AS int;
+CREATE TABLE s5.t (id int PRIMARY KEY, c s5.d);
+SELECT paimon.add_table('s5.t'::regclass);
+WARNING:  paimon_slot: type s5.d has no Paimon mapping, using STRING
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                       ?column?                                                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "t", "schema": "s5", "options": {"changelog-producer": "input"}}
+(1 row)
+
+DROP SCHEMA s5 CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to type s5.d
+drop cascades to table s5.t
+SELECT paimon.peek_messages() - 'relid';
+                          ?column?                          
+------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "t", "schema": "s5"}
+(1 row)
+
+-- RENAME TO: the Paimon table name is fixed at registration; tracking survives
+CREATE TABLE ren_t (id int PRIMARY KEY);
+SELECT paimon.add_table('ren_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                      ?column?                                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "ren_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+ALTER TABLE ren_t RENAME TO ren_t2;
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+SELECT table_name FROM paimon.table_registry WHERE relid = 'ren_t2'::regclass;
+ table_name 
+------------
+ ren_t
+(1 row)
+
+ALTER TABLE ren_t2 ADD COLUMN after_rename int;
+SELECT paimon.peek_messages() - 'relid';
+                                      ?column?                                      
+------------------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 2, "name": "after_rename", "type": "INT"}}
+(1 row)
+
+DROP TABLE ren_t2;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                              
+--------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "ren_t", "schema": "public"}
+(1 row)
+
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
 --------------------------

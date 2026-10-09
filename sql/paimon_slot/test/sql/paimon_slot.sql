@@ -170,4 +170,48 @@ SELECT paimon.peek_messages() - 'relid';
 DROP SCHEMA s4 CASCADE;
 SELECT paimon.peek_messages() - 'relid';
 
+-- columns lost to a cascade from another object are synced in the same statement
+CREATE DOMAIN dd AS int;
+CREATE TYPE ct AS (f int);
+CREATE TABLE casc_t (id int PRIMARY KEY, a int);
+SELECT paimon.add_table('casc_t'::regclass);
+ALTER TABLE casc_t ADD COLUMN dcol dd;
+ALTER TABLE casc_t ADD COLUMN tcol ct;
+SELECT paimon.peek_messages() - 'relid';
+DROP DOMAIN dd CASCADE;
+SELECT paimon.peek_messages() - 'relid';
+DROP TYPE ct CASCADE;
+SELECT paimon.peek_messages() - 'relid';
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid = 'casc_t'::regclass;
+-- same, for a table whose only cascaded column is a non-PK one
+CREATE TYPE ct2 AS (f int);
+CREATE TABLE casc2_t (id int PRIMARY KEY, c ct2);
+SELECT paimon.add_table('casc2_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+DROP TYPE ct2 CASCADE;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE casc_t;
+SELECT paimon.peek_messages() - 'relid';
+-- a table dropped in the same cascade as the type its column uses: drop_table only
+CREATE SCHEMA s5;
+CREATE DOMAIN s5.d AS int;
+CREATE TABLE s5.t (id int PRIMARY KEY, c s5.d);
+SELECT paimon.add_table('s5.t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+DROP SCHEMA s5 CASCADE;
+SELECT paimon.peek_messages() - 'relid';
+
+-- RENAME TO: the Paimon table name is fixed at registration; tracking survives
+CREATE TABLE ren_t (id int PRIMARY KEY);
+SELECT paimon.add_table('ren_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE ren_t RENAME TO ren_t2;
+SELECT paimon.peek_messages() - 'relid';
+SELECT table_name FROM paimon.table_registry WHERE relid = 'ren_t2'::regclass;
+ALTER TABLE ren_t2 ADD COLUMN after_rename int;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE ren_t2;
+SELECT paimon.peek_messages() - 'relid';
+
 SELECT pg_drop_replication_slot('paimon_test');

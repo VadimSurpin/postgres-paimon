@@ -214,112 +214,122 @@ END $$;
  * so RAISE here rolls the whole statement back: the user-visible outcome is the
  * same as pre-execution blocking.
  */
-CREATE FUNCTION paimon.on_ddl_end() RETURNS event_trigger
+/*
+ * Diff one tracked table's registry state against the live table and emit the
+ * resulting messages.  Called from both event triggers so that whenever the
+ * registry's cols stops matching the live table, a message goes out in the
+ * same transaction.  A no-op for untracked tables.
+ */
+CREATE FUNCTION paimon.sync_table(v_relid oid) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    obj       record;
     reg       paimon.table_registry;
-    v_relid   oid;
     new_cols  jsonb;
     new_pk    text[];
     c         jsonb;
     o         jsonb;
 BEGIN
-    FOR obj IN SELECT DISTINCT objid, classid FROM pg_event_trigger_ddl_commands()
+    SELECT * INTO reg FROM paimon.table_registry WHERE relid = v_relid;
+    IF NOT FOUND THEN RETURN; END IF;
+
+    new_pk   := paimon.pk_cols(v_relid);
+    new_cols := paimon.table_cols(v_relid);
+
+    /* Guardrail: primary key may not be added, dropped or changed. */
+    IF new_pk <> reg.pk_cols THEN
+        RAISE EXCEPTION 'paimon_slot: cannot change the primary key of %.%',
+                        reg.schema_name, reg.table_name
+              USING HINT = 'the Paimon table key is fixed at add_table() time';
+    END IF;
+
+    /*
+     * Everything below is derived from one before/after diff of the whole
+     * statement's net effect (registry cols vs live cols, keyed by field
+     * id), so combined actions such as DROP COLUMN x, ADD COLUMN y cannot
+     * hide one another.  All guardrails run before anything is emitted.
+     */
+    FOR c IN SELECT * FROM jsonb_array_elements(new_cols)
     LOOP
-        CONTINUE WHEN obj.classid <> 'pg_class'::regclass;
-        v_relid := obj.objid;
+        SELECT x INTO o FROM jsonb_array_elements(reg.cols) x
+         WHERE (x->>'id') = (c->>'id');
 
-        SELECT * INTO reg FROM paimon.table_registry WHERE relid = v_relid;
-        CONTINUE WHEN NOT FOUND;
+        IF o IS NULL THEN
+            /* added column */
+            IF EXISTS (SELECT 1 FROM pg_attribute
+                       WHERE attrelid = v_relid
+                         AND attnum = (c->>'id')::int
+                         AND atthasdef) THEN
+                RAISE EXCEPTION
+                    'paimon_slot: ADD COLUMN with a DEFAULT is not supported (%.%.%)',
+                    reg.schema_name, reg.table_name, c->>'name'
+                      USING HINT = 'add the column without a default, then UPDATE it';
+            END IF;
 
-        new_pk   := paimon.pk_cols(v_relid);
-        new_cols := paimon.table_cols(v_relid);
+            PERFORM paimon.reject_reserved_name(c->>'name');
 
-        /* Guardrail: primary key may not be added, dropped or changed. */
-        IF new_pk <> reg.pk_cols THEN
-            RAISE EXCEPTION 'paimon_slot: cannot change the primary key of %.%',
-                            reg.schema_name, reg.table_name
-                  USING HINT = 'the Paimon table key is fixed at add_table() time';
+            IF (c->>'type') LIKE '% NOT NULL' THEN
+                RAISE EXCEPTION
+                    'paimon_slot: ADD COLUMN ... NOT NULL without a default is not supported (%.%.%)',
+                    reg.schema_name, reg.table_name, c->>'name';
+            END IF;
+        ELSIF (o->>'name') <> (c->>'name') THEN
+            PERFORM paimon.reject_reserved_name(c->>'name');
+        END IF;
+    END LOOP;
+
+    /* Emit: drops first, then renames and alters, then adds, so a dropped
+     * name can be reused by an added column. */
+    FOR o IN SELECT x FROM jsonb_array_elements(reg.cols) x
+              WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(new_cols) n
+                                 WHERE (n->>'id') = (x->>'id'))
+    LOOP
+        PERFORM paimon.emit(jsonb_build_object(
+            'v', 1, 'op', 'drop_col', 'relid', v_relid, 'name', o->>'name'));
+    END LOOP;
+
+    FOR c IN SELECT * FROM jsonb_array_elements(new_cols)
+    LOOP
+        SELECT x INTO o FROM jsonb_array_elements(reg.cols) x
+         WHERE (x->>'id') = (c->>'id');
+        CONTINUE WHEN o IS NULL;
+
+        IF (o->>'name') <> (c->>'name') THEN
+            PERFORM paimon.emit(jsonb_build_object(
+                'v', 1, 'op', 'rename_col', 'relid', v_relid,
+                'id', (c->>'id')::int,
+                'from', o->>'name', 'to', c->>'name'));
         END IF;
 
-        /*
-         * Everything below is derived from one before/after diff of the whole
-         * statement's net effect (registry cols vs live cols, keyed by field
-         * id), so combined actions such as DROP COLUMN x, ADD COLUMN y cannot
-         * hide one another.  All guardrails run before anything is emitted.
-         */
-        FOR c IN SELECT * FROM jsonb_array_elements(new_cols)
-        LOOP
-            SELECT x INTO o FROM jsonb_array_elements(reg.cols) x
-             WHERE (x->>'id') = (c->>'id');
-
-            IF o IS NULL THEN
-                /* added column */
-                IF EXISTS (SELECT 1 FROM pg_attribute
-                           WHERE attrelid = v_relid
-                             AND attnum = (c->>'id')::int
-                             AND atthasdef) THEN
-                    RAISE EXCEPTION
-                        'paimon_slot: ADD COLUMN with a DEFAULT is not supported (%.%.%)',
-                        reg.schema_name, reg.table_name, c->>'name'
-                          USING HINT = 'add the column without a default, then UPDATE it';
-                END IF;
-
-                PERFORM paimon.reject_reserved_name(c->>'name');
-
-                IF (c->>'type') LIKE '% NOT NULL' THEN
-                    RAISE EXCEPTION
-                        'paimon_slot: ADD COLUMN ... NOT NULL without a default is not supported (%.%.%)',
-                        reg.schema_name, reg.table_name, c->>'name';
-                END IF;
-            ELSIF (o->>'name') <> (c->>'name') THEN
-                PERFORM paimon.reject_reserved_name(c->>'name');
-            END IF;
-        END LOOP;
-
-        /* Emit: drops first, then renames and alters, then adds, so a dropped
-         * name can be reused by an added column. */
-        FOR o IN SELECT x FROM jsonb_array_elements(reg.cols) x
-                  WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(new_cols) n
-                                     WHERE (n->>'id') = (x->>'id'))
-        LOOP
+        IF (o->>'type') <> (c->>'type') THEN
             PERFORM paimon.emit(jsonb_build_object(
-                'v', 1, 'op', 'drop_col', 'relid', v_relid, 'name', o->>'name'));
-        END LOOP;
+                'v', 1, 'op', 'alter_col', 'relid', v_relid,
+                'id', (c->>'id')::int,
+                'name', c->>'name', 'type', c->>'type'));
+        END IF;
+    END LOOP;
 
-        FOR c IN SELECT * FROM jsonb_array_elements(new_cols)
-        LOOP
-            SELECT x INTO o FROM jsonb_array_elements(reg.cols) x
-             WHERE (x->>'id') = (c->>'id');
-            CONTINUE WHEN o IS NULL;
+    FOR c IN SELECT n FROM jsonb_array_elements(new_cols) n
+              WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(reg.cols) x
+                                 WHERE (x->>'id') = (n->>'id'))
+    LOOP
+        PERFORM paimon.emit(jsonb_build_object(
+            'v', 1, 'op', 'add_col', 'relid', v_relid, 'col', c));
+    END LOOP;
 
-            IF (o->>'name') <> (c->>'name') THEN
-                PERFORM paimon.emit(jsonb_build_object(
-                    'v', 1, 'op', 'rename_col', 'relid', v_relid,
-                    'id', (c->>'id')::int,
-                    'from', o->>'name', 'to', c->>'name'));
-            END IF;
+    UPDATE paimon.table_registry
+       SET cols = new_cols
+     WHERE relid = v_relid;
+END $$;
 
-            IF (o->>'type') <> (c->>'type') THEN
-                PERFORM paimon.emit(jsonb_build_object(
-                    'v', 1, 'op', 'alter_col', 'relid', v_relid,
-                    'id', (c->>'id')::int,
-                    'name', c->>'name', 'type', c->>'type'));
-            END IF;
-        END LOOP;
-
-        FOR c IN SELECT n FROM jsonb_array_elements(new_cols) n
-                  WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(reg.cols) x
-                                     WHERE (x->>'id') = (n->>'id'))
-        LOOP
-            PERFORM paimon.emit(jsonb_build_object(
-                'v', 1, 'op', 'add_col', 'relid', v_relid, 'col', c));
-        END LOOP;
-
-        UPDATE paimon.table_registry
-           SET cols = new_cols
-         WHERE relid = v_relid;
+CREATE FUNCTION paimon.on_ddl_end() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    obj record;
+BEGIN
+    FOR obj IN SELECT DISTINCT objid FROM pg_event_trigger_ddl_commands()
+                WHERE classid = 'pg_class'::regclass
+    LOOP
+        PERFORM paimon.sync_table(obj.objid);
     END LOOP;
 END $$;
 
@@ -327,27 +337,40 @@ CREATE EVENT TRIGGER paimon_ddl_end ON ddl_command_end
     EXECUTE FUNCTION paimon.on_ddl_end();
 
 /*
- * Only table drops are handled here.  Column drops are covered by the
- * before/after diff in on_ddl_end(); a column of a dropped table needs no
- * message of its own.
+ * Table drops emit drop_table.  A column of a table that is itself dropped
+ * needs no message; a column lost from a surviving table is synced via the same
+ * diff on_ddl_end() uses.  The Paimon table name is deliberately fixed at
+ * registration: ALTER TABLE ... RENAME TO emits nothing and the registry keeps
+ * the original name (tracking is keyed on relid, so it survives the rename).
  */
 CREATE FUNCTION paimon.on_sql_drop() RETURNS event_trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-    obj record;
-    reg paimon.table_registry;
+    obj     record;
+    reg     paimon.table_registry;
+    dropped oid[];
 BEGIN
-    FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
-    LOOP
-        IF obj.object_type = 'table' THEN
-            SELECT * INTO reg FROM paimon.table_registry WHERE relid = obj.objid;
-            CONTINUE WHEN NOT FOUND;
-            PERFORM paimon.emit(jsonb_build_object(
-                'v', 1, 'op', 'drop_table', 'relid', obj.objid,
-                'schema', reg.schema_name, 'table', reg.table_name));
-            DELETE FROM paimon.table_registry WHERE relid = obj.objid;
+    SELECT coalesce(array_agg(objid), '{}') INTO dropped
+      FROM pg_event_trigger_dropped_objects() WHERE object_type = 'table';
 
-        END IF;
+    FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
+                WHERE object_type = 'table'
+    LOOP
+        SELECT * INTO reg FROM paimon.table_registry WHERE relid = obj.objid;
+        CONTINUE WHEN NOT FOUND;
+        PERFORM paimon.emit(jsonb_build_object(
+            'v', 1, 'op', 'drop_table', 'relid', obj.objid,
+            'schema', reg.schema_name, 'table', reg.table_name));
+        DELETE FROM paimon.table_registry WHERE relid = obj.objid;
+    END LOOP;
+
+    /* A column dropped by a cascade (DROP DOMAIN/TYPE ... CASCADE) is reported
+     * against the dropped object, so on_ddl_end never sees its table.  Sync
+     * every surviving table that lost a column. */
+    FOR obj IN SELECT DISTINCT objid FROM pg_event_trigger_dropped_objects()
+                WHERE object_type = 'table column' AND NOT (objid = ANY (dropped))
+    LOOP
+        PERFORM paimon.sync_table(obj.objid);
     END LOOP;
 END $$;
 
