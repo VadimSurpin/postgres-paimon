@@ -242,4 +242,23 @@ class TextDecoderTest {
     void columnNameAppearsInGenericParseErrors() {
         assertRejected(DataTypes.INT(), "zzz", "qty");
     }
+
+    @Test
+    void nonexistentDateIsRejectedForEveryTemporalType() {
+        assertRejected(DataTypes.DATE(), "2024-02-30", "d");
+        assertRejected(DataTypes.TIMESTAMP(6), "2024-02-30 00:00:00", "ts");
+        assertRejected(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6), "2024-02-30 00:00:00+00", "tstz");
+        // a real leap day still works
+        assertEquals("2024-02-29T00:00", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "2024-02-29 00:00:00")).toLocalDateTime().toString());
+    }
+
+    @Test
+    void decimalBoundaryIsExactlyAtThePrecisionLimit() {
+        assertEquals("999.99", ((Decimal) TextDecoder.toPaimon(
+            DataTypes.DECIMAL(5, 2), "999.99")).toBigDecimal().toPlainString());
+        assertEquals("-999.99", ((Decimal) TextDecoder.toPaimon(
+            DataTypes.DECIMAL(5, 2), "-999.99")).toBigDecimal().toPlainString());
+        assertRejected(DataTypes.DECIMAL(5, 2), "1000.00", "amt");
+    }
 }

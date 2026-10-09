@@ -9,6 +9,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.ResolverStyle;
 import java.time.temporal.ChronoField;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
@@ -38,7 +39,8 @@ public final class TextDecoder {
     private static final DateTimeFormatter TS = new DateTimeFormatterBuilder()
         .appendPattern("uuuu-MM-dd HH:mm:ss")
         .appendFraction(ChronoField.MICRO_OF_SECOND, 0, 6, true)
-        .toFormatter();
+        .toFormatter()
+        .withResolverStyle(ResolverStyle.STRICT);
 
     /**
      * "+HH:mm:ss" reads hours, then optional minutes, then optional seconds, which covers
@@ -48,7 +50,8 @@ public final class TextDecoder {
     private static final DateTimeFormatter TS_TZ = new DateTimeFormatterBuilder()
         .append(TS)
         .appendOffset("+HH:mm:ss", "+00")
-        .toFormatter();
+        .toFormatter()
+        .withResolverStyle(ResolverStyle.STRICT);
 
     private TextDecoder() {
     }
