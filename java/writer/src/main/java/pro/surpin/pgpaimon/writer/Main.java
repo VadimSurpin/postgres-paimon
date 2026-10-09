@@ -16,6 +16,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
+import java.util.function.LongFunction;
 import java.util.function.LongPredicate;
 import java.util.logging.Logger;
 import org.apache.paimon.catalog.Catalog;
@@ -82,7 +83,7 @@ public final class Main {
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry,
             confirmingFlusher(sink, lsn -> consumerRef[0].confirm(lsn)));
         DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix());
-        SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, ddl::handle,
+        SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle,
             new PipelineHandler.Target() {
                 @Override public void setRelation(long relid, RelationMeta meta) {
                     sink.setRelation(relid, meta);
@@ -269,15 +270,17 @@ public final class Main {
         }
 
         private final LongPredicate tracked;
+        private final LongFunction<List<String>> primaryKey;
         private final Consumer<PgEvent.Message> ddl;
         private final Target target;
         private final TxnBatcher batcher;
         private final Map<Long, RelationMeta> relations = new HashMap<>();
         private final Set<Long> pendingTruncates = new LinkedHashSet<>();
 
-        PipelineHandler(LongPredicate tracked, Consumer<PgEvent.Message> ddl, Target target,
-                        TxnBatcher batcher) {
+        PipelineHandler(LongPredicate tracked, LongFunction<List<String>> primaryKey,
+                        Consumer<PgEvent.Message> ddl, Target target, TxnBatcher batcher) {
             this.tracked = tracked;
+            this.primaryKey = primaryKey;
             this.ddl = ddl;
             this.target = target;
             this.batcher = batcher;
@@ -286,8 +289,9 @@ public final class Main {
         @Override
         public void onEvent(PgEvent event, long changeLsn) throws Exception {
             if (event instanceof PgEvent.Relation r) {
-                target.setRelation(r.meta().relid(), r.meta());
-                relations.put(r.meta().relid(), r.meta());
+                RelationMeta meta = withRegistryKey(r.meta());
+                target.setRelation(meta.relid(), meta);
+                relations.put(meta.relid(), meta);
             } else if (event instanceof PgEvent.Message m) {
                 ddl.accept(m);
             } else if (event instanceof PgEvent.Truncate t) {
@@ -308,6 +312,24 @@ public final class Main {
                 pendingTruncates.clear();
             }
             batcher.onEvent(event, changeLsn, relations.get(relidOf(event)));
+        }
+
+        /**
+         * Under REPLICA IDENTITY FULL pgoutput marks every column as a key column, which would
+         * make every UPDATE look like a key change (-D/+I instead of -U/+U). The key is the
+         * registry's primary key. An untracked relation is passed through unchanged: its
+         * events are skipped anyway.
+         */
+        private RelationMeta withRegistryKey(RelationMeta m) {
+            if (!tracked.test(m.relid())) {
+                return m;
+            }
+            Set<String> pk = new java.util.HashSet<>(primaryKey.apply(m.relid()));
+            List<Boolean> isKey = new ArrayList<>(m.columnNames().size());
+            for (String c : m.columnNames()) {
+                isKey.add(pk.contains(c));
+            }
+            return new RelationMeta(m.relid(), m.namespace(), m.relName(), m.columnNames(), isKey);
         }
 
         @Override

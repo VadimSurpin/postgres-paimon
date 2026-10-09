@@ -79,13 +79,13 @@ class SlotHarnessSmokeIT {
             Set<String> kinds = changelogKinds(catalog);
             assertTrue(kinds.contains("3:+I:three"), "insert of id 3 missing from changelog: " + kinds);
             assertTrue(kinds.contains("2:-D:two"), "delete of id 2 missing from changelog: " + kinds);
-            // The update must be in the changelog as an after-image. It is deliberately not
-            // required to be +U: today the writer emits -D/+I for every update of a REPLICA
-            // IDENTITY FULL table (PgOutputDecoder takes the pgoutput key flag, which is set on
-            // every column under FULL, so ToastResolver.keyChanged is always true). The final
-            // contents are right either way; that is a writer defect, not a harness one.
-            assertTrue(kinds.contains("3:+U:three-b") || kinds.contains("3:+I:three-b"),
-                "update of id 3 (after-image 'three-b') missing from changelog: " + kinds);
+            // An update of a non-key column is a genuine -U/+U pair (spec section 5), never
+            // -D/+I: the key comes from the registry's primary key, not pgoutput's flags.
+            assertTrue(kinds.contains("3:-U:three"),
+                "update of id 3 must produce -U with the before-image: " + kinds);
+            assertTrue(kinds.contains("3:+U:three-b"),
+                "update of id 3 must produce +U with the after-image: " + kinds);
+            assertFalse(kinds.contains("3:-D:three"), "update of id 3 was decomposed into -D/+I: " + kinds);
         }
     }
 

@@ -195,6 +195,15 @@ public final class SchemaRegistry {
         });
     }
 
+    /**
+     * The primary-key column names of a tracked relation, as Paimon holds them (so a renamed
+     * key column is followed). This, not pgoutput's Relation flags, defines the key: under
+     * REPLICA IDENTITY FULL pgoutput flags every column as a key column.
+     */
+    public List<String> primaryKey(long relid) {
+        return table(relid).primaryKeys();
+    }
+
     /** Cached per (relid, column list); a changed list or a reloaded table rebuilds it. */
     public RowBuilder rowBuilder(long relid, RelationMeta meta) {
         FileStoreTable t = table(relid);

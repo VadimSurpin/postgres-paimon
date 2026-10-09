@@ -62,11 +62,14 @@ class SlotConsumerTest {
             };
             batcher = new TxnBatcher(new ToastResolver(), null,
                 Main.confirmingFlusher(inner, confirmed::add));
-            handler = new Main.PipelineHandler(tracked::contains, m -> calls.add("ddl"),
+            handler = new Main.PipelineHandler(tracked::contains, r -> List.of("id"),
+                m -> calls.add("ddl"),
                 this, batcher);
         }
 
+        RelationMeta lastMeta;
         @Override public void setRelation(long relid, RelationMeta meta) {
+            lastMeta = meta;
             calls.add("relation" + relid);
         }
         @Override public void truncate(long relid, long commitLsn) {
@@ -187,5 +190,54 @@ class SlotConsumerTest {
             new java.sql.SQLException("paimon side", "08006"));
         assertFalse(SlotConsumer.isConnectionLoss(wrapped));
         assertInstanceOf(java.sql.SQLException.class, wrapped.getCause());
+    }
+
+    // ---- key flags come from the registry, not from pgoutput ------------------------------
+
+    /** What pgoutput really sends under REPLICA IDENTITY FULL: every column flagged as a key. */
+    static final RelationMeta ALL_KEY = new RelationMeta(1, "public", "t",
+        List.of("id", "n", "body"), List.of(true, true, true));
+
+    static PgEvent.Update update(String[] oldV, String[] newV) {
+        List<ColumnValue> o = new ArrayList<>(), n = new ArrayList<>();
+        for (String v : oldV) o.add(ColumnValue.of(v));
+        for (String v : newV) n.add(ColumnValue.of(v));
+        return new PgEvent.Update(1, new TupleData(o), false, new TupleData(n));
+    }
+
+    private List<RowKindAt> kindsOf(String[] oldV, String[] newV) throws Exception {
+        List<List<SinkRecord>> out = new ArrayList<>();
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Relation(ALL_KEY), 0L);
+        assertEquals(List.of(true, false, false), f.lastMeta.isKey(),
+            "the registry's primary key replaces pgoutput's all-true flags");
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(update(oldV, newV), 41L);
+        f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
+        List<RowKindAt> kinds = new ArrayList<>();
+        for (SinkRecord r : f.flushed.get(0)) kinds.add(new RowKindAt(r.kind().shortString()));
+        return kinds;
+    }
+
+    record RowKindAt(String kind) {}
+
+    @Test
+    void updateOfANonKeyColumnIsUpdateBeforeAfterNotDeleteInsert() throws Exception {
+        assertEquals(List.of(new RowKindAt("-U"), new RowKindAt("+U")),
+            kindsOf(new String[]{"1", "5", "a"}, new String[]{"1", "6", "a"}));
+    }
+
+    @Test
+    void updateOfThePrimaryKeyIsStillDeleteInsert() throws Exception {
+        assertEquals(List.of(new RowKindAt("-D"), new RowKindAt("+I")),
+            kindsOf(new String[]{"1", "5", "a"}, new String[]{"2", "5", "a"}));
+    }
+
+    @Test
+    void anUntrackedRelationIsPassedThroughUnchanged() throws Exception {
+        Fixture f = new Fixture();
+        f.tracked.clear();
+        f.handler.onEvent(new PgEvent.Relation(ALL_KEY), 0L);
+        assertSame(ALL_KEY, f.lastMeta);
     }
 }
