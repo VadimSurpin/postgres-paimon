@@ -217,6 +217,82 @@ class TxnBatcherTest {
         b.onEvent(trunc(16412), 1505L, null);
         b.discardOpenTransaction();
         b.onEvent(new PgEvent.Begin(1600L, 0L, 2L), 1600L, null);
-        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1610L, META);
+        assertDoesNotThrow(
+            () -> b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1610L, META));
+    }
+
+    @Test
+    void aThrowMidTransactionLeavesNothingOpenAndCommitFlushesNothing() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(1700L, 0L, 1L), 1700L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1710L, META);
+        // key-only old tuple: ToastResolver.resolve throws
+        assertThrows(IllegalStateException.class, () -> b.onEvent(
+            new PgEvent.Delete(16412, row("1", "a"), true), 1720L, META));
+        assertFalse(b.hasOpenTransaction());
+        assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Commit(1700L, 1730L, 0L), 1730L, null));
+        assertTrue(rec.batches.isEmpty(), "a partial batch must never be flushed");
+    }
+
+    @Test
+    void aTruncateConflictAlsoLeavesNothingOpen() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(1800L, 0L, 1L), 1800L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1810L, META);
+        assertThrows(IllegalStateException.class, () -> b.onEvent(trunc(16412), 1820L, null));
+        assertFalse(b.hasOpenTransaction());
+        assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Commit(1800L, 1830L, 0L), 1830L, null));
+        assertTrue(rec.batches.isEmpty());
+    }
+
+    @Test
+    void twoUpdatesToTheSameKeySurviveInOrder() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(1900L, 0L, 1L), 1900L, null);
+        b.onEvent(new PgEvent.Update(16412, row("1", "a"), false, row("1", "b")), 1910L, META);
+        b.onEvent(new PgEvent.Update(16412, row("1", "b"), false, row("1", "c")), 1920L, META);
+        b.onEvent(new PgEvent.Commit(1900L, 1930L, 0L), 1930L, null);
+        List<SinkRecord> batch = rec.batches.get(0);
+        assertEquals(List.of(RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER,
+                             RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER),
+                     batch.stream().map(SinkRecord::kind).toList());
+        assertEquals(List.of(0, 1, 2, 3), batch.stream().map(SinkRecord::opSeq).toList());
+        assertEquals(List.of(1910L, 1910L, 1920L, 1920L),
+                     batch.stream().map(SinkRecord::seq).toList());
+        assertEquals(List.of("a", "b", "b", "c"),
+                     batch.stream().map(r -> r.values().get(1)).toList());
+    }
+
+    @Test
+    void typeMsgAndOriginContributeNothing() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(2000L, 0L, 1L), 2000L, null);
+        b.onEvent(new PgEvent.TypeMsg(23L, "pg_catalog", "int4"), 0L, null);
+        b.onEvent(new PgEvent.Origin(2000L, "o"), 0L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 2010L, META);
+        b.onEvent(new PgEvent.Commit(2000L, 2020L, 0L), 2020L, null);
+        assertEquals(1, rec.batches.get(0).size());
+        assertEquals(0, rec.batches.get(0).get(0).opSeq());
+        assertEquals(2010L, rec.batches.get(0).get(0).seq());
+    }
+
+    @Test
+    void nestedBeginLeavesTheOpenBatchIntact() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(2100L, 0L, 1L), 2100L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 2110L, META);
+        assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Begin(2200L, 0L, 2L), 2200L, null));
+        assertTrue(b.hasOpenTransaction());
+        b.onEvent(new PgEvent.Commit(2100L, 2120L, 0L), 2120L, null);
+        assertEquals(1, rec.batches.get(0).size());
+        assertEquals(1L, rec.batches.get(0).get(0).xid());
     }
 }

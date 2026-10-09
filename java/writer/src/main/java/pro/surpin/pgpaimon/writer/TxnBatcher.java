@@ -73,6 +73,8 @@ public final class TxnBatcher {
     public void onEvent(PgEvent event, long changeLsn, RelationMeta meta) throws Exception {
         if (event instanceof PgEvent.Begin b) {
             if (open != null) {
+                // Deliberately leaves the open batch untouched; the caller must treat this as
+                // fatal (or call discardOpenTransaction()).
                 throw new IllegalStateException("Begin arrived while transaction " + xid
                     + " is still open; its Commit was never seen");
             }
@@ -93,31 +95,40 @@ public final class TxnBatcher {
             return;    // handled elsewhere; contributes no records
         }
 
-        if (event instanceof PgEvent.Truncate t) {
-            require();
-            for (long relid : t.relids()) {
-                if (registry != null && !registry.tracked(relid)) {
-                    continue;
+        // Invariant: after any exception from the Truncate or row-change paths below, no
+        // transaction is open. A throw partway through must never leave earlier records
+        // buffered, or a later Commit would flush a partial batch under the full
+        // transaction's commitLsn/endLsn and the slot would advance past the missing records.
+        try {
+            if (event instanceof PgEvent.Truncate t) {
+                require();
+                for (long relid : t.relids()) {
+                    if (registry != null && !registry.tracked(relid)) {
+                        continue;
+                    }
+                    if (buffered.contains(relid)) {
+                        throw ambiguous(relid, "TRUNCATE after earlier changes to the same table");
+                    }
+                    truncated.add(relid);
                 }
-                if (buffered.contains(relid)) {
-                    throw ambiguous(relid, "TRUNCATE after earlier changes to the same table");
-                }
-                truncated.add(relid);
+                return;
             }
-            return;
-        }
 
-        require();
-        if (registry != null && !registry.tracked(relidOf(event))) {
-            return;    // traffic for a table this writer does not replicate
-        }
-        long relid = relidOf(event);
-        if (truncated.contains(relid)) {
-            throw ambiguous(relid, "change after TRUNCATE of the same table");
-        }
-        for (PartialRecord p : resolver.resolve(event, meta)) {
-            open.add(new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid));
-            buffered.add(p.relid());
+            require();
+            long relid = relidOf(event);
+            if (registry != null && !registry.tracked(relid)) {
+                return;    // traffic for a table this writer does not replicate
+            }
+            if (truncated.contains(relid)) {
+                throw ambiguous(relid, "change after TRUNCATE of the same table");
+            }
+            for (PartialRecord p : resolver.resolve(event, meta)) {
+                open.add(new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid));
+                buffered.add(p.relid());
+            }
+        } catch (Throwable t) {
+            discardOpenTransaction();
+            throw t;
         }
     }
 
