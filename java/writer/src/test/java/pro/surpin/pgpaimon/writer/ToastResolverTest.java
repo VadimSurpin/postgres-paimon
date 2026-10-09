@@ -133,15 +133,26 @@ class ToastResolverTest {
                 t(v("1"), ColumnValue.ofNull(), ColumnValue.ofNull()), true), META));
     }
 
-    /** A no-op UPDATE under RI FULL can arrive with no old tuple and no u column: +U only. */
+    /**
+     * Unreachable in a correct configuration: under REPLICA IDENTITY FULL,
+     * ExtractReplicaIdentity() returns the full old tuple unconditionally (even for a
+     * no-op UPDATE, verified on PG 18), and the DDL guardrail (f2495af) stops a tracked
+     * table leaving FULL.  No old tuple therefore means drift (e.g. REPLICA IDENTITY
+     * NOTHING); a lone +U would silently drop the -U, so it must throw.
+     */
     @Test
-    void updateWithoutOldTupleAndNothingUnchangedYieldsAfterOnly() {
-        List<PartialRecord> out = r.resolve(new PgEvent.Update(16412, null, false,
-            t(v("1"), ColumnValue.ofNull(), v(""))), META);
-        assertEquals(1, out.size());
-        assertEquals(RowKind.UPDATE_AFTER, out.get(0).kind());
-        assertNull(out.get(0).values().get(1));
-        assertEquals("", out.get(0).values().get(2));
+    void updateWithoutOldTupleIsRejectedEvenWhenNothingIsUnchanged() {
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
+            r.resolve(new PgEvent.Update(16412, null, false,
+                t(v("1"), ColumnValue.ofNull(), v(""))), META));
+        assertTrue(e.getMessage().contains("relreplident"), e.getMessage());
+        assertTrue(e.getMessage().contains("REPLICA IDENTITY FULL"), e.getMessage());
+    }
+
+    @Test
+    void deleteWithoutOldTupleIsRejected() {
+        assertThrows(IllegalStateException.class, () ->
+            r.resolve(new PgEvent.Delete(16412, null, false), META));
     }
 
     /** Nulls and empty strings survive the update path, including when filled from old. */

@@ -28,22 +28,16 @@ public final class ToastResolver {
                                              plain(i.newTuple(), null, meta)));
         }
         if (event instanceof PgEvent.Delete d) {
-            requireFullOld(d.oldTuple(), d.oldIsKeyOnly(), meta);
+            requireFullOld(d.oldTuple(), d.oldIsKeyOnly(), null, meta);
             return List.of(new PartialRecord(d.relid(), RowKind.DELETE,
                                              plain(d.oldTuple(), null, meta)));
         }
         if (event instanceof PgEvent.Update u) {
-            requireFullOld(u.oldTuple(), u.oldIsKeyOnly(), meta);
+            requireFullOld(u.oldTuple(), u.oldIsKeyOnly(), u.newTuple(), meta);
             // Separate lists per record: the old values are never shared with the new.
-            List<String> oldValues = u.oldTuple() == null
-                ? null : plain(u.oldTuple(), null, meta);
+            List<String> oldValues = plain(u.oldTuple(), null, meta);
             List<String> newValues = plain(u.newTuple(), u.oldTuple(), meta);
 
-            if (oldValues == null) {
-                // No old tuple was logged (a no-op UPDATE under RI FULL); an UNCHANGED
-                // column would already have thrown in plain().
-                return List.of(new PartialRecord(u.relid(), RowKind.UPDATE_AFTER, newValues));
-            }
             if (keyChanged(oldValues, newValues, meta)) {
                 return List.of(
                     new PartialRecord(u.relid(), RowKind.DELETE, oldValues),
@@ -56,13 +50,33 @@ public final class ToastResolver {
         return List.of();
     }
 
-    /** A key-only ('K') old tuple means the table is not at REPLICA IDENTITY FULL. */
-    private static void requireFullOld(TupleData old, boolean keyOnly, RelationMeta meta) {
-        if (old != null && keyOnly) {
+    /**
+     * Every UPDATE and DELETE of a tracked table must carry a full ('O') old tuple.
+     * Under REPLICA IDENTITY FULL, ExtractReplicaIdentity() returns the full tuple
+     * unconditionally (the key_changed test that can suppress it applies only to the
+     * key-only path), so a missing or key-only ('K') old tuple means the table is
+     * not FULL.  The DDL guardrail from commit f2495af prevents that on a tracked
+     * table, so this is unreachable in a correct configuration; it is defence in
+     * depth against drift, not paranoia.  Do not remove it or fall back to a lone +U.
+     */
+    private static void requireFullOld(TupleData old, boolean keyOnly,
+                                       TupleData fresh, RelationMeta meta) {
+        if (old == null || keyOnly) {
+            StringBuilder unchanged = new StringBuilder();
+            if (fresh != null) {
+                for (int i = 0; i < fresh.columns().size(); i++) {
+                    if (fresh.columns().get(i).state() == ColState.UNCHANGED) {
+                        unchanged.append(unchanged.length() == 0 ? "; unchanged column(s): " : ", ")
+                                 .append(columnName(meta, i));
+                    }
+                }
+            }
             throw new IllegalStateException(
-                "received a key-only old tuple for " + meta.namespace() + "." + meta.relName()
-                + ": its non-key columns are absent, so no faithful before-image exists;"
-                + " the table must be at REPLICA IDENTITY FULL");
+                "table " + meta.namespace() + "." + meta.relName() + " sent "
+                + (old == null ? "no old tuple" : "a key-only old tuple")
+                + " for an UPDATE/DELETE: its replica identity is not FULL"
+                + " (check pg_class.relreplident; it must be 'f'), so the writer cannot"
+                + " produce a faithful before-image; the table must be at REPLICA IDENTITY FULL" + unchanged);
         }
     }
 
