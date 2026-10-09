@@ -122,6 +122,12 @@ run_suites() {
     local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
   fi
   echo ">> mvn ${args[*]}"
+  # Surefire exits 0 when a -Dtest name matches nothing as long as another name matches (the smoke
+  # test always does), and -DfailIfNoSpecifiedTests does not change that. So a mistyped suite, or a
+  # class with no @Test, would print "ALL SUITES PASSED" having run nothing. Prove each named suite
+  # ran: delete old reports first, then require a report with at least one test per name.
+  local reports="$REPO/java/target/surefire-reports"
+  rm -f "$reports"/TEST-*.xml
   # The writer module's live IT (BackfillerTest) creates and then DROPS the slot named by
   # PGPAIMON_SLOT, default "paimon" - the live writer's slot. Give suites a different name so
   # it can never kill the running writer. Do not "simplify" this back to one name.
@@ -132,6 +138,16 @@ run_suites() {
   PGPAIMON_HARNESS=1 \
   PGPAIMON_SLOT="${SLOT}_it" \
     mvn -B -ntp "${args[@]}" || rc=$?
+  local name rpt n
+  for name in "$@"; do
+    rpt="$(ls "$reports"/TEST-*."$name".xml 2>/dev/null | head -n1 || true)"
+    n=0
+    [ -n "$rpt" ] && n="$(sed -n 's/.*<testsuite [^>]*tests="\([0-9]*\)".*/\1/p' "$rpt" | head -n1)"
+    if [ "${n:-0}" -lt 1 ]; then
+      echo "FAIL: suite '$name' matched no tests (no surefire report with tests > 0): mistyped name, or a class with no @Test" >&2
+      rc=1
+    fi
+  done
   return "$rc"
 }
 
