@@ -141,7 +141,7 @@ class TxnBatcherTest {
         TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
         b.onEvent(new PgEvent.Begin(1000L, 0L, 1L), 1000L, null);
         b.onEvent(new PgEvent.Relation(META), 0L, null);
-        b.onEvent(new PgEvent.Truncate(List.of(16412L), false, false), 1005L, null);
+        b.onEvent(new PgEvent.Truncate(List.of(99999L), false, false), 1005L, null);
         b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1010L, META);
         b.onEvent(new PgEvent.Commit(1000L, 1020L, 0L), 1020L, null);
         List<SinkRecord> batch = rec.batches.get(0);
@@ -158,5 +158,65 @@ class TxnBatcherTest {
         b.onEvent(new PgEvent.Begin(1L, 0L, 1L), 1L, null);
         assertThrows(IllegalStateException.class,
             () -> b.onEvent(new PgEvent.Begin(2L, 0L, 2L), 2L, null));
+    }
+
+    private static PgEvent.Truncate trunc(long... relids) {
+        List<Long> l = new ArrayList<>();
+        for (long r : relids) l.add(r);
+        return new PgEvent.Truncate(l, false, false);
+    }
+
+    @Test
+    void truncateAloneIsFineAndStillFlushes() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(1100L, 0L, 1L), 1100L, null);
+        b.onEvent(trunc(16412), 1105L, null);
+        b.onEvent(new PgEvent.Commit(1100L, 1110L, 0L), 1110L, null);
+        assertEquals(1, rec.batches.size());
+        assertTrue(rec.batches.get(0).isEmpty());
+        assertEquals(1110L, rec.endLsns.get(0));
+    }
+
+    @Test
+    void recordAfterTruncateOfSameTableThrowsNamingTheTable() throws Exception {
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+        b.onEvent(new PgEvent.Begin(1200L, 0L, 1L), 1200L, null);
+        b.onEvent(trunc(16412), 1205L, null);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1210L, META));
+        assertTrue(e.getMessage().contains("16412"), e.getMessage());
+    }
+
+    @Test
+    void truncateAfterRecordOfSameTableThrowsNamingTheTable() throws Exception {
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+        b.onEvent(new PgEvent.Begin(1300L, 0L, 1L), 1300L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1310L, META);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> b.onEvent(trunc(16412), 1320L, null));
+        assertTrue(e.getMessage().contains("16412"), e.getMessage());
+    }
+
+    @Test
+    void truncateOfOneTableWithRecordForAnotherIsFine() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        b.onEvent(new PgEvent.Begin(1400L, 0L, 1L), 1400L, null);
+        b.onEvent(trunc(77777), 1405L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1410L, META);
+        b.onEvent(new PgEvent.Commit(1400L, 1420L, 0L), 1420L, null);
+        assertEquals(1, rec.batches.get(0).size());
+        assertEquals(16412L, rec.batches.get(0).get(0).relid());
+    }
+
+    @Test
+    void discardClearsTruncateState() throws Exception {
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+        b.onEvent(new PgEvent.Begin(1500L, 0L, 1L), 1500L, null);
+        b.onEvent(trunc(16412), 1505L, null);
+        b.discardOpenTransaction();
+        b.onEvent(new PgEvent.Begin(1600L, 0L, 2L), 1600L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1610L, META);
     }
 }

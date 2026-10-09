@@ -2,7 +2,9 @@
 package pro.surpin.pgpaimon.writer;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Assembles complete transactions: a batch is one committed PostgreSQL transaction or nothing.
@@ -13,11 +15,18 @@ import java.util.List;
  * assigned per emitted record (restarting at 0 each transaction), so a -U, which shares its
  * LSN with the +U it precedes, always sorts before it.
  *
- * <p>Relation, TypeMsg, Origin, Message and Truncate contribute no records and are ignored
- * here. An R message reports LSN 0/0; letting one reach {@code _seq} or the flush position
- * would sort a record before all history or move the slot to a position matching no committed
- * change. Truncate is not a row change; Main's event loop handles it before this class sees it
- * (calling PaimonSink.truncate for each relid).
+ * <p>Relation, TypeMsg, Origin and Message contribute no records and are ignored here. An R
+ * message reports LSN 0/0; letting one reach {@code _seq} or the flush position would sort a
+ * record before all history or move the slot to a position matching no committed change.
+ *
+ * <p>Truncate contributes no record either and is not forwarded to the flusher (applying the
+ * overwrite is the caller's job), but it IS shown to this class so it can refuse an ambiguous
+ * transaction. Paimon expresses a truncate as an empty overwrite commit, not a record, so an
+ * overwrite and an append are two separate commits and cannot be interleaved inside one
+ * atomic transaction commit. The two orders differ in result (INSERT then TRUNCATE ends empty;
+ * TRUNCATE then INSERT keeps the row), so a Truncate of table X together with any record for
+ * X in the same transaction throws, naming the table. A Truncate alone, or alongside DML on
+ * other tables, proceeds.
  */
 public final class TxnBatcher {
 
@@ -36,6 +45,8 @@ public final class TxnBatcher {
     private List<SinkRecord> open;
     private long xid;
     private int opSeq;
+    private final Set<Long> buffered = new HashSet<>();    // relids with records this txn
+    private final Set<Long> truncated = new HashSet<>();   // relids truncated this txn
 
     public TxnBatcher(ToastResolver resolver, SchemaRegistry registry, Flusher flusher) {
         this.resolver = resolver;
@@ -50,6 +61,8 @@ public final class TxnBatcher {
     public void discardOpenTransaction() {
         open = null;
         opSeq = 0;
+        buffered.clear();
+        truncated.clear();
     }
 
     /**
@@ -76,18 +89,42 @@ public final class TxnBatcher {
             return;
         }
         if (event instanceof PgEvent.Relation || event instanceof PgEvent.TypeMsg
-            || event instanceof PgEvent.Origin || event instanceof PgEvent.Message
-            || event instanceof PgEvent.Truncate) {
+            || event instanceof PgEvent.Origin || event instanceof PgEvent.Message) {
             return;    // handled elsewhere; contributes no records
+        }
+
+        if (event instanceof PgEvent.Truncate t) {
+            require();
+            for (long relid : t.relids()) {
+                if (registry != null && !registry.tracked(relid)) {
+                    continue;
+                }
+                if (buffered.contains(relid)) {
+                    throw ambiguous(relid, "TRUNCATE after earlier changes to the same table");
+                }
+                truncated.add(relid);
+            }
+            return;
         }
 
         require();
         if (registry != null && !registry.tracked(relidOf(event))) {
             return;    // traffic for a table this writer does not replicate
         }
+        long relid = relidOf(event);
+        if (truncated.contains(relid)) {
+            throw ambiguous(relid, "change after TRUNCATE of the same table");
+        }
         for (PartialRecord p : resolver.resolve(event, meta)) {
             open.add(new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid));
+            buffered.add(p.relid());
         }
+    }
+
+    private IllegalStateException ambiguous(long relid, String what) {
+        return new IllegalStateException("transaction " + xid + " mixes TRUNCATE and row changes"
+            + " for relation " + relid + " (" + what + "); Paimon applies a truncate as a separate"
+            + " overwrite commit, so the order cannot be preserved and the result would differ");
     }
 
     private void require() {
