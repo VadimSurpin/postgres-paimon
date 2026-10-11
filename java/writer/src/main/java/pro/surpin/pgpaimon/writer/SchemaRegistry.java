@@ -211,7 +211,7 @@ public final class SchemaRegistry {
         if (cb != null && cb.table() == t && cb.columns().equals(meta.columnNames())) {
             return cb.builder();
         }
-        RowBuilder rb = new RowBuilder(t.rowType(), meta.columnNames(), config.seqField(),
+        RowBuilder rb = new RowBuilder(meta.namespace() + "." + meta.relName(), t.rowType(), meta.columnNames(), config.seqField(),
                                        config.opSeqField(), config.xidField());
         builders.put(relid, new CachedBuilder(List.copyOf(meta.columnNames()), t, rb));
         return rb;

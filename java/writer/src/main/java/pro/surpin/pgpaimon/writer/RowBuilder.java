@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 package pro.surpin.pgpaimon.writer;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Logger;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
@@ -15,6 +17,8 @@ import org.apache.paimon.types.RowType;
  */
 public final class RowBuilder {
 
+    private static final Logger LOG = Logger.getLogger(RowBuilder.class.getName());
+
     private final RowType rowType;
     private final int[] paimonIndexForPgColumn;
     private final List<String> pgColumnOrder;
@@ -24,15 +28,47 @@ public final class RowBuilder {
 
     public RowBuilder(RowType rowType, List<String> pgColumnOrder,
                       String seqField, String opSeqField, String xidField) {
+        this(null, rowType, pgColumnOrder, seqField, opSeqField, xidField);
+    }
+
+    /** {@code tableName} is used only to name the table in the dropped-column warning. */
+    public RowBuilder(String tableName, RowType rowType, List<String> pgColumnOrder,
+                      String seqField, String opSeqField, String xidField) {
         this.rowType = rowType;
         this.pgColumnOrder = List.copyOf(pgColumnOrder);
         this.paimonIndexForPgColumn = new int[pgColumnOrder.size()];
         for (int i = 0; i < pgColumnOrder.size(); i++) {
             this.paimonIndexForPgColumn[i] = rowType.getFieldNames().indexOf(pgColumnOrder.get(i));
         }
+        warnAboutIgnoredColumns(tableName);
         this.seqIndex = required(rowType, seqField);
         this.opSeqIndex = required(rowType, opSeqField);
         this.xidIndex = xidField == null ? -1 : required(rowType, xidField);
+    }
+
+    /**
+     * A PostgreSQL column with no Paimon counterpart means the Paimon schema has moved on,
+     * which happens two ways, and ignoring the value is right in both. The drop_col DDL was
+     * earlier in the stream: the column is gone and its value unwanted. Or it is later in
+     * the stream (a replay): the registry was rebuilt from paimon.table_registry and reflects
+     * the CURRENT schema, so the column is already absent and cannot be restored; the value
+     * is about to be dropped anyway. Throwing would kill the writer on a replay it was
+     * designed to perform. (The opposite case, a Paimon column with no PostgreSQL
+     * counterpart, stays null: that is an added column.) Builders are cached per
+     * (relid, column list), so this warns once per schema, not once per row.
+     */
+    private void warnAboutIgnoredColumns(String tableName) {
+        List<String> ignored = new ArrayList<>();
+        for (int i = 0; i < paimonIndexForPgColumn.length; i++) {
+            if (paimonIndexForPgColumn[i] < 0) {
+                ignored.add(pgColumnOrder.get(i));
+            }
+        }
+        if (!ignored.isEmpty()) {
+            LOG.warning("table " + (tableName == null ? "(unnamed)" : tableName)
+                + ": ignoring PostgreSQL column(s) " + ignored
+                + " with no counterpart in the Paimon schema (dropped; likely a replay)");
+        }
     }
 
     public GenericRow build(SinkRecord r) {
@@ -48,10 +84,7 @@ public final class RowBuilder {
         for (int i = 0; i < paimonIndexForPgColumn.length; i++) {
             int target = paimonIndexForPgColumn[i];
             if (target < 0) {
-                throw new IllegalStateException(
-                    "PostgreSQL column '" + pgColumnOrder.get(i)
-                    + "' has no counterpart in the Paimon schema " + rowType
-                    + "; a DDL message was missed");
+                continue;   // see warnAboutIgnoredColumns
             }
             DataField f = fields.get(target);
             row.setField(target, TextDecoder.toPaimon(f.name(), f.type(), r.values().get(i)));
