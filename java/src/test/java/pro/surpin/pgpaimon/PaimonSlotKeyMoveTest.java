@@ -25,14 +25,23 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import org.junit.jupiter.api.Test;
 
 /**
- * T20 — intra-transaction key collisions.
+ * T20 — intra-transaction key collisions; the named acceptance test for spec section 7.
  *
- * "UPDATE t SET id = id + 1" rewrites every key in one transaction.  Each row
- * decomposes to -D(old_key) + +I(new_key), and those pairs interleave: the +I for
- * key 3 may arrive before the -D that vacates it.  Correctness rests entirely on
- * per-change LSN ordering surviving, so this is the test that any writer-side
- * collapsing, reordering or per-key deduplication fails.  It is the named acceptance
- * test for spec section 7's intra-transaction key-collision rule.
+ * A key-shifting UPDATE decomposes each row to -D(old_key) + +I(new_key), and the writer keeps
+ * every change in LSN order (it never collapses per key).  Whether that converges depends on
+ * the order PostgreSQL emits the pairs:
+ *
+ *  - Descending cascade ("SET id = id - 1"): each key is vacated (-D) before it is filled (+I),
+ *    so the higher-LSN event for every key is the +I and the merge ends correct.  This is the
+ *    main assertion.
+ *  - Ascending cascade ("SET id = id + 1"): the +I for key k+1 would precede the -D that
+ *    vacates it, so the delete would win the merge.  It never reaches the writer, because
+ *    PostgreSQL checks a non-deferrable key per row and rejects the statement with a unique
+ *    violation.  Pinned here so nobody "fixes" T20 by making the writer handle a case that
+ *    cannot occur.
+ *  - It could commit only under a DEFERRABLE key, where the transaction passes through states
+ *    with two rows sharing a key, which a Paimon primary-key table cannot represent.  So
+ *    paimon.add_table() refuses a deferrable primary key; asserted here.
  *
  * Usage (live stack): test/slot-acceptance/run_acceptance.sh PaimonSlotKeyMoveTest
  */
@@ -78,17 +87,11 @@ public class PaimonSlotKeyMoveTest {
         String tbl = "km_t";
         try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            /*
-             * Deferrable, so PostgreSQL itself accepts "SET id = id + 1" in any row order: a
-             * non-deferrable key checks uniqueness per row and would reject the statement
-             * whenever it reaches id=k before id=k+1 has moved.  Deferred checking is
-             * what makes the transient collision legal; it is the writer that must cope.
-             */
-            exec(conn, "CREATE TABLE " + tbl + " (id int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE, v text)");
+            exec(conn, "CREATE TABLE " + tbl + " (id int PRIMARY KEY, v text)");
             // Registered while empty: add_table derives backfill_due from emptiness.
             exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
             try (PreparedStatement ps = conn.prepareStatement("INSERT INTO " + tbl + " VALUES (?, ?)")) {
-                for (int i = 1; i <= N; i++) {
+                for (int i = 2; i <= N + 1; i++) {      // keys 2..N+1, so the descending move has room
                     ps.setInt(1, i);
                     ps.setString(2, "row" + i);
                     ps.addBatch();
@@ -96,63 +99,75 @@ public class PaimonSlotKeyMoveTest {
                 ps.executeBatch();
             }
         }
-
         Map<Integer, String> loaded = waitForMerged(tbl, N);
         check("T20 initial load: " + N + " keys", loaded.size() == N);
 
-        /*
-         * One statement, one transaction, key ranges overlapping: the server picks the
-         * row order, which is the point.
-         */
+        // (2) The ascending cascade cannot commit on an ordinary key: PostgreSQL rejects it.
+        boolean rejected = false;
+        String msg = "";
         try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
             conn.setAutoCommit(false);
-            exec(conn, "SET CONSTRAINTS ALL DEFERRED");
-            exec(conn, "UPDATE " + tbl + " SET id = id + 1");
-            conn.commit();
+            try {
+                exec(conn, "UPDATE " + tbl + " SET id = id + 1");
+                conn.commit();
+            } catch (SQLException e) {
+                rejected = true;
+                msg = e.getMessage();
+                conn.rollback();
+            }
         }
+        check("T20 ascending cascade is rejected by PostgreSQL", rejected);
+        check("T20 ... as a unique violation", msg.toLowerCase().contains("duplicate key"));
+        check("T20 ... and nothing changed", pgState(tbl).keySet().equals(range(2, N + 1)));
 
-        Map<Integer, String> expected = pgState(tbl);
-        check("T20 PostgreSQL holds " + N + " keys after the move", expected.size() == N);
-        check("T20 PostgreSQL keys are 2.." + (N + 1),
-              expected.keySet().equals(range(2, N + 1)));
-
-        Map<Integer, String> actual = waitForMergedEquals(tbl, expected);
-        report("move up", expected, actual);
-
-        // The same collision in the other direction: descending order of transient clashes.
+        // (1) The descending cascade commits and converges: every key is vacated before it is filled.
         try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
             conn.setAutoCommit(false);
-            exec(conn, "SET CONSTRAINTS ALL DEFERRED");
             exec(conn, "UPDATE " + tbl + " SET id = id - 1");
             conn.commit();
         }
-        Map<Integer, String> expected2 = pgState(tbl);
-        check("T20 PostgreSQL keys are back to 1.." + N, expected2.keySet().equals(range(1, N)));
-        Map<Integer, String> actual2 = waitForMergedEquals(tbl, expected2);
-        report("move down", expected2, actual2);
+        Map<Integer, String> expected = pgState(tbl);
+        check("T20 PostgreSQL holds keys 1.." + N + " after the descending move",
+              expected.keySet().equals(range(1, N)));
+        Map<Integer, String> actual = waitForMergedEquals(tbl, expected);
+        report("descending move", expected, actual);
 
-        /*
-         * The merged reads above prove the final state is ordered correctly.  The raw changelog
-         * proves nothing was dropped or collapsed on the way: every key that was vacated has a
-         * delete, and every key that was newly occupied has an insert.
-         */
+        // Nothing dropped or collapsed on the way: every change is in the raw changelog.
         List<Rec> raw = readChangelog(tbl);
         Map<Integer, Integer> inserts = new TreeMap<>(), deletes = new TreeMap<>();
         for (Rec r : raw) {
             if (r.kind.equals("+I") || r.kind.equals("+U")) inserts.merge(r.id, 1, Integer::sum);
             if (r.kind.equals("-D") || r.kind.equals("-U")) deletes.merge(r.id, 1, Integer::sum);
         }
-        // up-move: +I for 2..N+1, -D for 1..N.  down-move: +I for 1..N, -D for 2..N+1.
+        // initial load: +I for 2..N+1; move: -D for 2..N+1 and +I for 1..N.
         boolean insOk = true, delOk = true;
         for (int k = 1; k <= N + 1; k++) {
-            // initial load (k<=N) + up-move (k>=2) + down-move (k<=N) inserts
-            int wantIns = (k <= N ? 1 : 0) + (k >= 2 ? 1 : 0) + (k <= N ? 1 : 0);
-            int wantDel = (k <= N ? 1 : 0) + (k >= 2 ? 1 : 0);
+            int wantIns = (k >= 2 ? 1 : 0) + (k <= N ? 1 : 0);
+            int wantDel = (k >= 2 ? 1 : 0);
             if (inserts.getOrDefault(k, 0) != wantIns) insOk = false;
             if (deletes.getOrDefault(k, 0) != wantDel) delOk = false;
         }
-        check("T20 raw changelog: every new key inserted exactly as often as it was occupied", insOk);
-        check("T20 raw changelog: every vacated key deleted exactly as often as it was vacated", delOk);
+        check("T20 raw changelog: every filled key has its insert", insOk);
+        check("T20 raw changelog: every vacated key has its delete", delOk);
+
+        // (3) A DEFERRABLE primary key is refused at registration: it is what would let the
+        // ascending cascade commit.
+        String dtbl = "km_deferrable";
+        boolean refused = false;
+        String dmsg = "";
+        try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
+            exec(conn, "DROP TABLE IF EXISTS " + dtbl);
+            exec(conn, "CREATE TABLE " + dtbl + " (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v text)");
+            try {
+                exec(conn, "SELECT paimon.add_table('" + dtbl + "'::regclass)");
+            } catch (SQLException e) {
+                refused = true;
+                dmsg = e.getMessage();
+            }
+        }
+        check("T20 add_table refuses a DEFERRABLE primary key", refused);
+        check("T20 ... naming paimon_slot and DEFERRABLE",
+              dmsg.contains("paimon_slot") && dmsg.toUpperCase().contains("DEFERRABLE"));
 
         System.out.printf("%n  %d passed, %d failed%n", passed, failed);
         return failed;

@@ -202,6 +202,9 @@ public class PaimonAdvancedTest {
     }
 
     // ── T12: ALTER TABLE ADD COLUMN ──────────────────────────────────────────
+    // Documented difference: main accepted ADD COLUMN ... DEFAULT but left historical Paimon rows
+    // NULL; the extension now rejects the DEFAULT form (spec section 4; pg_regress guardrail tests
+    // cover the rejection).  This test uses the supported form, a column without a default.
     // paimon_ddl.cpp ProcessUtility_hook intercepts ADD COLUMN post-execute,
     // reads the new column's attnum/type from pg_attribute, and sends
     // PMSG_DDL_ADD_COL to the ring.  The bgworker adds the field to the Paimon
@@ -218,7 +221,7 @@ public class PaimonAdvancedTest {
 
         boolean alterOk = true;
         try (Connection conn = connect()) {
-            exec(conn, "ALTER TABLE " + tbl + " ADD COLUMN extra TEXT DEFAULT 'x'");
+            exec(conn, "ALTER TABLE " + tbl + " ADD COLUMN extra TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (3,30,'hello')");
             exec(conn, "INSERT INTO " + tbl + " VALUES (4,40,'world')");
         } catch (Exception e) {
