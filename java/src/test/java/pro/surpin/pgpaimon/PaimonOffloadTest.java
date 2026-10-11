@@ -25,6 +25,7 @@ import java.util.*;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import org.junit.jupiter.api.Test;
 
@@ -85,23 +86,52 @@ public class PaimonOffloadTest {
         System.exit(run(args) > 0 ? 1 : 0);
     }
 
-    /** Surefire entry point: the harness exports the stack's location. */
+    /** Surefire entry point for S3.  Skipped (a real JUnit skip) when no MinIO binary is named. */
     @Test
-    void acceptanceSuite() throws Exception {
+    void s3Warehouse() throws Exception {
+        requireStack();
+        reset(System.getenv("PGPAIMON_IT_JDBC_URL"));
+        if (!minioAvailable()) {
+            skip("T18", "no MinIO server binary at E2E_MINIO_BIN=" + MINIO_BIN, "E2E_MINIO_BIN=/path/to/minio");
+        }
+        assumeTrue(minioAvailable(), "T18 SKIPPED: set E2E_MINIO_BIN=/path/to/minio to enable");
+        runTest("T18", PaimonOffloadTest::testS3);
+        assertEquals(0, failed, "failed checks: " + failures);
+    }
+
+    /** Surefire entry point for HDFS: needs nothing but this JVM. */
+    @Test
+    void hdfsWarehouse() throws Exception {
+        requireStack();
+        reset(System.getenv("PGPAIMON_IT_JDBC_URL"));
+        if (SKIP_HDFS) skip("T19", "E2E_SKIP_HDFS=true", "unset E2E_SKIP_HDFS");
+        assumeFalse(SKIP_HDFS, "T19 SKIPPED: E2E_SKIP_HDFS=true");
+        runTest("T19", PaimonOffloadTest::testHdfs);
+        assertEquals(0, failed, "failed checks: " + failures);
+    }
+
+    static void requireStack() {
         String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
         if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
             assertNotNull(jdbc, "harness did not export PGPAIMON_IT_JDBC_URL");
             assertNotNull(System.getenv("PGPAIMON_WRITER_LAUNCHER"), "harness did not export PGPAIMON_WRITER_LAUNCHER");
         }
         assumeTrue(jdbc != null, "no live stack: run test/slot-acceptance/run_acceptance.sh");
-        int failedChecks = run(new String[0]);
-        assertEquals(0, failedChecks, "failed checks: " + failures);
+    }
+
+    static boolean minioAvailable() {
+        File f = new File(MINIO_BIN);
+        return f.isFile() && f.canExecute();
+    }
+
+    static void reset(String jdbc) {
+        passed = 0; failed = 0; skipped = 0; failures.clear(); skips.clear();
+        jdbcUrl = jdbc != null ? jdbc : DEFAULT_JDBC;
     }
 
     /** Returns the number of failed checks.  args[0], when given, is the JDBC URL. */
     static int run(String[] args) throws Exception {
-        passed = 0; failed = 0; skipped = 0; failures.clear(); skips.clear();
-        jdbcUrl = args.length > 0 ? args[0] : DEFAULT_JDBC;
+        reset(args.length > 0 ? args[0] : null);
 
         runTest("T18", PaimonOffloadTest::testS3);
         if (SKIP_HDFS) skip("T19", "E2E_SKIP_HDFS=true", "unset E2E_SKIP_HDFS");
@@ -137,8 +167,7 @@ public class PaimonOffloadTest {
     /* ── T18: S3 ─────────────────────────────────────────────────────── */
 
     static void testS3() throws Exception {
-        File minio = new File(MINIO_BIN);
-        if (!minio.isFile() || !minio.canExecute()) {
+        if (!minioAvailable()) {
             skip("T18", "no MinIO server binary at E2E_MINIO_BIN=" + MINIO_BIN,
                  "E2E_MINIO_BIN=/path/to/minio");
             return;

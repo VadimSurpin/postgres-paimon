@@ -165,6 +165,13 @@ run_suites() {
     rpt="$(ls "$reports"/TEST-*."$name".xml 2>/dev/null | head -n1 || true)"
     n=0
     [ -n "$rpt" ] && n="$(sed -n 's/.*<testsuite [^>]*tests="\([0-9]*\)".*/\1/p' "$rpt" | head -n1)"
+    # A suite whose every test was skipped ran nothing either.
+    local sk=0
+    [ -n "$rpt" ] && sk="$(sed -n 's/.*<testsuite [^>]*skipped="\([0-9]*\)".*/\1/p' "$rpt" | head -n1)"
+    if [ "${n:-0}" -ge 1 ] && [ "${sk:-0}" -ge "${n:-0}" ]; then
+      echo "FAIL: suite '$name': all ${n} tests were skipped, nothing ran" >&2
+      rc=1
+    fi
     if [ "${n:-0}" -lt 1 ]; then
       echo "FAIL: suite '$name' matched no tests (no surefire report with tests > 0): mistyped name, or a class with no @Test" >&2
       rc=1

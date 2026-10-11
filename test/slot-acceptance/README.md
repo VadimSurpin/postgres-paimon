@@ -55,5 +55,7 @@ waits for the slot to catch up, and restores the default writer.
   (`E2E_MINIO_BIN=/path/to/minio`; port `E2E_MINIO_PORT`, default 9100). Otherwise it prints
   `T18 SKIPPED (...)`, the results line reads `N passed, 0 failed, 1 skipped`, and the harness
   verdict reads `ALL SUITES PASSED -- except: T18 (S3) NOT RUN ...`. A skip is never a pass.
-  Known gap: the writer jar currently bundles no S3 FileIO (no `paimon-s3`), so T18 is expected
-  to fail against a real MinIO until that dependency is added to `java/writer/pom.xml`.
+  The writer jar bundles `paimon-s3`. S3 is present but UNVERIFIED in this environment (no MinIO):
+  verify with `E2E_MINIO_BIN=/path/to/minio ./test/slot-acceptance/run_acceptance.sh PaimonOffloadTest`.
+  Surefire reports T18 and T19 as two tests (`s3Warehouse`, `hdfsWarehouse`); a skipped T18 shows in
+  its Skipped column, and a suite whose tests were all skipped fails the harness.

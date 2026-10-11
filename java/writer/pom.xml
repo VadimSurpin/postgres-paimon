@@ -21,6 +21,13 @@
             <artifactId>paimon-bundle</artifactId>
             <version>${paimon.version}</version>
         </dependency>
+        <!-- s3:// warehouses: Paimon's S3 FileIO (registers via META-INF/services, kept by the
+             ServicesResourceTransformer below) -->
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-s3</artifactId>
+            <version>${paimon.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-client-api</artifactId>
