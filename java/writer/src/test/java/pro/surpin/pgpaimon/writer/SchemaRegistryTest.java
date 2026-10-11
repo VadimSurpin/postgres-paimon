@@ -355,4 +355,110 @@ class SchemaRegistryTest {
             handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t"))));
         assertTrue(clean.isEmpty(), "an identical replay must not warn");
     }
+
+    /*
+     * Finding 2 of the whole-branch review. A DDL-only transaction produces no records, so
+     * filterAndCommit has nothing to filter and up to one status interval (10 s) of applied
+     * DDL replays after a hard kill. Every op must therefore be a no-op the second time:
+     * before this, add_col raised ColumnAlreadyExistException and drop_col/rename_col raised
+     * ColumnNotExistException, and because the slot only advances after a successful commit
+     * the writer could never get past it. One test per op; each applies it twice.
+     */
+
+    private static final long IDEM = 41000L;
+
+    private static String idem(String json) {
+        return json.replace("RELID", String.valueOf(IDEM));
+    }
+
+    /** Also the "create" case: a second create must not bump the schema version. */
+    @Test @Order(40)
+    void replayedCreateIsANoOp() throws Exception {
+        String create = idem("""
+            {"v":1,"op":"create","relid":"RELID","schema":"public","table":"idem_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                 {"id":2,"name":"keep","type":"STRING"},
+                                 {"id":3,"name":"n","type":"INT"}],
+             "options":{"changelog-producer":"input"}}""");
+        handler.handle(msg(create));
+        long ver = reg.table(IDEM).schema().id();
+        handler.handle(msg(create));
+        assertEquals(ver, reg.table(IDEM).schema().id());
+    }
+
+    @Test @Order(41)
+    void replayedAddColumnIsANoOp() throws Exception {
+        String add = idem("""
+            {"v":1,"op":"add_col","relid":"RELID","col":{"id":4,"name":"extra","type":"BIGINT"}}""");
+        handler.handle(msg(add));
+        long ver = reg.table(IDEM).schema().id();
+        assertTrue(reg.table(IDEM).schema().fieldNames().contains("extra"));
+
+        assertDoesNotThrow(() -> handler.handle(msg(add)), "replayed add_col must not throw");
+        assertEquals(ver, reg.table(IDEM).schema().id(), "replay must not alter the schema");
+        assertEquals(1, reg.table(IDEM).schema().fieldNames().stream()
+                          .filter("extra"::equals).count());
+    }
+
+    /** The one case that is NOT a replay: same name, different type. */
+    @Test @Order(42)
+    void addColumnThatConflictsOnTypeStillFails() throws Exception {
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
+            handler.handle(msg(idem("""
+                {"v":1,"op":"add_col","relid":"RELID",
+                 "col":{"id":4,"name":"extra","type":"STRING"}}"""))));
+        assertTrue(e.getMessage().contains("extra"), e.getMessage());
+        assertTrue(e.getMessage().contains("not a replay"), e.getMessage());
+        assertEquals("BIGINT",
+            reg.table(IDEM).rowType().getField("extra").type().asSQLString());
+    }
+
+    @Test @Order(43)
+    void replayedRenameColumnIsANoOp() throws Exception {
+        String rename = idem("""
+            {"v":1,"op":"rename_col","relid":"RELID","id":4,"from":"extra","to":"renamed"}""");
+        handler.handle(msg(rename));
+        long ver = reg.table(IDEM).schema().id();
+        assertTrue(reg.table(IDEM).schema().fieldNames().contains("renamed"));
+
+        assertDoesNotThrow(() -> handler.handle(msg(rename)),
+                           "replayed rename_col must not throw");
+        assertEquals(ver, reg.table(IDEM).schema().id());
+        assertFalse(reg.table(IDEM).schema().fieldNames().contains("extra"));
+    }
+
+    @Test @Order(44)
+    void replayedAlterColumnIsANoOp() throws Exception {
+        String alter = idem("""
+            {"v":1,"op":"alter_col","relid":"RELID","id":3,"name":"n","type":"BIGINT"}""");
+        handler.handle(msg(alter));
+        long ver = reg.table(IDEM).schema().id();
+        assertEquals("BIGINT", reg.table(IDEM).rowType().getField("n").type().asSQLString());
+
+        assertDoesNotThrow(() -> handler.handle(msg(alter)));
+        assertEquals(ver, reg.table(IDEM).schema().id());
+    }
+
+    @Test @Order(45)
+    void replayedDropColumnIsANoOp() throws Exception {
+        String drop = idem("""
+            {"v":1,"op":"drop_col","relid":"RELID","name":"renamed"}""");
+        handler.handle(msg(drop));
+        long ver = reg.table(IDEM).schema().id();
+        assertFalse(reg.table(IDEM).schema().fieldNames().contains("renamed"));
+
+        assertDoesNotThrow(() -> handler.handle(msg(drop)), "replayed drop_col must not throw");
+        assertEquals(ver, reg.table(IDEM).schema().id());
+    }
+
+    @Test @Order(46)
+    void replayedDropTableIsANoOp() throws Exception {
+        String drop = idem("""
+            {"v":1,"op":"drop_table","relid":"RELID","schema":"public","table":"idem_t"}""");
+        handler.handle(msg(drop));
+        assertFalse(reg.tracked(IDEM));
+        assertDoesNotThrow(() -> handler.handle(msg(drop)), "replayed drop_table must not throw");
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create(cfg.database(), "idem_t")));
+    }
 }

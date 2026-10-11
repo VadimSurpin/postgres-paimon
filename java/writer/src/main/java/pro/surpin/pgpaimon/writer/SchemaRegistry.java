@@ -142,25 +142,81 @@ public final class SchemaRegistry {
         }
     }
 
+    /*
+     * Why every DDL operation below tolerates "already in the desired state".
+     *
+     * A DDL-only transaction produces no records, so nothing about it reaches Paimon and
+     * filterAndCommit has no identifier to filter on. The slot position is confirmed to pgjdbc
+     * immediately but reaches the server only at the next status tick (10 s), so a hard kill
+     * replays up to 10 s of DDL that was already applied. Paimon's own errors for that replay
+     * (ColumnAlreadyExistException, ColumnNotExistException) are not retryable, and the slot
+     * only advances after a successful commit, so the writer stops permanently. Replay must be
+     * a no-op here exactly as filterAndCommit makes it one for data.
+     *
+     * "Already applied" is not the same as "conflicting": a column that exists with a different
+     * type than the message declares is not a replay, and still fails loudly.
+     */
+
     public void addColumn(long relid, DdlMessage.Col col) {
+        DataField existing = field(relid, col.name());
+        if (existing != null) {
+            DataType wanted = parseType(col.type());
+            if (!existing.type().equals(wanted)) {
+                throw new IllegalStateException("add_col '" + col.name() + "' on "
+                    + identifiers.get(relid) + ": the column already exists as "
+                    + existing.type().asSQLString() + " but the message declares "
+                    + wanted.asSQLString() + ", so this is not a replay of an applied add_col");
+            }
+            LOG.info("add_col '" + col.name() + "' on " + identifiers.get(relid)
+                + " is already applied as " + wanted.asSQLString() + ": replay, no-op");
+            return;
+        }
         alter(relid, SchemaChange.addColumn(col.name(), parseType(col.type())));
     }
 
     public void dropColumn(long relid, String name) {
+        if (field(relid, name) == null) {
+            LOG.info("drop_col '" + name + "' on " + identifiers.get(relid)
+                + " is already applied (no such column): replay, no-op");
+            return;
+        }
         alter(relid, SchemaChange.dropColumn(name));
     }
 
+    /**
+     * A rename is already applied when the source is gone and the target is there. Any other
+     * shape (both gone, both present) is a conflict and is left to Paimon to refuse.
+     */
     public void renameColumn(long relid, String from, String to) {
+        if (field(relid, from) == null && field(relid, to) != null) {
+            LOG.info("rename_col '" + from + "' -> '" + to + "' on " + identifiers.get(relid)
+                + " is already applied: replay, no-op");
+            return;
+        }
         alter(relid, SchemaChange.renameColumn(from, to));
     }
 
-    /** A no-op when the stored type already equals the new one (varchar vs text are both STRING). */
+    /** One field of the relation's Paimon schema by name, or null if there is none. */
+    private DataField field(long relid, String name) {
+        for (DataField f : table(relid).schema().fields()) {
+            if (f.name().equals(name)) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A no-op when the stored type already equals the new one (varchar vs text are both STRING),
+     * which also makes a replayed alter_col a no-op.
+     */
     public void alterColumn(long relid, String name, String type) {
         DataType wanted = parseType(type);
-        DataField current = table(relid).schema().fields().stream()
-            .filter(f -> f.name().equals(name)).findFirst()
-            .orElseThrow(() -> new IllegalStateException(
-                "no column '" + name + "' in " + identifiers.get(relid)));
+        DataField current = field(relid, name);
+        if (current == null) {
+            throw new IllegalStateException("no column '" + name + "' in "
+                + identifiers.get(relid));
+        }
         if (current.type().equals(wanted)) {
             return;
         }
