@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One command: bring up PostgreSQL + the Paimon slot writer locally (no containers), run the
 # JDBC acceptance suites, tear down, and exit with the suites' status.
-#   usage: run_acceptance.sh [SuiteName ...]     (no argument = every *IT suite)
+#   usage: run_acceptance.sh [SuiteName ...]     (no argument = every suite in ALL_SUITES)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +18,21 @@ SLOT=paimon
 READY_TIMEOUT=${READY_TIMEOUT:-60}  # seconds, for both the cluster and the writer gates
 WRITER_PID=""
 NOT_RUN=""                          # checks a suite will skip: reported next to the verdict
+
+# Every acceptance suite, named explicitly, because a bare invocation runs exactly this list.
+#
+# It used to pass no -Dtest at all when given no arguments, leaving the selection to Surefire's
+# default includes -- which match *Test and *IT by pattern but, in this project's configuration,
+# selected only the two *IT suites: 24 JUnit tests and 24 of the 186 checks, reported as
+# "ALL SUITES PASSED". The most likely way anyone runs this (bare, from CI) was the way that
+# covered an eighth of the suite and said nothing. Naming the set here makes it visible in the
+# script, and the per-suite report check below then proves each one actually ran.
+#
+# Keep in step with java/src/test/java/pro/surpin/pgpaimon/: a new suite missing from this list is
+# a visible omission here, not a silent gap in the run. PaimonE2ETest is deliberately absent --
+# it is not ported to this architecture and naming it fails the run, by design.
+ALL_SUITES=(SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
+            PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest)
 LAUNCHER="$RUN/start_writer.sh"
 PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER
@@ -129,18 +144,27 @@ LAUNCH
 }
 
 run_suites() {
+  # No suite named: run every one of them, explicitly. Never fall back to Surefire's default
+  # includes -- see ALL_SUITES.
+  if [ "$#" -eq 0 ]; then
+    set -- "${ALL_SUITES[@]}"
+    echo ">> no suite named: running all $# ($*)" >&2
+  fi
+  # The smoke suite always runs: it proves a JDBC suite can see replicated changes.
+  case " $* " in *" SlotHarnessSmokeIT "*) ;; *) set -- SlotHarnessSmokeIT "$@" ;; esac
+
   local args=(-f "$REPO/java/pom.xml" test)
-  # (Before the IFS=, below: `local IFS` lasts to the end of the function and would break "$*".)
   # PaimonOffloadTest T18 needs a MinIO binary; say so up front rather than only in the test log.
   local minio="${E2E_MINIO_BIN:-/root/cloud-db/opt/minio3}"
-  if { [ "$#" -eq 0 ] || [[ " $* " == *" PaimonOffloadTest "* ]]; } && [ ! -x "$minio" ]; then
+  if [[ " $* " == *" PaimonOffloadTest "* ]] && [ ! -x "$minio" ]; then
     NOT_RUN="T18 (S3) NOT RUN: no executable MinIO at '$minio'; enable with E2E_MINIO_BIN=/path/to/minio"
     echo ">> NOTE: $NOT_RUN" >&2
   fi
-  if [ "$#" -gt 0 ]; then
-    # The smoke suite always runs: it proves a JDBC suite can see replicated changes.
-    local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
-  fi
+  # Built with printf, not by setting IFS: `local IFS=,` lasts to the end of the function and
+  # would also mangle "${args[*]}" in the echo below.
+  local dtest
+  dtest="$(printf '%s,' "$@")"
+  args+=("-Dtest=${dtest%,}")
   echo ">> mvn ${args[*]}"
   # Surefire exits 0 when a -Dtest name matches nothing as long as another name matches (the smoke
   # test always does), and -DfailIfNoSpecifiedTests does not change that. So a mistyped suite, or a

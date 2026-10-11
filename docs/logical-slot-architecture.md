@@ -529,10 +529,12 @@ cd java/writer && mvn -q package                 # 194 unit tests, builds the sh
 
 The harness (`test/slot-acceptance/`) needs no Docker. It builds its own PostgreSQL 18 cluster on
 port 5442 (leaving a cluster on 5441 alone), installs the extension from the worktree, runs the writer
-jar locally, runs the JDBC suites and exits with their status. With no arguments it runs every
-`*IT` suite; name the others (`PaimonFeatureTest`, `PaimonDdlTest`, `PaimonAdvancedTest`,
-`PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`, `PaimonSchemaIT`). A suite that
-matches no tests fails the harness; that is how `PaimonE2ETest` fails.
+jar locally, runs the JDBC suites and exits with their status. With no arguments it runs **every**
+suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDdlTest`,
+`PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`, named
+explicitly in the script's `ALL_SUITES` and printed at the start of the run — which is **186
+checks**. Name a subset to run just those (plus the smoke suite). A named suite that matches no
+tests, or whose every test is skipped, fails the harness; that is how `PaimonE2ETest` fails.
 
 Status of the remote warehouses: **T19 (HDFS) passes; T18 (S3) is not run** here, because it needs
 a MinIO server (`E2E_MINIO_BIN`). The harness says so in its verdict (`ALL SUITES PASSED -- except:

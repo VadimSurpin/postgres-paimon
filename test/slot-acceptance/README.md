@@ -8,9 +8,29 @@ It starts, in order: a PostgreSQL 18 cluster on `127.0.0.1:5442` (TCP only, no u
 the `paimon_slot` extension loaded from the worktree (`make install-local` +
 `extension_control_path`, never `sudo make install`), database `paimon_acc` created from
 `setup.sql` (tables + `paimon.add_table`), then the writer jar. Only when the replication slot
-is active does it run `mvn test` in `java/pom.xml` (no argument: every `*IT` suite; with
-names: `-Dtest=SlotHarnessSmokeIT,Name1,...`; the smoke suite, which streams an insert, update and
-delete and waits for them in Paimon, always runs). The script's exit status is Maven's. Teardown runs on any exit.
+is active does it run `mvn test` in `java/pom.xml`, always with an explicit `-Dtest=` list.
+The script's exit status is Maven's. Teardown runs on any exit.
+
+**What a bare run covers.** With no argument it names every suite — the `ALL_SUITES` list in the
+script — and runs all eight:
+
+    SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
+    PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
+
+That is **186 checks** (plus T18 not run without MinIO). It prints the list it is about to run.
+`PaimonE2ETest` is deliberately not in it: it is not ported to this architecture, and naming it
+fails the run by design. The selection is never left to Surefire's default includes — doing so
+picked up only the two `*IT` suites, 24 of the 186 checks, and still printed `ALL SUITES PASSED`.
+
+With names, it runs exactly those plus the smoke suite, which streams an insert, update and delete
+and waits for them in Paimon: `-Dtest=SlotHarnessSmokeIT,Name1,...`.
+
+**Each named suite must actually run.** After Maven, the harness requires a Surefire report with
+`tests > 0` for every name on the list, and fails the run otherwise — so a mistyped name, a class
+with no `@Test`, a suite dropped from `ALL_SUITES`, or a suite whose every test was skipped is a
+failure, not a silent pass. (Surefire itself exits 0 when one `-Dtest` name matches nothing as long
+as another matches, and `-DfailIfNoSpecifiedTests` does not change that; hence the check.) Because
+a bare run names the full list, that check now covers the whole suite as well.
 
 `add_table` runs before the writer because a table cannot be added once the slot exists.
 Each run starts from a fresh database, slot and warehouse; only `pgdata` is reused.
