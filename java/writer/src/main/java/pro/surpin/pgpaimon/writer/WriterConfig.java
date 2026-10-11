@@ -3,12 +3,21 @@ package pro.surpin.pgpaimon.writer;
 
 import java.util.*;
 
+/**
+ * The writer's whole configuration, read from the environment once.
+ *
+ * <p>There is deliberately no flush interval and no flush size for the streaming path: a batch is
+ * one committed PostgreSQL transaction or nothing ({@link TxnBatcher}), so a timer or a record
+ * count could only split a transaction, which would break atomicity and let the slot advance past
+ * records that were never written. {@code flushMaxRecords} is a chunk size for the initial load
+ * only, where each chunk is a commit of its own.
+ */
 public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            String password, String warehouse, String database,
                            String slotName, String publicationName,
                            String messagePrefix, String commitUser,
                            String seqField, String opSeqField, String xidField,
-                           int flushMaxRecords, long flushMaxIntervalMs,
+                           int flushMaxRecords,
                            Map<String, String> catalogOptions) {
 
     public static WriterConfig fromEnv(Map<String, String> env) {
@@ -40,7 +49,6 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             getOrDefault(env, "PGPAIMON_OP_SEQ_FIELD", "_op_seq"),
             get(env, "PGPAIMON_XID_FIELD"),
             (int) parseNumber(env, "PGPAIMON_FLUSH_MAX_RECORDS", "10000", Integer.MAX_VALUE),
-            parseNumber(env, "PGPAIMON_FLUSH_MAX_INTERVAL_MS", "1000", Long.MAX_VALUE),
             Map.copyOf(cat));
     }
 

@@ -108,7 +108,6 @@ export PGPAIMON_SLOT="$SLOT"
 # PGPAIMON_WAREHOUSE_OVERRIDE (and PGPAIMON_S3_* , inherited) let a suite relaunch the writer against
 # s3://... or hdfs://... : see README "Remote warehouses". Unset = the local warehouse.
 export PGPAIMON_WAREHOUSE="\${PGPAIMON_WAREHOUSE_OVERRIDE:-$WAREHOUSE}"
-export PGPAIMON_FLUSH_MAX_INTERVAL_MS=500
 export PGPAIMON_XID_FIELD=_xid
 nohup java -jar "$JAR" >>"$RUN/writer.log" 2>&1 </dev/null &
 echo \$! >"$PIDFILE"

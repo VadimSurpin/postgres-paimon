@@ -80,11 +80,18 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_COMMIT_USER` | `paimon-writer-<slot>` | **must stay stable across restarts**: replay deduplication is scoped to it |
 | `PGPAIMON_SEQ_FIELD`, `PGPAIMON_OP_SEQ_FIELD` | `_seq`, `_op_seq` | mandatory metadata columns (sequencing) |
 | `PGPAIMON_XID_FIELD` | unset (**off**) | set to e.g. `_xid` to add the transaction id column |
-| `PGPAIMON_FLUSH_MAX_RECORDS`, `PGPAIMON_FLUSH_MAX_INTERVAL_MS` | `10000`, `1000` | batching |
+| `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per commit during the **initial load** only; it is not a streaming batch size (see below) |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 
 `_xid` is off by default because it is optional (spec section 6). The acceptance harness sets
 `PGPAIMON_XID_FIELD=_xid` because test T4 asserts the column exists; do not remove that.
+
+**There is no streaming flush interval or flush size, and there must not be one.** A batch is one
+committed PostgreSQL transaction or nothing, so a timer or a record count could only split a
+transaction — which breaks atomicity and lets the slot advance past records that were never
+written. `PGPAIMON_FLUSH_MAX_RECORDS` applies to the initial load, where each chunk is a commit of
+its own. (A `PGPAIMON_FLUSH_MAX_INTERVAL_MS` was parsed but never read; it has been removed rather
+than implemented.)
 
 ### Order of operations, and why it matters
 

@@ -134,11 +134,6 @@ class WriterConfigTest {
         assertTrue(ex.getMessage().contains("PGPAIMON_FLUSH_MAX_RECORDS"));
         assertTrue(ex.getMessage().contains("lots"));
 
-        Map<String, String> e2 = minimal();
-        e2.put("PGPAIMON_FLUSH_MAX_INTERVAL_MS", "1s");
-        ex = assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(e2));
-        assertTrue(ex.getMessage().contains("PGPAIMON_FLUSH_MAX_INTERVAL_MS"));
-
         Map<String, String> e3 = minimal();
         e3.put("PGPAIMON_FLUSH_MAX_RECORDS", "99999999999");
         assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(e3));

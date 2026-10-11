@@ -396,10 +396,17 @@ same versions. One responsibility per class; each testable without the others.
 | `DdlMessageHandler` | `Message` JSON → list of `SchemaChange` | `SchemaRegistry` |
 | `SchemaRegistry` | PG relid → Paimon `Identifier`; applies evolution; owns field-id ↔ column mapping | Paimon `Catalog` |
 | `ToastResolver` | fills `u` columns in the new tuple from the old tuple; decomposes key changes into `-D` + `+I` | — |
-| `TxnBatcher` | groups by transaction, preserves LSN order, flushes on transaction boundary or size | — |
+| `TxnBatcher` | groups by transaction, preserves LSN order, flushes on the transaction boundary **only** | — |
 | `PaimonSink` | `TableWriteImpl` writes, commit with identifier | Paimon |
 | `Backfiller` | exported-snapshot COPY → `+I` rows | PgJDBC, `PaimonSink` |
 | `OffsetStore` | last committed LSN, read back from Paimon snapshots | Paimon |
+
+**Amendment (final whole-branch review):** "or size" above was wrong and a size trigger must not
+exist. A batch is one committed transaction or nothing (section 7, "Complete transactions only"),
+so splitting on a record count would break atomicity and let the slot advance past records that
+were never written. `PGPAIMON_FLUSH_MAX_RECORDS` is therefore the chunk size of the **initial
+load** only, where each chunk is a commit of its own. A `PGPAIMON_FLUSH_MAX_INTERVAL_MS` was
+parsed and never read; it has been removed rather than implemented, for the same reason.
 
 ### Slot connection
 
