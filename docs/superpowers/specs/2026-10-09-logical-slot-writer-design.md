@@ -603,7 +603,7 @@ startup cost is one query, independent of how much WAL the slot is holding.
 ### New limitations versus main
 
 - Unlogged and temporary tables produce no logical changes and cannot be tracked.
-- Partitioned tables require `publish_via_partition_root` set deliberately.
+- Partitioned tables are **refused outright** in v1. `publish_via_partition_root` would be the route to supporting them, and is not taken here.
 - `wal_level = logical` is mandatory.
 - `merge-engine` is fixed at `deduplicate` for tracked tables.
 - Tracked tables are switched to `REPLICA IDENTITY FULL`, which adds the old row to the
@@ -611,7 +611,9 @@ startup cost is one query, independent of how much WAL the slot is holding.
   the same table. The §5 escape exists for tables that cannot afford it.
 - `paimon.add_table()` briefly takes an `ACCESS EXCLUSIVE` lock to set the replica
   identity. Main's `SET ACCESS METHOD` took one too, so this is not a regression.
-- **A *non-empty* table cannot be added once the writer's slot exists.** `add_table()` sets
+- **A *non-empty* table cannot be added once the writer's slot exists**, and the refusal comes
+  from the **writer at its next start**, not from `add_table()` — which succeeds, leaving
+  `backfill_due` set. `add_table()` sets
   `backfill_due` from whether the table actually has rows, under the `SHARE ROW EXCLUSIVE` lock it
   already holds — which conflicts with `ROW EXCLUSIVE`, so no concurrent write can commit between
   the check and the registry row. An **empty** table therefore registers fine against a live
