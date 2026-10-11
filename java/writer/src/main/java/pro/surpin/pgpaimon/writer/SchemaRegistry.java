@@ -82,17 +82,14 @@ public final class SchemaRegistry {
         b.option("ignore-update-before", "false");
 
         Identifier id = Identifier.create(config.database(), table);
+        Table existing = null;
         try {
             catalog.createDatabase(config.database(), true);
             Schema wanted = b.build();
-            Table existing = null;
             try {
                 existing = catalog.getTable(id);
             } catch (Catalog.TableNotExistException e) {
                 // normal first-time case
-            }
-            if (existing != null) {
-                warnOnDrift(id, existing, pk, cols);
             }
             catalog.createTable(id, wanted, true);
         } catch (Exception e) {
@@ -100,15 +97,32 @@ public final class SchemaRegistry {
         }
         identifiers.put(relid, id);
         forget0(relid);
+        if (existing != null) {
+            reconcileOrWarn(relid, id, existing, pk, cols);
+        }
     }
 
     /**
-     * A repeated create for an existing table stays a no-op (restart bootstrap replays every
-     * registry row), but disagreement between the incoming definition and the stored schema is
-     * logged as a WARNING naming each difference. Never throws: drift must not block a restart.
+     * A repeated create for an existing table (the restart bootstrap replays every registry row).
+     *
+     * <p>Columns the create message declares and Paimon lacks are <strong>applied</strong>, one
+     * {@code addColumn} each, with a WARNING naming the column. Warning alone was not enough: a
+     * DDL message lost while the writer was down (a dropped slot, the re-bootstrap procedure in
+     * the operations guide) leaves the Paimon schema permanently behind, and {@link RowBuilder}
+     * then discards that column's value from every row for ever, with nothing but two warnings to
+     * show for it. The registry is rebuilt from {@code paimon.table_registry}, which is updated in
+     * the same transaction as the DDL, so on this one difference the create message is the
+     * authority and Paimon is simply behind.
+     *
+     * <p>Everything else is a WARNING and nothing more, because there is no way to tell which side
+     * is right: a column present in both with different types, a different primary key, a column
+     * Paimon has that the message does not.
+     *
+     * <p>Never throws, and a reconciliation that fails degrades to a warning: drift must not block
+     * a restart.
      */
-    private void warnOnDrift(Identifier id, Table existing, List<String> pk,
-                             List<DdlMessage.Col> cols) {
+    private void reconcileOrWarn(long relid, Identifier id, Table existing, List<String> pk,
+                                 List<DdlMessage.Col> cols) {
         List<String> diffs = new ArrayList<>();
         if (!existing.primaryKeys().equals(pk)) {
             diffs.add("primary key is " + existing.primaryKeys() + " in Paimon but " + pk
@@ -118,10 +132,11 @@ public final class SchemaRegistry {
         for (DataField f : existing.rowType().getFields()) {
             have.put(f.name(), f.type());
         }
+        List<DdlMessage.Col> missing = new ArrayList<>();
         for (DdlMessage.Col c : cols) {
             DataType t = have.remove(c.name());
             if (t == null) {
-                diffs.add("column '" + c.name() + "' is missing from Paimon");
+                missing.add(c);
             } else if (!t.equals(parseType(c.type()))) {
                 diffs.add("column '" + c.name() + "' is " + t.asSQLString()
                     + " in Paimon but " + parseType(c.type()).asSQLString()
@@ -135,6 +150,20 @@ public final class SchemaRegistry {
         }
         for (String extra : have.keySet()) {
             diffs.add("column '" + extra + "' exists in Paimon but not in the create message");
+        }
+        for (DdlMessage.Col c : missing) {
+            DataType t = parseType(c.type());
+            try {
+                catalog.alterTable(id, List.of(SchemaChange.addColumn(c.name(), t)), false);
+                forget0(relid);
+                LOG.warning("create for existing table " + id + ": column '" + c.name() + "' "
+                    + t.asSQLString() + " was missing from its Paimon schema and has been added"
+                    + " (a DDL message for it never reached this writer; rows written before now"
+                    + " hold NULL there)");
+            } catch (Exception e) {
+                diffs.add("column '" + c.name() + "' is missing from Paimon and could not be"
+                    + " added: " + e);
+            }
         }
         if (!diffs.isEmpty()) {
             LOG.warning("create for existing table " + id + " differs from its Paimon schema: "

@@ -181,6 +181,20 @@ Changes made between the loss of the slot and the re-bootstrap are not replayed 
 reload captures the table's state at the new snapshot. Paimon-side history (the changelog) restarts
 from the reload.
 
+A **DDL** statement in that window is a different matter: its message is lost with the slot, so the
+Paimon schema would be left permanently behind the registry, and the writer would discard the new
+column's value from every row with nothing but a warning. The startup bootstrap therefore
+reconciles: a `create` for a table Paimon already has adds the columns the registry declares and
+Paimon lacks, one WARNING per column —
+
+```
+WARNING: create for existing table Identifier{database='default', object='d4'}: column 'extra' STRING was missing from its Paimon schema and has been added (a DDL message for it never reached this writer; rows written before now hold NULL there)
+```
+
+Only that one direction is reconciled. A column present in both with a different type, a different
+primary key, or a column Paimon has that the registry does not, stays a warning and nothing more:
+neither side can be shown to be right, and guessing would be worse than saying so.
+
 The writer prints this same recipe when it refuses to start (section 5). One caveat: the reload
 copies each table using the name recorded at registration, so if a tracked table has been renamed
 since (section 5), rename it back first or the reload fails with `relation "public.<name>" does not exist`.

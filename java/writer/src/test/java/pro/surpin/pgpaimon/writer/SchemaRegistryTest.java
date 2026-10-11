@@ -356,6 +356,52 @@ class SchemaRegistryTest {
         assertTrue(clean.isEmpty(), "an identical replay must not warn");
     }
 
+    /**
+     * Finding 4 of the whole-branch review. A DDL message lost while the writer was down (the
+     * re-bootstrap procedure drops the slot, so anything still in it is gone) used to leave the
+     * Paimon schema permanently behind: the drift was warned about and RowBuilder then discarded
+     * the column's value from every row for ever. A create for an existing table now APPLIES the
+     * columns Paimon lacks. A conflicting difference stays a warning, because neither side can be
+     * shown to be right.
+     */
+    @Test @Order(32)
+    void replayedCreateAppliesTheColumnsPaimonIsMissing() throws Exception {
+        String base = CREATE_FIXTURE.replace("19228", "40003").replace("cap_t", "recon_t");
+        handler.handle(msg(base));
+        assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq"),
+                     reg.table(40003L).schema().fieldNames());
+
+        // the same table, now with a column the writer never saw a DDL message for
+        String drifted = base.replace(
+            """
+            {"id":4,"name":"note","type":"STRING"}""",
+            """
+            {"id":4,"name":"note","type":"STRING"},
+                     {"id":5,"name":"extra","type":"STRING"}""");
+        List<LogRecord> logs = captureWarnings(SchemaRegistry.class,
+                                               () -> handler.handle(msg(drifted)));
+        assertEquals(1, logs.size(), logs.toString());
+        assertTrue(logs.get(0).getMessage().contains("'extra'"), logs.get(0).getMessage());
+        assertTrue(logs.get(0).getMessage().contains("has been added"), logs.get(0).getMessage());
+        assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq", "extra"),
+                     reg.table(40003L).schema().fieldNames(),
+                     "the missing column must be applied, not merely warned about");
+
+        // and a second replay of the same message is then silent
+        assertTrue(captureWarnings(SchemaRegistry.class,
+                                   () -> handler.handle(msg(drifted))).isEmpty());
+
+        // a column present in both with a different type is NOT reconciled
+        long ver = reg.table(40003L).schema().id();
+        List<LogRecord> conflict = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg(drifted.replace("DECIMAL(10, 2)", "DECIMAL(12, 2)"))));
+        assertEquals(1, conflict.size());
+        assertTrue(conflict.get(0).getMessage().contains("'price'"),
+                   conflict.get(0).getMessage());
+        assertEquals(ver, reg.table(40003L).schema().id(),
+                     "a conflicting difference must not alter the table");
+    }
+
     /*
      * Finding 2 of the whole-branch review. A DDL-only transaction produces no records, so
      * filterAndCommit has nothing to filter and up to one status interval (10 s) of applied
