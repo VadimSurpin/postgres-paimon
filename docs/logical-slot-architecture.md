@@ -305,6 +305,37 @@ column cannot be NOT NULL against existing Paimon files) and any change to the p
 (`paimon_slot: cannot change the primary key of public.t`, hint: the Paimon table key is fixed at
 `add_table()` time). These are the same as main.
 
+### A primary-key column's type cannot change, and no column can gain NOT NULL
+
+```
+ERROR:  paimon_slot: cannot change the type of primary-key column public.key_t.id (INT -> BIGINT)
+HINT:  Paimon cannot alter the type of a primary-key field; the key is fixed at add_table() time, so re-register the table (paimon.remove_table, drop the Paimon table, paimon.add_table) to change it
+```
+
+```
+ERROR:  paimon_slot: SET NOT NULL on a replicated column is not supported (public.key_t.n)
+HINT:  rows already written to Paimon may hold NULL there and Paimon never rewrites them, so the column must stay nullable; re-register the table to change it
+```
+
+Both are refusals in PostgreSQL because Paimon refuses them in the writer, and by then PostgreSQL
+has already committed: `UnsupportedOperationException: Cannot update primary key` and
+`Cannot update column type from nullable to non nullable` (measured, Paimon 1.4.1). A transaction
+that is in the slot and can never be applied stops replication for the whole database on every
+restart (section 3, "A record the writer can never apply"), so the only safe place to stop these is
+before they reach WAL. `ALTER COLUMN <pk> TYPE bigint` previously passed every guardrail, because
+the primary-key guardrail compares column *names* and the names do not change.
+
+For the NOT NULL case Paimon offers the table option
+`alter-column-null-to-not-null.disabled = false`. **It is deliberately not used.** Paimon rewrites
+only the declared schema, never the data files, so every row already written — the initial load, and
+every `-U` before-image in the changelog — may legitimately hold NULL in that column, and a schema
+that declares NOT NULL over them is a silent lie to every reader. PostgreSQL's own `SET NOT NULL`
+validates the live table, not that history. (The option is also per table and read from the stored
+options, so enabling it would not even cover tables created by an earlier run.)
+
+What still works: `ALTER COLUMN ... TYPE` on any non-key column, and `DROP NOT NULL` (Paimon accepts
+that direction; verified). To change a key's type, re-register the table.
+
 ### `REPLICA IDENTITY` must stay FULL on a tracked table
 
 ```

@@ -287,3 +287,55 @@ DROP TABLE df_ok, df_t;
 SELECT paimon.peek_messages() - 'relid';
 
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- Finding 3 of the whole-branch review: two ordinary ALTERs passed every
+-- guardrail and then killed the writer permanently, because Paimon refuses both
+-- in a transaction PostgreSQL has already committed.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+CREATE TABLE key_t (id int PRIMARY KEY, v text, nn int NOT NULL, n int);
+SELECT paimon.add_table('key_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+
+-- the primary key's NAME is unchanged, so the pk guardrail passes; its TYPE is not
+ALTER TABLE key_t ALTER COLUMN id TYPE bigint;                    -- expect ERROR
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'key_t'::regclass AND attname = 'id';
+-- and in a combined statement, before anything is emitted
+ALTER TABLE key_t ALTER COLUMN id TYPE bigint, ADD COLUMN q int;  -- expect ERROR
+SELECT paimon.peek_messages() - 'relid';                          -- nothing emitted
+
+-- nullable -> NOT NULL: Paimon never rewrites the rows already written
+ALTER TABLE key_t ALTER COLUMN n SET NOT NULL;                    -- expect ERROR
+ALTER TABLE key_t ALTER COLUMN n SET NOT NULL, ADD COLUMN q int;  -- expect ERROR
+SELECT attnotnull FROM pg_attribute
+WHERE attrelid = 'key_t'::regclass AND attname = 'n';
+SELECT paimon.peek_messages() - 'relid';                          -- nothing emitted
+
+-- what stays allowed: a non-key type change, and NOT NULL -> nullable
+ALTER TABLE key_t ALTER COLUMN v TYPE varchar(32);   -- STRING -> STRING: no message
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE key_t ALTER COLUMN n TYPE bigint;        -- non-key: allowed
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE key_t ALTER COLUMN nn DROP NOT NULL;     -- Paimon accepts this direction
+SELECT paimon.peek_messages() - 'relid';
+
+-- a composite key is covered on every column
+CREATE TABLE key2_t (a int, b int, v text, PRIMARY KEY (a, b));
+SELECT paimon.add_table('key2_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+ALTER TABLE key2_t ALTER COLUMN b TYPE bigint;                    -- expect ERROR
+SELECT paimon.peek_messages() - 'relid';
+
+-- untracked tables are not interfered with
+CREATE TABLE key_plain (id int PRIMARY KEY, n int);
+ALTER TABLE key_plain ALTER COLUMN id TYPE bigint;
+ALTER TABLE key_plain ALTER COLUMN n SET NOT NULL;
+SELECT paimon.peek_messages() - 'relid';
+
+DROP TABLE key_t;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE key2_t;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE key_plain;
+SELECT paimon.peek_messages() - 'relid';
+SELECT pg_drop_replication_slot('paimon_test');

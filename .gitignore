@@ -32,6 +32,8 @@ java/org/
 sql/paimon_slot/_install/
 sql/paimon_slot/test/results/
 sql/paimon_slot/regression.*
+# pg_regress writes its diff and summary into --outputdir, which is test/
+sql/paimon_slot/test/regression.*
 
 # acceptance harness runtime state (cluster, logs, warehouse)
 test/slot-acceptance/run/

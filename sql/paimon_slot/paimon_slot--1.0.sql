@@ -313,8 +313,53 @@ BEGIN
                     'paimon_slot: ADD COLUMN ... NOT NULL without a default is not supported (%.%.%)',
                     reg.schema_name, reg.table_name, c->>'name';
             END IF;
-        ELSIF (o->>'name') <> (c->>'name') THEN
-            PERFORM paimon.reject_reserved_name(c->>'name');
+        ELSE
+            IF (o->>'name') <> (c->>'name') THEN
+                PERFORM paimon.reject_reserved_name(c->>'name');
+            END IF;
+
+            /*
+             * Guardrail: the type of a primary-key column may not change.  The key
+             * guardrail above compares pk_cols, which are NAMES, so ALTER COLUMN <pk>
+             * TYPE bigint leaves the key "unchanged" and passes it.  Paimon then refuses
+             * the schema change with "UnsupportedOperationException: Cannot update
+             * primary key" -- in a transaction PostgreSQL has already committed, so the
+             * writer replays it forever and replication stops for the whole database.
+             * Comparison is on the type without the NOT NULL suffix, so this reports a
+             * real type change and not a nullability one (a key column is always NOT
+             * NULL anyway).
+             */
+            IF (o->>'name') = ANY (reg.pk_cols)
+               AND regexp_replace(o->>'type', ' NOT NULL$', '')
+                   <> regexp_replace(c->>'type', ' NOT NULL$', '') THEN
+                RAISE EXCEPTION
+                    'paimon_slot: cannot change the type of primary-key column %.%.% (% -> %)',
+                    reg.schema_name, reg.table_name, c->>'name',
+                    regexp_replace(o->>'type', ' NOT NULL$', ''),
+                    regexp_replace(c->>'type', ' NOT NULL$', '')
+                      USING HINT = 'Paimon cannot alter the type of a primary-key field; the key is fixed at add_table() time, so re-register the table (paimon.remove_table, drop the Paimon table, paimon.add_table) to change it';
+            END IF;
+
+            /*
+             * Guardrail: a column may not go from nullable to NOT NULL.  Paimon refuses
+             * it with "Cannot update column type from nullable to non nullable", again
+             * after PostgreSQL has committed.  Paimon does offer the table option
+             * alter-column-null-to-not-null.disabled = false, and this REFUSES rather
+             * than enabling it: Paimon only rewrites the declared schema, never the data
+             * files, so every row already written -- the backfill, and every -U
+             * before-image in the changelog -- may hold NULL there, and a schema claiming
+             * NOT NULL over them is a silent lie to every reader.  PostgreSQL's own SET
+             * NOT NULL validates the live table, not the history.  (The option is also
+             * per table and read from the stored options, so enabling it would not even
+             * cover tables created by an earlier run.)
+             */
+            IF (o->>'type') NOT LIKE '% NOT NULL'
+               AND (c->>'type') LIKE '% NOT NULL' THEN
+                RAISE EXCEPTION
+                    'paimon_slot: SET NOT NULL on a replicated column is not supported (%.%.%)',
+                    reg.schema_name, reg.table_name, c->>'name'
+                      USING HINT = 'rows already written to Paimon may hold NULL there and Paimon never rewrites them, so the column must stay nullable; re-register the table to change it';
+            END IF;
         END IF;
     END LOOP;
 

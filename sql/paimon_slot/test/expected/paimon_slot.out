@@ -863,3 +863,142 @@ SELECT pg_drop_replication_slot('paimon_test');
  
 (1 row)
 
+-- Finding 3 of the whole-branch review: two ordinary ALTERs passed every
+-- guardrail and then killed the writer permanently, because Paimon refuses both
+-- in a transaction PostgreSQL has already committed.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+CREATE TABLE key_t (id int PRIMARY KEY, v text, nn int NOT NULL, n int);
+SELECT paimon.add_table('key_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                                                       ?column?                                                                                                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}, {"id": 3, "name": "nn", "type": "INT NOT NULL"}, {"id": 4, "name": "n", "type": "INT"}], "table": "key_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+-- the primary key's NAME is unchanged, so the pk guardrail passes; its TYPE is not
+ALTER TABLE key_t ALTER COLUMN id TYPE bigint;                    -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of primary-key column public.key_t.id (INT -> BIGINT)
+HINT:  Paimon cannot alter the type of a primary-key field; the key is fixed at add_table() time, so re-register the table (paimon.remove_table, drop the Paimon table, paimon.add_table) to change it
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'key_t'::regclass AND attname = 'id';
+ format_type 
+-------------
+ integer
+(1 row)
+
+-- and in a combined statement, before anything is emitted
+ALTER TABLE key_t ALTER COLUMN id TYPE bigint, ADD COLUMN q int;  -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of primary-key column public.key_t.id (INT -> BIGINT)
+HINT:  Paimon cannot alter the type of a primary-key field; the key is fixed at add_table() time, so re-register the table (paimon.remove_table, drop the Paimon table, paimon.add_table) to change it
+SELECT paimon.peek_messages() - 'relid';                          -- nothing emitted
+ ?column? 
+----------
+(0 rows)
+
+-- nullable -> NOT NULL: Paimon never rewrites the rows already written
+ALTER TABLE key_t ALTER COLUMN n SET NOT NULL;                    -- expect ERROR
+ERROR:  paimon_slot: SET NOT NULL on a replicated column is not supported (public.key_t.n)
+HINT:  rows already written to Paimon may hold NULL there and Paimon never rewrites them, so the column must stay nullable; re-register the table to change it
+ALTER TABLE key_t ALTER COLUMN n SET NOT NULL, ADD COLUMN q int;  -- expect ERROR
+ERROR:  paimon_slot: SET NOT NULL on a replicated column is not supported (public.key_t.n)
+HINT:  rows already written to Paimon may hold NULL there and Paimon never rewrites them, so the column must stay nullable; re-register the table to change it
+SELECT attnotnull FROM pg_attribute
+WHERE attrelid = 'key_t'::regclass AND attname = 'n';
+ attnotnull 
+------------
+ f
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';                          -- nothing emitted
+ ?column? 
+----------
+(0 rows)
+
+-- what stays allowed: a non-key type change, and NOT NULL -> nullable
+ALTER TABLE key_t ALTER COLUMN v TYPE varchar(32);   -- STRING -> STRING: no message
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+ALTER TABLE key_t ALTER COLUMN n TYPE bigint;        -- non-key: allowed
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                               
+---------------------------------------------------------------------
+ {"v": 1, "id": 4, "op": "alter_col", "name": "n", "type": "BIGINT"}
+(1 row)
+
+ALTER TABLE key_t ALTER COLUMN nn DROP NOT NULL;     -- Paimon accepts this direction
+SELECT paimon.peek_messages() - 'relid';
+                             ?column?                              
+-------------------------------------------------------------------
+ {"v": 1, "id": 3, "op": "alter_col", "name": "nn", "type": "INT"}
+(1 row)
+
+-- a composite key is covered on every column
+CREATE TABLE key2_t (a int, b int, v text, PRIMARY KEY (a, b));
+SELECT paimon.add_table('key2_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                                     ?column?                                                                                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["a", "b"], "cols": [{"id": 1, "name": "a", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT NOT NULL"}, {"id": 3, "name": "v", "type": "STRING"}], "table": "key2_t", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+ALTER TABLE key2_t ALTER COLUMN b TYPE bigint;                    -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of primary-key column public.key2_t.b (INT -> BIGINT)
+HINT:  Paimon cannot alter the type of a primary-key field; the key is fixed at add_table() time, so re-register the table (paimon.remove_table, drop the Paimon table, paimon.add_table) to change it
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+-- untracked tables are not interfered with
+CREATE TABLE key_plain (id int PRIMARY KEY, n int);
+ALTER TABLE key_plain ALTER COLUMN id TYPE bigint;
+ALTER TABLE key_plain ALTER COLUMN n SET NOT NULL;
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+DROP TABLE key_t;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                              
+--------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "key_t", "schema": "public"}
+(1 row)
+
+DROP TABLE key2_t;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                               
+---------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "key2_t", "schema": "public"}
+(1 row)
+
+DROP TABLE key_plain;
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
