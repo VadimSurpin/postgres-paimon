@@ -28,7 +28,7 @@ import org.apache.paimon.types.DecimalType;
  * as text, and bytea is hex.
  *
  * <p>A null {@code text} is SQL NULL; "" is the empty string. They never map to the same
- * Paimon value. Values with no Paimon representation (date/timestamp infinity, BC dates,
+ * Paimon value. Values with no Paimon representation (date/timestamp infinity,
  * numeric NaN/Infinity, decimals that would lose digits) are rejected, never clamped.
  *
  * <p>A timestamptz's offset is rendered in the walsender session's TimeZone at decode
@@ -109,15 +109,12 @@ public final class TextDecoder {
             case VARBINARY:
                 return fromHex(s);
             case DATE:
-                rejectUnrepresentableTemporal(s);
-                return (int) LocalDate.parse(s).toEpochDay();
+                return (int) LocalDate.parse(temporal(s)).toEpochDay();
             case TIMESTAMP_WITHOUT_TIME_ZONE:
-                rejectUnrepresentableTemporal(s);
-                return Timestamp.fromLocalDateTime(LocalDateTime.parse(s, TS));
+                return Timestamp.fromLocalDateTime(LocalDateTime.parse(temporal(s), TS));
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                rejectUnrepresentableTemporal(s);
                 return Timestamp.fromLocalDateTime(
-                    OffsetDateTime.parse(s, TS_TZ)
+                    OffsetDateTime.parse(temporal(s), TS_TZ)
                                   .withOffsetSameInstant(ZoneOffset.UTC)
                                   .toLocalDateTime());
             default:
@@ -125,14 +122,33 @@ public final class TextDecoder {
         }
     }
 
-    private static void rejectUnrepresentableTemporal(String s) {
+    private static String temporal(String s) {
         if (s.equals("infinity") || s.equals("-infinity")) {
             throw new IllegalArgumentException("infinity has no Paimon representation");
         }
-        if (s.endsWith(" BC")) {
-            throw new IllegalArgumentException(
-                "BC dates have no Paimon representation (stripping the suffix would record the wrong year)");
+        return s.endsWith(" BC") ? bcToProleptic(s) : s;
+    }
+
+    /**
+     * PostgreSQL prints BC values as "0044-03-15 BC" / "0044-03-15 10:20:30+00 BC"; the
+     * suffix is always last. Java counts proleptic years, where 1 BC is year 0, so the
+     * year becomes 1 - bcYear and the rest of the text is parsed unchanged. (Paimon's int
+     * epoch-day and long micros both cover these values.)
+     */
+    private static String bcToProleptic(String s) {
+        String body = s.substring(0, s.length() - 3);
+        int dash = body.indexOf('-');
+        if (dash < 1) {
+            throw new IllegalArgumentException("malformed BC value");
         }
+        long bcYear = Long.parseLong(body.substring(0, dash));
+        if (bcYear < 1 || body.charAt(0) == '+') {
+            throw new IllegalArgumentException("malformed BC value");
+        }
+        long proleptic = 1 - bcYear;
+        String year = proleptic == 0 ? "0000"
+            : "-" + String.format("%04d", -proleptic);
+        return year + body.substring(dash);
     }
 
     private static Decimal decimal(DecimalType t, String s) {

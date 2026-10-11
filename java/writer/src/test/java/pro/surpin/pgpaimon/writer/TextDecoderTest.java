@@ -224,11 +224,52 @@ class TextDecoderTest {
         }
     }
 
+    // Strings below were produced by PostgreSQL 18 (::text), not composed by hand.
     @Test
-    void bcDatesAreRejectedNotStripped() {
-        assertRejected(DataTypes.DATE(), "0044-03-15 BC", "d");
-        assertRejected(DataTypes.TIMESTAMP(6), "0044-03-15 10:00:00 BC", "ts");
-        assertRejected(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6), "0044-03-15 10:00:00+00 BC", "tstz");
+    void bcDatesBecomeProlepticEpochDays() {
+        assertEquals(-735160, TextDecoder.toPaimon(DataTypes.DATE(), "0044-03-15 BC"));
+        assertEquals((int) LocalDate.of(-43, 3, 15).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "0044-03-15 BC"));
+        assertEquals((int) LocalDate.of(-4712, 1, 1).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "4713-01-01 BC"));
+    }
+
+    @Test
+    void yearZeroBoundaryIsPinnedFromBothSides() {
+        assertEquals((int) LocalDate.of(0, 1, 1).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "0001-01-01 BC"));
+        assertEquals((int) LocalDate.of(1, 1, 1).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "0001-01-01"));
+        assertEquals(366, (int) TextDecoder.toPaimon(DataTypes.DATE(), "0001-01-01")
+                          - (int) TextDecoder.toPaimon(DataTypes.DATE(), "0001-01-01 BC"));
+    }
+
+    @Test
+    void bcLeapDayUsesProlepticLeapRule() {
+        // 45 BC = proleptic -44, a leap year; PostgreSQL accepts 0045-02-29 BC
+        assertEquals((int) LocalDate.of(-44, 2, 29).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "0045-02-29 BC"));
+        assertRejected(DataTypes.DATE(), "0044-02-29 BC", "d");   // 44 BC = -43, not leap
+    }
+
+    @Test
+    void bcTimestampsKeepTimeAndFraction() {
+        assertEquals("-0043-03-15T10:20:30", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "0044-03-15 10:20:30 BC")).toLocalDateTime().toString());
+        assertEquals("-0043-03-15T10:20:30.500", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "0044-03-15 10:20:30.5 BC")).toLocalDateTime().toString());
+        assertEquals("0000-01-01T00:00", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "0001-01-01 00:00:00 BC")).toLocalDateTime().toString());
+        assertEquals("0001-01-01T00:00", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "0001-01-01 00:00:00")).toLocalDateTime().toString());
+    }
+
+    @Test
+    void bcTimestamptzAppliesOffsetAfterTheYearConversion() {
+        assertEquals("-0043-03-15T10:20:30", tstz("0044-03-15 10:20:30+00 BC"));
+        assertEquals("0000-01-01T00:00", tstz("0001-01-01 00:00:00+00 BC"));
+        // server rendering of the same instant in Asia/Kathmandu (LMT +05:41:16)
+        assertEquals("-0043-03-15T10:20:30", tstz("0044-03-15 16:01:46+05:41:16 BC"));
     }
 
     @Test
