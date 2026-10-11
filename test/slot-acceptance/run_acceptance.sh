@@ -17,6 +17,7 @@ JAR="$REPO/java/writer/target/paimon-writer.jar"
 SLOT=paimon
 READY_TIMEOUT=${READY_TIMEOUT:-60}  # seconds, for both the cluster and the writer gates
 WRITER_PID=""
+NOT_RUN=""                          # checks a suite will skip: reported next to the verdict
 LAUNCHER="$RUN/start_writer.sh"
 PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER
@@ -103,7 +104,10 @@ start_writer() {
 #!/usr/bin/env bash
 export PGPAIMON_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB"
 export PGPAIMON_USER="$PGUSER" PGPAIMON_PASSWORD=""
-export PGPAIMON_SLOT="$SLOT" PGPAIMON_WAREHOUSE="$WAREHOUSE"
+export PGPAIMON_SLOT="$SLOT"
+# PGPAIMON_WAREHOUSE_OVERRIDE (and PGPAIMON_S3_* , inherited) let a suite relaunch the writer against
+# s3://... or hdfs://... : see README "Remote warehouses". Unset = the local warehouse.
+export PGPAIMON_WAREHOUSE="\${PGPAIMON_WAREHOUSE_OVERRIDE:-$WAREHOUSE}"
 export PGPAIMON_FLUSH_MAX_INTERVAL_MS=500
 export PGPAIMON_XID_FIELD=_xid
 nohup java -jar "$JAR" >>"$RUN/writer.log" 2>&1 </dev/null &
@@ -132,6 +136,12 @@ run_suites() {
     local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
   fi
   echo ">> mvn ${args[*]}"
+  # PaimonOffloadTest T18 needs a MinIO binary; say so up front rather than only in the test log.
+  local minio="${E2E_MINIO_BIN:-/root/cloud-db/opt/minio3}"
+  if { [ "$#" -eq 0 ] || [[ " $* " == *" PaimonOffloadTest "* ]]; } && [ ! -x "$minio" ]; then
+    NOT_RUN="T18 (S3) NOT RUN: no executable MinIO at '$minio'; enable with E2E_MINIO_BIN=/path/to/minio"
+    echo ">> NOTE: $NOT_RUN" >&2
+  fi
   # Surefire exits 0 when a -Dtest name matches nothing as long as another name matches (the smoke
   # test always does), and -DfailIfNoSpecifiedTests does not change that. So a mistyped suite, or a
   # class with no @Test, would print "ALL SUITES PASSED" having run nothing. Prove each named suite
@@ -187,7 +197,7 @@ main() {
   start_writer
   local rc=0
   run_suites "$@" || rc=$?
-  [ "$rc" -eq 0 ] && echo ">> ALL SUITES PASSED" || echo ">> SUITES FAILED (mvn exit $rc)" >&2
+  [ "$rc" -eq 0 ] && echo ">> ALL SUITES PASSED${NOT_RUN:+ -- except: $NOT_RUN}" || echo ">> SUITES FAILED (mvn exit $rc)" >&2
   exit "$rc"
 }
 main "$@"

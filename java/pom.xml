@@ -16,6 +16,27 @@
     </properties>
 
     <dependencies>
+        <!-- Embedded single-node HDFS for T19.  Declared FIRST on purpose: hadoop-client-api below
+             bundles a relocated copy of the same org.apache.hadoop classes (HttpServer2 etc.,
+             compiled against org.apache.hadoop.shaded jetty) which would shadow these and break
+             MiniDFSCluster with NoClassDefFoundError.  Classpath order is declaration order. -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-minicluster</artifactId>
+            <version>3.3.4</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-hdfs</artifactId>
+            <version>3.3.4</version>
+        </dependency>
+        <!-- MiniDFSCluster.isNameNodeUp references org.mockito.stubbing.Answer -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.14.2</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>paimon-bundle</artifactId>
@@ -41,12 +62,6 @@
             <artifactId>junit-jupiter</artifactId>
             <version>5.10.2</version>
             <scope>test</scope>
-        </dependency>
-        <!-- Embedded single-node HDFS for T19 -->
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-minicluster</artifactId>
-            <version>3.3.4</version>
         </dependency>
         <!-- Spark: provided so Spark-dependent sources compile in every profile.
              The compaction and e2e-test profiles redeclare these as compile scope,

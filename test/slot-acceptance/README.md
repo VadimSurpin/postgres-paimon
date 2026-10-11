@@ -32,3 +32,28 @@ lives inside `pgdata`, so stopping the cluster stops it holding WAL and deleting
 removes it.
 
 `READY_TIMEOUT` (seconds, default 60) bounds both readiness gates.
+
+## Remote warehouses (PaimonOffloadTest: T18 S3, T19 HDFS)
+
+There is no offload step in this architecture (on main a worker wrote Parquet locally, uploaded
+it and deleted the local copy). The warehouse itself is `s3://bucket/wh` or `hdfs://host:port/wh`
+and the writer's Paimon FileIO writes straight to it. The suite proves the data is still
+readable from there.
+
+Mode: the generated writer launcher (`run/start_writer.sh`, exported to suites as
+`PGPAIMON_WRITER_LAUNCHER`) honours `PGPAIMON_WAREHOUSE_OVERRIDE`; any `PGPAIMON_S3_ENDPOINT`,
+`PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` in its environment reach the writer. Unset,
+the writer uses the local warehouse and every other suite is unaffected. `PaimonOffloadTest`
+uses it: it stops the harness writer, runs `PGPAIMON_WAREHOUSE_OVERRIDE=<uri> bash $LAUNCHER`,
+runs its three phases (INSERT 20, UPDATE 5, DELETE 3, row kinds read from `$audit_log`),
+waits for the slot to catch up, and restores the default writer.
+
+    ./test/slot-acceptance/run_acceptance.sh PaimonOffloadTest
+
+- **T19 (HDFS)** runs in the test JVM on a `MiniDFSCluster`. No setup, no extra install.
+- **T18 (S3)** runs only when `E2E_MINIO_BIN` names an executable MinIO server
+  (`E2E_MINIO_BIN=/path/to/minio`; port `E2E_MINIO_PORT`, default 9100). Otherwise it prints
+  `T18 SKIPPED (...)`, the results line reads `N passed, 0 failed, 1 skipped`, and the harness
+  verdict reads `ALL SUITES PASSED -- except: T18 (S3) NOT RUN ...`. A skip is never a pass.
+  Known gap: the writer jar currently bundles no S3 FileIO (no `paimon-s3`), so T18 is expected
+  to fail against a real MinIO until that dependency is added to `java/writer/pom.xml`.
