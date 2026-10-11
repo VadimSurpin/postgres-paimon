@@ -131,6 +131,12 @@ BEGIN
               USING HINT = 'a primary key is required; see design spec section 4';
     END IF;
 
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conrelid = v_relid AND contype = 'p' AND condeferrable) THEN
+        RAISE EXCEPTION 'paimon_slot: the primary key of % must not be DEFERRABLE', rel
+              USING HINT = 'a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7';
+    END IF;
+
     v_cols := paimon.table_cols(v_relid);
     PERFORM paimon.reject_reserved_name(c->>'name') FROM jsonb_array_elements(v_cols) c;
 
@@ -255,6 +261,15 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: cannot change the primary key of %.%',
                         reg.schema_name, reg.table_name
               USING HINT = 'the Paimon table key is fixed at add_table() time';
+    END IF;
+
+    /* Guardrail: a deferrable key (reachable by DROP CONSTRAINT + ADD PRIMARY KEY
+     * ... DEFERRABLE in one statement, which leaves pk_cols unchanged). */
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conrelid = v_relid AND contype = 'p' AND condeferrable) THEN
+        RAISE EXCEPTION 'paimon_slot: the primary key of %.% must not be DEFERRABLE',
+                        reg.schema_name, reg.table_name
+              USING HINT = 'a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7';
     END IF;
 
     /*

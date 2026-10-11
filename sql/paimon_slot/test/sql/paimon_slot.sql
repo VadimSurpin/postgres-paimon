@@ -269,4 +269,21 @@ ORDER BY 2;
 DROP TABLE bf_empty, bf_rows;
 SELECT paimon.peek_messages() - 'relid';
 
+-- a DEFERRABLE primary key cannot be represented in a Paimon pk table
+CREATE TABLE df_t (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED);
+SELECT paimon.add_table('df_t'::regclass);                  -- expect ERROR
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'df_t';
+CREATE TABLE df_ok (id int PRIMARY KEY);
+SELECT paimon.add_table('df_ok'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+-- ALTER CONSTRAINT cannot change a primary key's deferrability in place
+ALTER TABLE df_ok ALTER CONSTRAINT df_ok_pkey DEFERRABLE;   -- expect ERROR (PostgreSQL)
+-- but drop + re-add in one statement keeps pk_cols, so the DDL path checks too
+ALTER TABLE df_ok DROP CONSTRAINT df_ok_pkey,
+  ADD CONSTRAINT df_ok_pkey PRIMARY KEY (id) DEFERRABLE;    -- expect ERROR
+SELECT condeferrable FROM pg_constraint WHERE conrelid = 'df_ok'::regclass;
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE df_ok, df_t;
+SELECT paimon.peek_messages() - 'relid';
+
 SELECT pg_drop_replication_slot('paimon_test');

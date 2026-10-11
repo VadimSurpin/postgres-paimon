@@ -806,6 +806,57 @@ SELECT paimon.peek_messages() - 'relid';
  {"v": 1, "op": "drop_table", "table": "bf_empty", "schema": "public"}
 (2 rows)
 
+-- a DEFERRABLE primary key cannot be represented in a Paimon pk table
+CREATE TABLE df_t (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED);
+SELECT paimon.add_table('df_t'::regclass);                  -- expect ERROR
+ERROR:  paimon_slot: the primary key of df_t must not be DEFERRABLE
+HINT:  a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'df_t';
+ count 
+-------
+     0
+(1 row)
+
+CREATE TABLE df_ok (id int PRIMARY KEY);
+SELECT paimon.add_table('df_ok'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                      ?column?                                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "df_ok", "schema": "public", "options": {"changelog-producer": "input"}}
+(1 row)
+
+-- ALTER CONSTRAINT cannot change a primary key's deferrability in place
+ALTER TABLE df_ok ALTER CONSTRAINT df_ok_pkey DEFERRABLE;   -- expect ERROR (PostgreSQL)
+ERROR:  constraint "df_ok_pkey" of relation "df_ok" is not a foreign key constraint
+-- but drop + re-add in one statement keeps pk_cols, so the DDL path checks too
+ALTER TABLE df_ok DROP CONSTRAINT df_ok_pkey,
+  ADD CONSTRAINT df_ok_pkey PRIMARY KEY (id) DEFERRABLE;    -- expect ERROR
+ERROR:  paimon_slot: the primary key of public.df_ok must not be DEFERRABLE
+HINT:  a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7
+SELECT condeferrable FROM pg_constraint WHERE conrelid = 'df_ok'::regclass;
+ condeferrable 
+---------------
+ f
+ f
+(2 rows)
+
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+DROP TABLE df_ok, df_t;
+SELECT paimon.peek_messages() - 'relid';
+                              ?column?                              
+--------------------------------------------------------------------
+ {"v": 1, "op": "drop_table", "table": "df_ok", "schema": "public"}
+(1 row)
+
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
 --------------------------
