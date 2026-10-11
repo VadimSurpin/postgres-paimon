@@ -151,13 +151,18 @@ public final class SlotConsumer {
             // startup packet and the "options" property does not override it (verified against
             // PostgreSQL 18), so the zone is set with SQL, which a replication=database session
             // accepts. client_encoding must be UTF8 because PgOutputDecoder decodes strictly.
+            // bytea_output must be hex because TextDecoder accepts only the \x form, and a
+            // server (or role, or database) set to 'escape' would otherwise feed it octal
+            // escapes; Backfiller pins it on its own connection for the same reason.
             // Each setting is read back: a mismatch is a misconfiguration, not connection loss.
             try (Statement st = conn.createStatement()) {
                 st.execute("SET TimeZone = 'UTC'");
                 st.execute("SET client_encoding = 'UTF8'");
+                st.execute("SET bytea_output = 'hex'");
             }
             requireSetting(conn, "TimeZone", "UTC");
             requireSetting(conn, "client_encoding", "UTF8");
+            requireSetting(conn, "bytea_output", "hex");
         } catch (SQLException | RuntimeException e) {
             try {
                 conn.close();
