@@ -10,6 +10,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.ResolverStyle;
+import java.time.format.SignStyle;
 import java.time.temporal.ChronoField;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
@@ -36,8 +37,23 @@ import org.apache.paimon.types.DecimalType;
  */
 public final class TextDecoder {
 
+    /**
+     * Proleptic year of 4 to 10 digits. PostgreSQL prints years above 9999 with no '+'
+     * (e.g. 5874897-12-31), which ISO_LOCAL_DATE and a fixed "uuuu" both refuse; NORMAL
+     * sign style accepts them and a leading '-' (used for converted BC years).
+     */
+    private static final DateTimeFormatterBuilder YMD = new DateTimeFormatterBuilder()
+        .appendValue(ChronoField.YEAR, 4, 10, SignStyle.NORMAL)
+        .appendPattern("-MM-dd");
+
+    private static final DateTimeFormatter DATE_FMT = new DateTimeFormatterBuilder()
+        .append(YMD.toFormatter())
+        .toFormatter()
+        .withResolverStyle(ResolverStyle.STRICT);
+
     private static final DateTimeFormatter TS = new DateTimeFormatterBuilder()
-        .appendPattern("uuuu-MM-dd HH:mm:ss")
+        .append(YMD.toFormatter())
+        .appendPattern(" HH:mm:ss")
         .appendFraction(ChronoField.MICRO_OF_SECOND, 0, 6, true)
         .toFormatter()
         .withResolverStyle(ResolverStyle.STRICT);
@@ -109,7 +125,7 @@ public final class TextDecoder {
             case VARBINARY:
                 return fromHex(s);
             case DATE:
-                return (int) LocalDate.parse(temporal(s)).toEpochDay();
+                return (int) LocalDate.parse(temporal(s), DATE_FMT).toEpochDay();
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 return Timestamp.fromLocalDateTime(LocalDateTime.parse(temporal(s), TS));
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
@@ -133,7 +149,8 @@ public final class TextDecoder {
      * PostgreSQL prints BC values as "0044-03-15 BC" / "0044-03-15 10:20:30+00 BC"; the
      * suffix is always last. Java counts proleptic years, where 1 BC is year 0, so the
      * year becomes 1 - bcYear and the rest of the text is parsed unchanged. (Paimon's int
-     * epoch-day and long micros both cover these values.)
+     * epoch-day and long micros both cover every value PostgreSQL can hold, so only the
+     * infinity sentinels are unrepresentable.)
      */
     private static String bcToProleptic(String s) {
         String body = s.substring(0, s.length() - 3);

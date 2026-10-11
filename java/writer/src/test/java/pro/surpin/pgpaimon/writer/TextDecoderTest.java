@@ -302,4 +302,33 @@ class TextDecoderTest {
             DataTypes.DECIMAL(5, 2), "-999.99")).toBigDecimal().toPlainString());
         assertRejected(DataTypes.DECIMAL(5, 2), "1000.00", "amt");
     }
+
+    // Server-produced extremes (PostgreSQL 18).
+    @Test
+    void postgresMaximumDateParses() {
+        assertEquals(2145042905, TextDecoder.toPaimon(DataTypes.DATE(), "5874897-12-31"));
+        assertEquals((int) LocalDate.of(10000, 1, 1).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "10000-01-01"));
+        assertEquals((int) LocalDate.of(9999, 12, 31).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "9999-12-31"));
+        assertEquals(-735160, TextDecoder.toPaimon(DataTypes.DATE(), "0044-03-15 BC"));
+        assertEquals((int) LocalDate.of(-4713, 11, 24).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "4714-11-24 BC"));
+    }
+
+    @Test
+    void postgresMaximumTimestampsParse() {
+        assertEquals("+294276-12-31T23:59:59.999999", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "294276-12-31 23:59:59.999999")).toLocalDateTime().toString());
+        assertEquals("+294276-12-31T23:59:59.999999", tstz("294276-12-31 23:59:59.999999+00"));
+        // same instant rendered by a Kathmandu session lands in year 294277 local time
+        assertEquals("+294276-12-31T23:59:59", tstz("294277-01-01 05:44:59+05:45"));
+        assertEquals("+10000-01-01T00:00", tstz("10000-01-01 05:45:00+05:45"));
+    }
+
+    @Test
+    void invalidHighYearDatesAreStillRejected() {
+        assertRejected(DataTypes.DATE(), "10000-02-30", "d");
+        assertRejected(DataTypes.DATE(), "+10000-01-01", "d");
+    }
 }
