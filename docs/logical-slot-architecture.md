@@ -202,9 +202,9 @@ Only that one direction is reconciled. A column present in both with a different
 primary key, or a column Paimon has that the registry does not, stays a warning and nothing more:
 neither side can be shown to be right, and guessing would be worse than saying so.
 
-The writer prints this same recipe when it refuses to start (section 5). One caveat: the reload
-copies each table using the name recorded at registration, so if a tracked table has been renamed
-since (section 5), rename it back first or the reload fails with `relation "public.<name>" does not exist`.
+The writer prints this same recipe when it refuses to start (section 5). A table renamed since
+registration needs nothing extra: the reload resolves the source table by its OID, so it copies the
+table under its current name while the Paimon table keeps the name it was registered under.
 
 ### A record the writer can never apply (a poison record)
 
@@ -437,8 +437,9 @@ the warehouse.
 
 **Why.** The Paimon table's identity is fixed at registration. Following the rename would orphan the
 data already written under the old name, or require moving a table in the warehouse and re-pointing
-every reader. Consequence to be aware of: the PostgreSQL name and the Paimon name diverge, and a
-re-bootstrap copies by the registered name, so rename the table back first (section 3).
+every reader. Consequence to be aware of: the PostgreSQL name and the Paimon name diverge. A
+re-bootstrap handles it — the initial load resolves the source table by its OID, not by the
+registered name — so no renaming back is needed.
 
 ### Metadata columns differ from the TAM architecture
 
