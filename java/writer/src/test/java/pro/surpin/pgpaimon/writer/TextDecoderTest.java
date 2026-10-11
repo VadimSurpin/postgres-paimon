@@ -215,13 +215,53 @@ class TextDecoderTest {
         assertRejected(DataTypes.DECIMAL(10, 2), "-Infinity", "amt");
     }
 
+    // "infinity" / "-infinity" are what PostgreSQL 18 prints for these values.
+    private static final Timestamp MAX_TS = Timestamp.fromLocalDateTime(
+        java.time.LocalDateTime.of(294276, 12, 31, 23, 59, 59, 999_999_000));
+    private static final Timestamp MIN_TS = Timestamp.fromLocalDateTime(
+        java.time.LocalDateTime.of(-4712, 1, 1, 0, 0));
+
     @Test
-    void dateAndTimestampInfinityAreRejected() {
-        for (String v : new String[] { "infinity", "-infinity" }) {
-            assertRejected(DataTypes.DATE(), v, "d");
-            assertRejected(DataTypes.TIMESTAMP(6), v, "ts");
-            assertRejected(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6), v, "tstz");
+    void timestampInfinityMapsToTheExtremeTimestamps() {
+        for (DataType t : new DataType[] { DataTypes.TIMESTAMP(6),
+                                           DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6) }) {
+            assertEquals(MAX_TS, TextDecoder.toPaimon(t, "infinity"));
+            assertEquals(MIN_TS, TextDecoder.toPaimon(t, "-infinity"));
+            assertEquals("+294276-12-31T23:59:59.999999",
+                ((Timestamp) TextDecoder.toPaimon(t, "infinity")).toLocalDateTime().toString());
+            assertEquals("-4712-01-01T00:00",
+                ((Timestamp) TextDecoder.toPaimon(t, "-infinity")).toLocalDateTime().toString());
         }
+    }
+
+    @Test
+    void dateInfinityMapsToTheExtremeDates() {
+        assertEquals(2145042905, TextDecoder.toPaimon(DataTypes.DATE(), "infinity"));
+        assertEquals(-2440550, TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
+        assertEquals((int) LocalDate.of(-4712, 1, 1).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
+    }
+
+    @Test
+    void infinitySortsOutsideEveryOrdinaryValue() {
+        Timestamp ordinary = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "2026-10-09 13:46:40");
+        Timestamp pos = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "infinity");
+        Timestamp neg = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "-infinity");
+        assertTrue(pos.compareTo(ordinary) > 0);
+        assertTrue(neg.compareTo(ordinary) < 0);
+        int d = (int) TextDecoder.toPaimon(DataTypes.DATE(), "2026-10-09");
+        assertTrue((int) TextDecoder.toPaimon(DataTypes.DATE(), "infinity") > d);
+        assertTrue((int) TextDecoder.toPaimon(DataTypes.DATE(), "-infinity") < d);
+    }
+
+    @Test
+    void theFiniteExtremesParseAsThemselvesSoBothPathsAgree() {
+        assertEquals(MAX_TS, TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "294276-12-31 23:59:59.999999"));
+        assertEquals(MIN_TS, TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "4713-01-01 00:00:00 BC"));
+        assertEquals(TextDecoder.toPaimon(DataTypes.DATE(), "infinity"),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "5874897-12-31"));
+        assertEquals(TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "4713-01-01 BC"));
     }
 
     // Strings below were produced by PostgreSQL 18 (::text), not composed by hand.

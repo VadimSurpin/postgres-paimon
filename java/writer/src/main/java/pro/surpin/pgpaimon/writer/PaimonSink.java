@@ -152,11 +152,11 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
     }
 
     /**
-     * A value PostgreSQL stores happily that Paimon cannot represent -- {@code timestamp
-     * 'infinity'}, a {@code numeric} outside {@code DECIMAL(38, 18)}, a BC date -- is a
+     * A value PostgreSQL stores happily that Paimon cannot represent -- {@code numeric
+     * 'NaN'} or a {@code numeric} outside {@code DECIMAL(38, 18)} -- is a
      * <em>poison record</em>, not a transient failure, and the distinction is the whole point of
-     * this message. No guardrail can prevent one (a {@code timestamp} column can always hold
-     * infinity), the slot only advances after a successful Paimon commit, and the offending WAL
+     * this message. No guardrail can prevent one (a {@code numeric} column can always hold
+     * NaN), the slot only advances after a successful Paimon commit, and the offending WAL
      * record is in the slot, so every restart replays it and fails identically. Deleting or
      * correcting the row in PostgreSQL does not help. Spec section 8's "transaction replayed on
      * retry" does not cover a replay that can never succeed; there is no quarantine mechanism, by

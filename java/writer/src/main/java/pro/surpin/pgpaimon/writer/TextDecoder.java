@@ -29,8 +29,8 @@ import org.apache.paimon.types.DecimalType;
  * as text, and bytea is hex.
  *
  * <p>A null {@code text} is SQL NULL; "" is the empty string. They never map to the same
- * Paimon value. Values with no Paimon representation (date/timestamp infinity,
- * numeric NaN/Infinity, decimals that would lose digits) are rejected, never clamped.
+ * Paimon value. date/timestamp infinity maps to the extreme finite values (see the constants);
+ * values with no Paimon representation (numeric NaN/Infinity, decimals that would lose digits) are rejected, never clamped.
  *
  * <p>A timestamptz's offset is rendered in the walsender session's TimeZone at decode
  * time; the replication connection must be pinned to UTC (all offset forms still parse).
@@ -68,6 +68,22 @@ public final class TextDecoder {
         .appendOffset("+HH:mm:ss", "+00")
         .toFormatter()
         .withResolverStyle(ResolverStyle.STRICT);
+
+    /*
+     * PostgreSQL's infinity / -infinity have no Paimon counterpart, so they are encoded as
+     * PostgreSQL's own finite extremes: the largest and smallest values the source can hold.
+     * This is an order-preserving encoding of a sentinel (infinity almost always means an
+     * open-ended interval, e.g. valid_to = 'infinity', and "valid_to > now()" must still
+     * match), not a fabricated date. It is NOT lossless: a row genuinely holding the maximum
+     * (or minimum) value becomes indistinguishable from infinity (-infinity), whereas in
+     * PostgreSQL they are distinct values.
+     */
+    static final int DATE_POS_INFINITY = (int) LocalDate.parse("5874897-12-31", DATE_FMT).toEpochDay();
+    static final int DATE_NEG_INFINITY = (int) LocalDate.parse("-4712-01-01", DATE_FMT).toEpochDay(); // 4713-01-01 BC
+    static final Timestamp TS_POS_INFINITY = Timestamp.fromLocalDateTime(
+        LocalDateTime.parse("294276-12-31 23:59:59.999999", TS));
+    static final Timestamp TS_NEG_INFINITY = Timestamp.fromLocalDateTime(
+        LocalDateTime.parse("-4712-01-01 00:00:00", TS));                                      // 4713-01-01 00:00:00 BC
 
     private TextDecoder() {
     }
@@ -125,10 +141,28 @@ public final class TextDecoder {
             case VARBINARY:
                 return fromHex(s);
             case DATE:
+                if (s.equals("infinity")) {
+                    return DATE_POS_INFINITY;
+                }
+                if (s.equals("-infinity")) {
+                    return DATE_NEG_INFINITY;
+                }
                 return (int) LocalDate.parse(temporal(s), DATE_FMT).toEpochDay();
             case TIMESTAMP_WITHOUT_TIME_ZONE:
+                if (s.equals("infinity")) {
+                    return TS_POS_INFINITY;
+                }
+                if (s.equals("-infinity")) {
+                    return TS_NEG_INFINITY;
+                }
                 return Timestamp.fromLocalDateTime(LocalDateTime.parse(temporal(s), TS));
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                if (s.equals("infinity")) {
+                    return TS_POS_INFINITY;
+                }
+                if (s.equals("-infinity")) {
+                    return TS_NEG_INFINITY;
+                }
                 return Timestamp.fromLocalDateTime(
                     OffsetDateTime.parse(temporal(s), TS_TZ)
                                   .withOffsetSameInstant(ZoneOffset.UTC)
@@ -139,9 +173,6 @@ public final class TextDecoder {
     }
 
     private static String temporal(String s) {
-        if (s.equals("infinity") || s.equals("-infinity")) {
-            throw new IllegalArgumentException("infinity has no Paimon representation");
-        }
         return s.endsWith(" BC") ? bcToProleptic(s) : s;
     }
 
@@ -149,8 +180,8 @@ public final class TextDecoder {
      * PostgreSQL prints BC values as "0044-03-15 BC" / "0044-03-15 10:20:30+00 BC"; the
      * suffix is always last. Java counts proleptic years, where 1 BC is year 0, so the
      * year becomes 1 - bcYear and the rest of the text is parsed unchanged. (Paimon's int
-     * epoch-day and long micros both cover every value PostgreSQL can hold, so only the
-     * infinity sentinels are unrepresentable.)
+     * epoch-day and long micros both cover every value PostgreSQL can hold, so nothing
+     * temporal is unrepresentable apart from the infinity sentinels, which are encoded separately.)
      */
     private static String bcToProleptic(String s) {
         String body = s.substring(0, s.length() - 3);

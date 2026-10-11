@@ -212,17 +212,17 @@ table under its current name while the Paimon table keeps the name it was regist
 replication for the whole database:
 
 ```sql
-CREATE TABLE v (id int PRIMARY KEY, ts timestamp, amt numeric(10,2));
+CREATE TABLE v (id int PRIMARY KEY, amt numeric(10,2));
 SELECT paimon.add_table('v'::regclass);
-INSERT INTO v VALUES (2, 'infinity', 2.5);
+INSERT INTO v VALUES (2, 'NaN');
 ```
 
-`timestamp 'infinity'` has no Paimon representation. The writer refuses it rather than clamping it
-(silently storing the wrong instant is worse), which is right, but the refusal is fatal and the
+`numeric 'NaN'` has no Paimon representation. The writer refuses it rather than inventing a value
+(a silently wrong number is worse), which is right, but the refusal is fatal and the
 failure is permanent:
 
 ```
-SEVERE: fatal: java.lang.IllegalStateException: POISON RECORD in public.v (INSERT at _seq 0/14CD98C8), transaction committing at 0/14CD9958: column 'ts': cannot parse TIMESTAMP(6) from "infinity": infinity has no Paimon representation. THIS IS NOT TRANSIENT and will not clear by itself: the change is already in replication slot 'paimon', the slot advances only after a successful Paimon commit, so every restart replays this same record and fails identically. Deleting or correcting the row in PostgreSQL does NOT help -- the offending WAL record stays in the slot. ...
+SEVERE: fatal: java.lang.IllegalStateException: POISON RECORD in public.v (INSERT at _seq 0/14CD98C8), transaction committing at 0/14CD9958: column 'amt': cannot parse DECIMAL(10, 2) from "NaN": numeric NaN and Infinity have no Paimon representation. THIS IS NOT TRANSIENT and will not clear by itself: the change is already in replication slot 'paimon', the slot advances only after a successful Paimon commit, so every restart replays this same record and fails identically. Deleting or correcting the row in PostgreSQL does NOT help -- the offending WAL record stays in the slot. ...
 ```
 
 **`DELETE FROM v WHERE id = 2` does not help** (verified: the restart after the delete exits 1 with
@@ -231,10 +231,11 @@ has returned, so the record is replayed on every start, for ever, and no later D
 from the slot.
 
 The same applies to any value PostgreSQL stores happily that Paimon cannot represent: `numeric`
-beyond `DECIMAL(38, 18)`, a BC date, `timestamp '-infinity'`.
+beyond `DECIMAL(38, 18)`. (Dates and timestamps are not in this class: `infinity` is encoded as
+the extreme finite values and BC and large years parse, so the writer never refuses a temporal value.)
 
 **No guardrail can prevent this.** The extension refuses column *types* it cannot map, but a
-`timestamp` column is mappable and can always be given the value `infinity`. The check can only
+`numeric` column is mappable and can always be given the value `NaN`. The check can only
 happen on the write path, by which time PostgreSQL has committed and the record is in the slot.
 
 **Recourse today: the re-bootstrap procedure above, and nothing else.** It works (verified end to

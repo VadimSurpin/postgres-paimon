@@ -350,10 +350,10 @@ class PaimonSinkTest {
     }
 
     /**
-     * Finding 5. INSERT INTO v VALUES (2, 'infinity', 2.5) on an accepted table permanently stops
+     * Finding 5. INSERT INTO v VALUES (2, 'NaN') into a numeric(10,2) column on an accepted table permanently stops
      * replication for the whole database, and still does after the row is deleted, because the
-     * WAL record is in the slot. No guardrail can refuse it -- a timestamp column can always hold
-     * infinity -- and there is no quarantine mechanism by decision, so the one thing that must be
+     * WAL record is in the slot. No guardrail can refuse it -- a numeric column can always hold
+     * NaN -- and there is no quarantine mechanism by decision, so the one thing that must be
      * true is that the error says what it is: the table, the column, the value, the LSN, that the
      * record is in the slot, and what the only recourse is.
      */
@@ -363,22 +363,22 @@ class PaimonSinkTest {
         ddl.handle(msg("""
              {"v":1,"op":"create","relid":16700,"schema":"public","table":"poison",
               "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
-                                  {"id":2,"name":"ts","type":"TIMESTAMP"}],
+                                  {"id":2,"name":"amt","type":"DECIMAL(10, 2)"}],
               "options":{"changelog-producer":"input"}}"""));
         RelationMeta meta = new RelationMeta(poisonRelid, "public", "poison",
-            List.of("id", "ts"), List.of(true, false));
+            List.of("id", "amt"), List.of(true, false));
         try (PaimonSink s = new PaimonSink(reg, cfg)) {
             s.setRelation(poisonRelid, meta);
             SinkRecord bad = new SinkRecord(poisonRelid, RowKind.INSERT,
-                Arrays.asList("2", "infinity"), 0x1_9ABC_DEF0L, 0, 4711L);
+                Arrays.asList("2", "NaN"), 0x1_9ABC_DEF0L, 0, 4711L);
 
             IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> s.flush(List.of(bad), 0x1_9ABC_DEF1L, 0x1_9ABC_DEF2L));
             String m = e.getMessage();
             assertTrue(m.contains("POISON RECORD"), m);
             assertTrue(m.contains("public.poison"), m);          // the table
-            assertTrue(m.contains("'ts'"), m);                   // the column
-            assertTrue(m.contains("infinity"), m);               // the value
+            assertTrue(m.contains("'amt'"), m);                   // the column
+            assertTrue(m.contains("NaN"), m);                    // the value
             assertTrue(m.contains("1/9ABCDEF0"), m);             // the LSN of the change
             assertTrue(m.contains("1/9ABCDEF1"), m);             // and of its commit
             assertTrue(m.contains("already in"), m);             // the record is in the slot
@@ -396,13 +396,13 @@ class PaimonSinkTest {
         ddl.handle(msg("""
              {"v":1,"op":"create","relid":16701,"schema":"public","table":"poison2",
               "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
-                                  {"id":2,"name":"ts","type":"TIMESTAMP"}],
+                                  {"id":2,"name":"amt","type":"DECIMAL(10, 2)"}],
               "options":{"changelog-producer":"input"}}"""));
         try (PaimonSink s = new PaimonSink(reg, cfg)) {
             s.setRelation(relid, new RelationMeta(relid, "public", "poison2",
-                List.of("id", "ts"), List.of(true, false)));
+                List.of("id", "amt"), List.of(true, false)));
             SinkRecord bad = new SinkRecord(relid, RowKind.INSERT,
-                Arrays.asList("2", "infinity"), 500L, 0, 0L);
+                Arrays.asList("2", "NaN"), 500L, 0, 0L);
             IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> s.flushApplied(List.of(bad), 500L, 500L));
             assertFalse(e.getMessage().contains("POISON RECORD"), e.getMessage());
