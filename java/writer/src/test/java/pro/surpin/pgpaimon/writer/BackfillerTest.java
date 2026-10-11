@@ -90,15 +90,44 @@ class BackfillerTest {
 
     @Test
     void startupDecisionNeverReconcilesWhatItCannot() {
+        List<String> none = List.of();
         assertEquals(Main.BackfillAction.CREATE_SLOT_AND_BACKFILL,
-                     Main.decideBackfill(false, 2, 2, "s"));
+                     Main.decideBackfill(false, 2, 2, none, "s"));
         assertEquals(Main.BackfillAction.CREATE_SLOT_AND_BACKFILL,
-                     Main.decideBackfill(false, 0, 0, "s"), "no tables yet: still make the slot");
-        assertEquals(Main.BackfillAction.NONE, Main.decideBackfill(true, 0, 3, "s"));
+                     Main.decideBackfill(false, 0, 0, none, "s"),
+                     "no tables yet: still make the slot");
+        assertEquals(Main.BackfillAction.NONE, Main.decideBackfill(true, 0, 3, none, "s"));
         assertEquals(Main.BackfillAction.RECREATE_SLOT_AND_BACKFILL,
-                     Main.decideBackfill(true, 3, 3, "s"));
-        assertThrows(IllegalStateException.class, () -> Main.decideBackfill(false, 1, 2, "s"));
-        assertThrows(IllegalStateException.class, () -> Main.decideBackfill(true, 1, 2, "s"));
+                     Main.decideBackfill(true, 3, 3, none, "s"));
+        assertThrows(IllegalStateException.class,
+                     () -> Main.decideBackfill(false, 1, 2, List.of("public.a"), "s"));
+        assertThrows(IllegalStateException.class,
+                     () -> Main.decideBackfill(true, 1, 2, none, "s"));
+    }
+
+    /**
+     * The documented first start: one table registered while EMPTY, so backfill_due is false
+     * although nothing has ever been written to Paimon. Nothing is stranded, so the slot is
+     * created; keying this on backfill_due refused the start with "stream position is lost".
+     */
+    @Test
+    void firstStartWithOnlyEmptyTablesRegisteredCreatesTheSlot() {
+        assertEquals(Main.BackfillAction.CREATE_SLOT_AND_BACKFILL,
+                     Main.decideBackfill(false, 0, 1, List.of(), "s"));
+        assertEquals(Main.BackfillAction.CREATE_SLOT_AND_BACKFILL,
+                     Main.decideBackfill(false, 1, 3, List.of(), "s"),
+                     "one table with rows, two registered empty: still a first start");
+    }
+
+    /**
+     * The documented re-bootstrap (drop the slot, set backfill_due on every row) leaves the
+     * warehouse full of data this writer committed, and must still be allowed: every table is
+     * due, so none is stranded and the backfill truncates and reloads each one.
+     */
+    @Test
+    void reBootstrapIsAllowedAlthoughPaimonHoldsOurData() {
+        assertEquals(Main.BackfillAction.CREATE_SLOT_AND_BACKFILL,
+                     Main.decideBackfill(false, 3, 3, List.of(), "s"));
     }
 
     @Test

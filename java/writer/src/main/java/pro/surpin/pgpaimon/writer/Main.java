@@ -74,7 +74,8 @@ public final class Main {
         // 5. initial backfill (and slot creation) for anything due. A backfill moves the
         //    committed offsets (each loaded table now stands at the slot's consistent point), so
         //    resume is read again afterwards.
-        backfillIfDue(config, registry, sink, rows, slotExists);
+        backfillIfDue(config, registry, sink, rows, slotExists,
+                      new OffsetStore(registry, config));
         resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
         // 6. the pipeline
@@ -127,9 +128,9 @@ public final class Main {
      * The slot and the due tables determine what is safe.
      * <ul>
      *   <li>slot present, nothing due: stream.</li>
-     *   <li>slot absent: every tracked table must be due. A table that is not due has Paimon
-     *       data whose stream position was the lost slot; a new slot cannot reconcile it, so
-     *       this is a refusal, not a guess.</li>
+     *   <li>slot absent: no tracked table may already hold data this writer committed. Such a
+     *       table's stream position was the lost slot and a new slot cannot reconcile it, so
+     *       this is a refusal, not a guess. {@code stranded} names those tables.</li>
      *   <li>slot present, every table due: no table has ever streamed (a table leaves the due
      *       state only after its load, and the stream starts after all loads), so the slot
      *       holds nothing of value. An interrupted first load lands here and its exported
@@ -137,16 +138,27 @@ public final class Main {
      *   <li>slot present, some due and some not: a table added to a running system. Its
      *       snapshot cannot be made consistent with the existing slot.</li>
      * </ul>
+     *
+     * <p>Note what the slot-absent test is NOT: it is not {@code dueCount != totalCount}.
+     * {@code backfill_due} means "the table held rows at registration that the initial load
+     * must copy", not "the table has never been loaded". A table registered while empty is
+     * therefore not due although nothing has ever been written for it, and keying the refusal
+     * on that flag made the documented first start impossible, with an error whose own remedy
+     * (remove_table + add_table on an empty table) looped. "Has this system ever run for this
+     * table" is answered by Paimon's own snapshots, through
+     * {@link OffsetStore#hasCommitted(long)}; the caller passes the result as {@code stranded}.
      */
     static BackfillAction decideBackfill(boolean slotExists, int dueCount, int totalCount,
-                                         String slotName) {
+                                         List<String> stranded, String slotName) {
         if (!slotExists) {
-            if (dueCount != totalCount) {
+            if (!stranded.isEmpty()) {
                 throw new IllegalStateException("slot '" + slotName + "' does not exist but "
-                    + (totalCount - dueCount) + " tracked table(s) were already backfilled; "
-                    + "their stream position is lost and a new slot cannot reconcile them."
-                    + " Re-register them (paimon.remove_table, delete the Paimon tables,"
-                    + " paimon.add_table) to load them afresh");
+                    + stranded.size() + " tracked table(s) already hold data this writer"
+                    + " committed " + stranded + "; their stream position is lost and a new slot"
+                    + " cannot reconcile them. Re-bootstrap: UPDATE paimon.table_registry SET"
+                    + " backfill_due = true; then start the writer again (it creates a slot and"
+                    + " reloads every tracked table from a fresh snapshot, losing Paimon-side"
+                    + " changelog history)");
             }
             return BackfillAction.CREATE_SLOT_AND_BACKFILL;
         }
@@ -173,14 +185,19 @@ public final class Main {
      */
     private static void backfillIfDue(WriterConfig config, SchemaRegistry registry,
                                       PaimonSink sink, List<RegistryRow> rows,
-                                      boolean slotExists) throws Exception {
+                                      boolean slotExists, OffsetStore offsets) throws Exception {
         List<RegistryRow> due = new ArrayList<>();
+        List<String> stranded = new ArrayList<>();
         for (RegistryRow r : rows) {
             if (r.backfillDue()) {
                 due.add(r);
+            } else if (offsets.hasCommitted(r.relid())) {
+                // Not awaiting a load AND already carrying data we wrote: only such a table has
+                // a stream position to lose. A table registered empty has neither.
+                stranded.add(r.schema() + "." + r.table());
             }
         }
-        BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(),
+        BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(), stranded,
                                                config.slotName());
         if (action == BackfillAction.NONE) {
             return;

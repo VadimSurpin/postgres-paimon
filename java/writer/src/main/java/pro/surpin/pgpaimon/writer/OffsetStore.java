@@ -41,24 +41,44 @@ public final class OffsetStore {
             if (!registry.tracked(relid)) {
                 continue;
             }
-            FileStoreTable t = registry.table(relid);
-            SnapshotManager sm = t.snapshotManager();
-            Long latest = sm.latestSnapshotId();
-            Long earliest = sm.earliestSnapshotId();
             any = true;
-            long tableHighest = 0;
-            if (latest != null && earliest != null) for (long id = latest; id >= earliest; id--) {
-                if (!sm.snapshotExists(id)) {
-                    continue;
-                }
-                Snapshot s = sm.snapshot(id);
-                if (config.commitUser().equals(s.commitUser())) {
-                    tableHighest = s.commitIdentifier();
-                    break;
-                }
-            }
-            lowest = Math.min(lowest, tableHighest);
+            Long ours = ourHighest(relid);
+            lowest = Math.min(lowest, ours == null ? 0 : ours);
         }
         return any ? lowest : 0;
+    }
+
+    /**
+     * Whether this writer's {@code commitUser} has ever committed anything to the relation's
+     * Paimon table. This is the only honest answer to "has this system ever run for this table":
+     * {@code paimon.table_registry.backfill_due} answers a different question ("does the table
+     * hold rows that the initial load must copy"), and a table registered while empty is not
+     * due although nothing has ever been written for it. Startup must not confuse the two.
+     *
+     * <p>An untracked relation answers false.
+     */
+    public boolean hasCommitted(long relid) {
+        return registry.tracked(relid) && ourHighest(relid) != null;
+    }
+
+    /** The highest identifier committed by our commitUser to one table, or null if there is none. */
+    private Long ourHighest(long relid) {
+        FileStoreTable t = registry.table(relid);
+        SnapshotManager sm = t.snapshotManager();
+        Long latest = sm.latestSnapshotId();
+        Long earliest = sm.earliestSnapshotId();
+        if (latest == null || earliest == null) {
+            return null;
+        }
+        for (long id = latest; id >= earliest; id--) {
+            if (!sm.snapshotExists(id)) {
+                continue;
+            }
+            Snapshot s = sm.snapshot(id);
+            if (config.commitUser().equals(s.commitUser())) {
+                return s.commitIdentifier();
+            }
+        }
+        return null;
     }
 }

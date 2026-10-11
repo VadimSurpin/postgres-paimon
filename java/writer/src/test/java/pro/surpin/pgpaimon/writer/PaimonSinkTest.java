@@ -315,4 +315,37 @@ class PaimonSinkTest {
             assertEquals(42L, new OffsetStore(r, c).highestCommittedLsn(List.of(16600L)));
         }
     }
+
+    /**
+     * "Has this system ever run for this table" must come from Paimon's snapshots, not from
+     * paimon.table_registry.backfill_due: a table registered while empty is not due although
+     * nothing has ever been committed for it (finding 1 of the whole-branch review).
+     */
+    @Test @Order(15)
+    void hasCommittedIsTrueOnlyForTablesThisCommitUserHasWrittenTo() throws Exception {
+        OffsetStore ours = new OffsetStore(reg, cfg);
+        assertTrue(ours.hasCommitted(RELID), "this test class has committed to it");
+        assertFalse(ours.hasCommitted(999999L), "untracked");
+
+        // A tracked table with a Paimon table but no snapshot of ours: never loaded.
+        Options o = new Options();
+        java.nio.file.Path freshWh = wh.resolveSibling("fresh-wh");
+        o.set("warehouse", freshWh.toString());
+        Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
+        WriterConfig c = WriterConfig.fromEnv(Map.of(
+            "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+            "PGPAIMON_WAREHOUSE", freshWh.toString()));
+        SchemaRegistry r = new SchemaRegistry(cat, c);
+        r.createTable(17000, "public", "never_loaded", List.of("id"),
+                      List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")));
+        assertFalse(new OffsetStore(r, c).hasCommitted(17000L),
+                    "registered (and created in Paimon) but never written: not stranded");
+
+        // Another commitUser's snapshots are not ours either.
+        WriterConfig other = WriterConfig.fromEnv(Map.of(
+            "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+            "PGPAIMON_WAREHOUSE", wh.toString(),
+            "PGPAIMON_COMMIT_USER", "someone-else"));
+        assertFalse(new OffsetStore(reg, other).hasCommitted(RELID));
+    }
 }
