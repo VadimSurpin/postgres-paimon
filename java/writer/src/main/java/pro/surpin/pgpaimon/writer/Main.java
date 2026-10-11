@@ -324,6 +324,16 @@ public final class Main {
                 // Before the batcher flushes (and so confirms): were the slot confirmed first,
                 // a crash here would lose the truncate. A replay is filtered by commit LSN.
                 for (long relid : pendingTruncates) {
+                    // BEGIN; TRUNCATE t; DROP TABLE t; COMMIT: the drop_table message arrives
+                    // between the Truncate and the Commit and untracks the relation, so there
+                    // is no Paimon table left to empty. Truncating a table that is about to be
+                    // dropped is pointless anyway.
+                    if (!tracked.test(relid)) {
+                        LOG.info("skipping the buffered truncate of relation " + relid
+                            + ": it stopped being tracked before this transaction committed"
+                            + " (dropped in the same transaction)");
+                        continue;
+                    }
                     target.truncate(relid, c.commitLsn());
                 }
                 pendingTruncates.clear();
