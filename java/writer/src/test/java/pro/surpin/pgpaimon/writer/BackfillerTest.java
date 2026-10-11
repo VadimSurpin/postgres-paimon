@@ -110,11 +110,14 @@ class BackfillerTest {
         try (Connection c = DriverManager.getConnection(jdbc);
              Statement st = c.createStatement()) {
             st.execute("DROP TABLE IF EXISTS bf_t");
+            st.execute("DROP TABLE IF EXISTS bf_renamed");
             st.execute("CREATE TABLE bf_t (id int PRIMARY KEY, v text)");
             st.execute("INSERT INTO bf_t SELECT g, 'v' || g FROM generate_series(1, 1000) g");
             st.execute("SELECT paimon.add_table('bf_t'::regclass)");
+            // the PostgreSQL name changes; the Paimon identity (registry + warehouse) must not
+            st.execute("ALTER TABLE bf_t RENAME TO bf_renamed");
         }
-        long relid = relidOf(jdbc, "bf_t");
+        long relid = relidOf(jdbc, "bf_renamed");
 
         Map<String, String> env = new HashMap<>();
         env.put("PGPAIMON_JDBC_URL", jdbc);
@@ -140,7 +143,7 @@ class BackfillerTest {
                 // a row committed after the slot exists must NOT be in the snapshot
                 try (Connection c = DriverManager.getConnection(jdbc);
                      Statement st = c.createStatement()) {
-                    st.execute("INSERT INTO bf_t VALUES (5000, 'late')");
+                    st.execute("INSERT INTO bf_renamed VALUES (5000, 'late')");
                 }
                 bf.backfill(plan, relid, "public", "bf_t", List.of("id", "v"));
             }
@@ -153,6 +156,11 @@ class BackfillerTest {
                        "every backfilled record must be RowKind.INSERT");
             assertTrue(raw.stream().allMatch(r -> r.seq() == plan.consistentPoint()),
                        "every backfilled _seq must equal the consistent point");
+            assertTrue(java.nio.file.Files.isDirectory(
+                java.nio.file.Path.of(wh, "default.db", "bf_t")),
+                "the Paimon table keeps its original name");
+            assertFalse(java.nio.file.Files.exists(
+                java.nio.file.Path.of(wh, "default.db", "bf_renamed")));
             assertEquals(plan.consistentPoint(),
                 new OffsetStore(reg, cfg).highestCommittedLsn(List.of(relid)));
         } finally {
@@ -170,7 +178,7 @@ class BackfillerTest {
              Statement st = c.createStatement();
              ResultSet rs = st.executeQuery(
                  "SELECT backfill_due FROM paimon.table_registry"
-                 + " WHERE relid = 'bf_t'::regclass")) {
+                 + " WHERE relid = 'bf_renamed'::regclass")) {
             assertTrue(rs.next());
             assertFalse(rs.getBoolean(1), "mark_backfilled must have run");
         }

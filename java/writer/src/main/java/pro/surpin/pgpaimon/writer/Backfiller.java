@@ -117,11 +117,16 @@ public final class Backfiller implements AutoCloseable {
         for (String c : columns) {
             cols.append(cols.length() == 0 ? "" : ", ").append(quoteIdent(c));
         }
-        String qualified = quoteIdent(schema) + "." + quoteIdent(table);
+        // Two identities. The PostgreSQL source is resolved from relid at load time, because
+        // relid survives ALTER TABLE ... RENAME while the registry's schema/table are the
+        // Paimon identity, frozen at registration. `schema` and `table` only name the Paimon
+        // side (the sink resolves it by relid too) and appear in messages.
+        String qualified;
         int chunk = config.flushMaxRecords();
 
         try (Connection conn = Main.plainConnection(config)) {
             conn.setAutoCommit(true);
+            qualified = currentName(conn, relid);
             try (Statement st = conn.createStatement()) {
                 // Text output that depends on session settings is pinned, as on the stream.
                 st.execute("SET TimeZone = 'UTC'");
@@ -183,7 +188,22 @@ public final class Backfiller implements AutoCloseable {
                 ps.execute();
             }
         }
-        LOG.info("backfilled " + qualified + " at " + plan.consistentPoint());
+        LOG.info("backfilled " + qualified + " (paimon " + schema + "." + table + ") at " + plan.consistentPoint());
+    }
+
+    /** The table's present, quoted, schema-qualified name; looked up before the transaction. */
+    static String currentName(Connection conn, long relid) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT n.nspname, c.relname FROM pg_class c"
+                + " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ?::bigint::oid")) {
+            ps.setLong(1, relid);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    throw new SQLException("relation with oid " + relid + " no longer exists");
+                }
+                return quoteIdent(rs.getString(1)) + "." + quoteIdent(rs.getString(2));
+            }
+        }
     }
 
     private void flushChunk(List<SinkRecord> batch, String table, BackfillPlan plan, long chunks, long index)
