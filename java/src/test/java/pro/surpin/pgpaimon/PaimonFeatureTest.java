@@ -36,7 +36,7 @@ import java.util.*;
  *   T1  Basic INSERT capture
  *   T2  UPDATE capture (before + after rows)
  *   T3  DELETE capture
- *   T4  Metadata fields (_xid, _op_seq, _tid)
+ *   T4  Metadata fields (_xid, _op_seq, _seq)
  *   T5  Configurable seq / row_kind field names
  *   T6  Schema structure (all fields present)
  *   T7  CREATE TABLE with TEXT columns (proxy-relation fix)
@@ -153,18 +153,21 @@ public class PaimonFeatureTest {
         check("T3 inserts",     rows.ofKind(0) == 2);
     }
 
-    // ── T4: Metadata fields (_xid, _op_seq, _tid) ─────────────────────────
+    // ── T4: Metadata fields (_xid, _op_seq, _seq) ─────────────────────────
+    // Documented difference: main's _tid (physical tuple identifier) cannot exist here,
+    // since no tuple identifier survives the reorder buffer.  _seq, the per-change LSN,
+    // replaces it: it must be present and strictly increasing across changes.
 
     static void test4_metadataFields() throws Exception {
         String tbl = "ft_meta_test";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            setGuc(conn, "paimon_heap.meta_field_xid", "_xid");
-            setGuc(conn, "paimon_heap.meta_field_op",  "_op_seq");
-            setGuc(conn, "paimon_heap.meta_field_tid", "_tid");
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
+            // Separate autocommit statements: three distinct changes, three distinct LSNs.
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'test')");
+            exec(conn, "INSERT INTO " + tbl + " VALUES (2,'test')");
+            exec(conn, "INSERT INTO " + tbl + " VALUES (3,'test')");
         }
         // Wait for schema
         File schemaFile = new File(tableDir(tbl) + "/schema/schema-0");
@@ -172,14 +175,51 @@ public class PaimonFeatureTest {
         TableSchema schema = readSchema(tbl);
         boolean hasXid = schema.fields().stream().anyMatch(f -> f.name().equals("_xid"));
         boolean hasOp  = schema.fields().stream().anyMatch(f -> f.name().equals("_op_seq"));
-        boolean hasTid = schema.fields().stream().anyMatch(f -> f.name().equals("_tid"));
+        boolean hasSeq = schema.fields().stream().anyMatch(f -> f.name().equals("_seq"));
         check("T4 _xid in schema", hasXid);
         check("T4 _op_seq in schema", hasOp);
-        check("T4 _tid in schema", hasTid);
+        check("T4 _seq in schema", hasSeq);
 
-        // Verify values are non-negative (we can't check exact values)
-        PaimonRows rows = waitAndRead(tbl, 1);
-        check("T4 row captured", rows.total == 1);
+        PaimonRows rows = waitAndRead(tbl, 3);
+        check("T4 rows captured", rows.total == 3);
+
+        // _seq per key, in insertion (= commit = LSN) order
+        Map<Integer, Long> seqById = readSeqById(tbl, 3);
+        boolean present = seqById.size() == 3 && !seqById.containsValue(null);
+        check("T4 _seq present on every row", present);
+        boolean increasing = present;
+        long prev = Long.MIN_VALUE;
+        for (long v : seqById.values()) {   // TreeMap: ids 1,2,3
+            if (v <= prev) increasing = false;
+            prev = v;
+        }
+        check("T4 _seq strictly increasing across changes", increasing);
+    }
+
+    /** id -> _seq from the $audit_log changelog (column 0 is the kind; id and _seq by name). */
+    static Map<Integer, Long> readSeqById(String tbl, int want) throws Exception {
+        long deadline = System.currentTimeMillis() + 60_000;
+        Map<Integer, Long> out = new TreeMap<>();
+        while (System.currentTimeMillis() < deadline) {
+            out.clear();
+            Options o = new Options();
+            o.set("warehouse", warehouse);
+            try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+                Table t = catalog.getTable(Identifier.create("default", tbl));
+                int idIdx = t.rowType().getFieldNames().indexOf("id");
+                int seqIdx = t.rowType().getFieldNames().indexOf("_seq");
+                try (RecordReader<InternalRow> reader = t.newReadBuilder().newRead()
+                         .createReader(t.newReadBuilder().newScan().plan().splits())) {
+                    reader.forEachRemaining(r ->
+                        out.put(r.getInt(idIdx), r.isNullAt(seqIdx) ? null : r.getLong(seqIdx)));
+                }
+            } catch (Exception e) {
+                System.err.println("  warn: _seq read failed for " + tbl + ": " + e.getMessage());
+            }
+            if (out.size() >= want) break;
+            Thread.sleep(500);
+        }
+        return out;
     }
 
     // ── T5: Configurable seq / row_kind field names ───────────────────────

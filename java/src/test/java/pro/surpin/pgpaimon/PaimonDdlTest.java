@@ -40,7 +40,7 @@ import java.util.*;
  *   D4  DROP COLUMN        — pre-execute capture; column removed from Paimon schema
  *   D5  RENAME COLUMN      — pre-execute capture; new name reflected in Paimon schema
  *   D6  ALTER COLUMN TYPE  — post-execute capture; new type reflected in Paimon schema
- *   D7  ADD PRIMARY KEY    — blocked with ERROR before any execution
+ *   D7  key-less table     — add_table refuses it (the guardrail replaces ADD PRIMARY KEY)
  *   D8  DROP PRIMARY KEY   — blocked with ERROR before any execution
  *   D9  Non-paimon passthrough — regular heap tables are unaffected by the hook
  *
@@ -427,51 +427,54 @@ public class PaimonDdlTest {
         }
     }
 
-    // ── D7: ADD PRIMARY KEY blocked ───────────────────────────────────────────
-    // AT_AddConstraint with CONSTR_PRIMARY is rejected before execution so that
-    // Paimon table ordering / primary-key semantics are never changed mid-life.
-    // The hook ERRORs out; the table must remain fully functional afterwards.
+    // ── D7: a table without a primary key cannot be tracked ──────────────────
+    // Main blocked ADD PRIMARY KEY on a paimon_heap table so that Paimon's key
+    // semantics never changed mid-life.  Here a table can only be tracked if it
+    // already has a key, and the key is frozen once tracked (D8).  The guardrail
+    // therefore moves to the door: paimon.add_table() must refuse a key-less table,
+    // and that refusal is the assertion.  The table must stay untracked and usable.
     static void testD7_addPkBlocked() throws Exception {
-        System.out.println("\n── D7: ADD PRIMARY KEY blocked ──────────────────────");
+        System.out.println("\n── D7: key-less table refused by add_table ──────────");
         String tbl = "ddl_add_pk_blocked";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            // Create WITHOUT a primary key so we can attempt to add one
             exec(conn, "CREATE TABLE " + tbl + " (id INT, v TEXT)");
-            // Slot architecture: a table without a primary key cannot be tracked at all
-            // (add_table refuses it), so it stays untracked and the assertions below run
-            // against that. See the Task 15 report: D7 needs Task 16.
-            try {
-                exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
-            } catch (SQLException e) {
-                System.out.println("  note: add_table refused the key-less table: " + e.getMessage());
-            }
-            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a')");
         }
 
         boolean errorThrown = false;
         String errorMsg = "";
         try (Connection conn = connect()) {
-            exec(conn, "ALTER TABLE " + tbl + " ADD PRIMARY KEY (id)");
+            exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
         } catch (SQLException e) {
             errorThrown = true;
             errorMsg = e.getMessage();
         }
-        check("D7 add pk: ALTER TABLE ADD PRIMARY KEY is rejected", errorThrown);
-        check("D7 add pk: error message mentions paimon_heap",
-              errorMsg.toLowerCase().contains("paimon_heap"));
+        check("D7 no pk: add_table on a key-less table is rejected", errorThrown);
+        check("D7 no pk: error message mentions paimon_slot",
+              errorMsg.toLowerCase().contains("paimon_slot"));
+        check("D7 no pk: error message says there is no primary key",
+              errorMsg.toLowerCase().contains("no primary key"));
 
-        // Table must still accept DML after the failed ALTER
+        long registered = -1;
+        try (Connection conn = connect();
+             Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT count(*) FROM paimon.table_registry WHERE relid = '" + tbl + "'::regclass")) {
+            rs.next();
+            registered = rs.getLong(1);
+        }
+        check("D7 no pk: refused table is not in the registry", registered == 0);
+
+        // The table must still accept DML after the refused add_table
         boolean dmlOk = true;
         try (Connection conn = connect()) {
-            exec(conn, "INSERT INTO " + tbl + " VALUES (2,'b')");
+            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(2,'b')");
         } catch (Exception e) {
             dmlOk = false;
             System.err.println("  Post-error DML failed: " + e.getMessage());
         }
-        check("D7 add pk: DML still works after blocked ALTER", dmlOk);
+        check("D7 no pk: DML still works after refused add_table", dmlOk);
     }
 
     // ── D8: DROP PRIMARY KEY blocked ──────────────────────────────────────────
@@ -509,8 +512,8 @@ public class PaimonDdlTest {
                 errorMsg = e.getMessage();
             }
             check("D8 drop pk: ALTER TABLE DROP CONSTRAINT (PK) is rejected", errorThrown);
-            check("D8 drop pk: error message mentions paimon_heap",
-                  errorMsg.toLowerCase().contains("paimon_heap"));
+            check("D8 drop pk: error message mentions paimon_slot",
+                  errorMsg.toLowerCase().contains("paimon_slot"));
 
             // PK constraint must still be there
             String pkAfter = null;

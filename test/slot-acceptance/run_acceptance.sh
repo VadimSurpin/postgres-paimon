@@ -17,6 +17,8 @@ JAR="$REPO/java/writer/target/paimon-writer.jar"
 SLOT=paimon
 READY_TIMEOUT=${READY_TIMEOUT:-60}  # seconds, for both the cluster and the writer gates
 WRITER_PID=""
+LAUNCHER="$RUN/start_writer.sh"
+PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER
 
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -91,17 +93,25 @@ load_extension() {
 
 start_writer() {
   echo ">> starting writer (log: $RUN/writer.log)"
-  # flush interval 500ms (default 1000): halves the smoke test's wait without making tiny commits
-  # _xid is optional and off by default (spec section 6); PaimonFeatureTest T4 asserts it is in the schema.
-  # PGPAIMON_COMMIT_USER is left to its default (paimon-writer-<slot>): it must be stable.
-  PGPAIMON_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB" \
-  PGPAIMON_USER="$PGUSER" PGPAIMON_PASSWORD="" \
-  PGPAIMON_SLOT="$SLOT" PGPAIMON_WAREHOUSE="$WAREHOUSE" \
-  PGPAIMON_FLUSH_MAX_INTERVAL_MS=500 \
-  PGPAIMON_XID_FIELD=_xid \
-    nohup java -jar "$JAR" >"$RUN/writer.log" 2>&1 &
-  WRITER_PID=$!
-  echo "$WRITER_PID" >"$RUN/writer.pid"
+  # The launch is a generated script so a suite can restart the writer with the identical
+  # environment (PaimonAdvancedTest T16 kills it mid-load): it appends to the log and rewrites
+  # writer.pid. flush interval 500ms (default 1000): halves the smoke test's wait without making
+  # tiny commits. _xid is optional and off by default (spec section 6); PaimonFeatureTest T4
+  # asserts it is in the schema. PGPAIMON_COMMIT_USER is left to its default
+  # (paimon-writer-<slot>): it must be stable across restarts.
+  cat >"$LAUNCHER" <<LAUNCH
+#!/usr/bin/env bash
+export PGPAIMON_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB"
+export PGPAIMON_USER="$PGUSER" PGPAIMON_PASSWORD=""
+export PGPAIMON_SLOT="$SLOT" PGPAIMON_WAREHOUSE="$WAREHOUSE"
+export PGPAIMON_FLUSH_MAX_INTERVAL_MS=500
+export PGPAIMON_XID_FIELD=_xid
+nohup java -jar "$JAR" >>"$RUN/writer.log" 2>&1 </dev/null &
+echo \$! >"$PIDFILE"
+LAUNCH
+  : >"$RUN/writer.log"
+  bash "$LAUNCHER"
+  WRITER_PID="$(cat "$PIDFILE")"
   local i active
   for ((i = 0; i < READY_TIMEOUT * 2; i++)); do
     if ! kill -0 "$WRITER_PID" 2>/dev/null; then
@@ -136,6 +146,8 @@ run_suites() {
   PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
   PGPAIMON_IT_WAREHOUSE="$WAREHOUSE" \
   PGPAIMON_HARNESS=1 \
+  PGPAIMON_WRITER_LAUNCHER="$LAUNCHER" \
+  PGPAIMON_WRITER_PID_FILE="$PIDFILE" \
   PGPAIMON_SLOT="${SLOT}_it" \
     mvn -B -ntp "${args[@]}" || rc=$?
   local name rpt n
@@ -155,6 +167,8 @@ stop_all() {
   local rc=$?
   trap - EXIT
   set +e
+  # A suite may have restarted the writer: the pid file, not the launch-time pid, is current.
+  [ -f "$PIDFILE" ] && WRITER_PID="$(cat "$PIDFILE")"
   if [ -n "$WRITER_PID" ] && kill -0 "$WRITER_PID" 2>/dev/null; then
     kill "$WRITER_PID"
     for _ in $(seq 1 20); do kill -0 "$WRITER_PID" 2>/dev/null || break; sleep 0.5; done

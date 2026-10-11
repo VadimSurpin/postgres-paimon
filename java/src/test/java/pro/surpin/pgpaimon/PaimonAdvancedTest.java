@@ -14,55 +14,65 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.StreamTableScan;
+
 import java.io.*;
+import java.nio.file.Files;
 import java.sql.*;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import org.junit.jupiter.api.Test;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Advanced integration tests for paimon_heap.
+ * Advanced integration tests for the slot-based writer.
  *
  *   T9  – CHECKPOINT: rows survive a PostgreSQL checkpoint
- *   T10 – VACUUM: VACUUM on paimon_heap does not error and leaves warehouse intact
- *   T11 – VACUUM FREEZE: same guarantee for VACUUM FREEZE
- *   T12 – ALTER TABLE ADD COLUMN: rows captured; new column absent from schema (known limitation)
+ *   T10 – VACUUM: emits no logical changes; the record count is unchanged across it
+ *   T11 – VACUUM FREEZE: same
+ *   T12 – ALTER TABLE ADD COLUMN: rows captured; new column present in schema
  *   T13 – ALTER TABLE DROP COLUMN: rows still captured after column drop
- *   T14 – ALTER TABLE RENAME COLUMN: data captured correctly; old name stays in schema
+ *   T14 – ALTER TABLE RENAME COLUMN: data captured correctly; old name leaves the schema
  *   T15 – ALTER COLUMN TYPE: no crash; rows captured after type change
- *   T16 – Crash recovery: warehouse data survives immediate (crash) shutdown + restart
- *   T17 – Default TAM: CREATE EXTENSION sets database default; plain CREATE TABLE uses paimon_heap
+ *   T16 – Crash recovery: the WRITER is killed (SIGKILL) mid-load and restarted;
+ *         zero loss and zero duplicates
+ *   T17 – A table never passed to paimon.add_table() reaches neither paimon_pub nor the warehouse
  *
- * Usage:
- *   java -cp paimon-advanced-test.jar pro.surpin.pgpaimon.PaimonAdvancedTest \
- *        [warehouse] [jdbc-url] [pg_ctl-path] [pgdata-dir]
+ * Usage (live stack): test/slot-acceptance/run_acceptance.sh PaimonAdvancedTest
  */
 public class PaimonAdvancedTest {
 
-    static final String DEFAULT_WAREHOUSE = "/tmp/paimon-warehouse";
-    static final String DEFAULT_JDBC      = "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=";
-    static final String DEFAULT_PGCTL     = "/usr/local/pgsql/bin/pg_ctl";
-    static final String DEFAULT_PGDATA    = "/root/cloud-db/pgdata3";
+    static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
+    static final String DEFAULT_JDBC =
+        env("PGPAIMON_IT_JDBC_URL", "jdbc:postgresql://localhost:5442/paimon_acc?user=postgres");
 
     static String warehouse;
     static String jdbcUrl;
-    static String pgCtl;
-    static String pgData;
     static LocalFileIO fileIO = LocalFileIO.create();
     static int passed = 0, failed = 0;
+    static final List<String> failures = new ArrayList<>();
 
     public static void main(String[] args) throws Exception {
+        System.exit(run(args) > 0 ? 1 : 0);
+    }
+
+    static int run(String[] args) throws Exception {
+        passed = 0; failed = 0; failures.clear();
         warehouse = args.length > 0 ? args[0] : DEFAULT_WAREHOUSE;
         jdbcUrl   = args.length > 1 ? args[1] : DEFAULT_JDBC;
-        pgCtl     = args.length > 2 ? args[2] : DEFAULT_PGCTL;
-        pgData    = args.length > 3 ? args[3] : DEFAULT_PGDATA;
 
         System.out.println("╔════════════════════════════════════════════════════╗");
-        System.out.println("║       paimon_heap Advanced Test Suite              ║");
+        System.out.println("║       paimon slot-writer Advanced Test Suite       ║");
         System.out.println("╚════════════════════════════════════════════════════╝");
         System.out.printf("  Warehouse : %s%n", warehouse);
         System.out.printf("  JDBC      : %s%n", jdbcUrl);
-        System.out.printf("  pg_ctl    : %s%n", pgCtl);
-        System.out.printf("  pgdata    : %s%n", pgData);
         System.out.println();
 
         test9_checkpoint();
@@ -73,26 +83,38 @@ public class PaimonAdvancedTest {
         test14_alterRenameColumn();
         test15_alterColumnType();
         test16_crashRecovery();
-        test17_defaultTam();
+        test17_untracked();
 
         System.out.println();
         System.out.println("═".repeat(52));
         System.out.printf("  Results: %d passed, %d failed%n", passed, failed);
-        System.exit(failed > 0 ? 1 : 0);
+        return failed;
+    }
+
+    /** Surefire entry point: the harness exports the stack's location. */
+    @Test
+    void acceptanceSuite() throws Exception {
+        String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
+        String wh = System.getenv("PGPAIMON_IT_WAREHOUSE");
+        if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
+            assertNotNull(jdbc, "harness did not export PGPAIMON_IT_JDBC_URL");
+            assertNotNull(wh, "harness did not export PGPAIMON_IT_WAREHOUSE");
+        }
+        assumeTrue(jdbc != null && wh != null, "no live stack: run test/slot-acceptance/run_acceptance.sh");
+        int failedChecks = run(new String[0]);
+        assertEquals(0, failedChecks, "failed checks: " + failures);
     }
 
     // ── T9: CHECKPOINT ───────────────────────────────────────────────────────
     // CHECKPOINT flushes dirty pages and advances the WAL redo point. Because
-    // paimon_heap stores rows in a shared-memory ring buffer (not WAL pages),
-    // a checkpoint must not disturb in-flight or already-flushed capture data.
+    // the slot retains WAL independently of checkpoints, a checkpoint must not
+    // disturb in-flight or already-flushed capture data.
     static void test9_checkpoint() throws Exception {
         System.out.println("\n── T9: CHECKPOINT ──────────────────────────────────");
         String tbl = "adv_checkpoint";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20),(3,30)");
             exec(conn, "CHECKPOINT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (4,40),(5,50)");
@@ -104,22 +126,21 @@ public class PaimonAdvancedTest {
     }
 
     // ── T10: VACUUM ──────────────────────────────────────────────────────────
-    // VACUUM on a paimon_heap table must succeed without error. Since paimon_heap
-    // has no on-disk tuple storage, the vacuum TAM callback is a no-op. The already-
-    // captured rows in the Paimon warehouse must remain intact after vacuum.
+    // Documented difference: VACUUM emits no logical changes, so nothing may appear
+    // in the Paimon changelog.  The record count (and every kind count) is identical
+    // before and after, and capture of later inserts continues.
     static void test10_vacuum() throws Exception {
         System.out.println("\n── T10: VACUUM ─────────────────────────────────────");
         String tbl = "adv_vacuum";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,1),(2,2),(3,3),(4,4),(5,5)");
             exec(conn, "DELETE FROM " + tbl + " WHERE id IN (2,4)");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
+        // changelog: 5 inserts + 2 deletes
+        PaimonRows before = waitAndRead(tbl, 7);
+        check("T10 vacuum: 7 records before VACUUM", before.total == 7);
 
         boolean vacuumOk = true;
         try (Connection conn = connect()) {
@@ -130,11 +151,11 @@ public class PaimonAdvancedTest {
         }
         check("T10 vacuum: no error",              vacuumOk);
 
+        Thread.sleep(3000);   // several flush intervals: anything VACUUM emitted would be committed by now
         PaimonRows rows = readRows(tbl);
-        // changelog: 5 inserts + 2 deletes
-        check("T10 vacuum: warehouse unchanged",   rows.total == 7);
-        check("T10 vacuum: 5 inserts present",     rows.ofKind(0) == 5);
-        check("T10 vacuum: 2 deletes present",     rows.ofKind(3) == 2);
+        check("T10 vacuum: no record appeared (count unchanged)",  rows.total == before.total);
+        check("T10 vacuum: 5 inserts, unchanged",                  rows.ofKind(0) == 5);
+        check("T10 vacuum: 2 deletes, unchanged",                  rows.ofKind(3) == 2);
 
         // New inserts after vacuum must still be captured
         try (Connection conn = connect()) {
@@ -145,21 +166,18 @@ public class PaimonAdvancedTest {
     }
 
     // ── T11: VACUUM FREEZE ───────────────────────────────────────────────────
-    // VACUUM FREEZE updates pg_class.relfrozenxid to allow XID wraparound
-    // prevention. For paimon_heap, this only touches catalog entries; it must
-    // not touch or invalidate the Paimon warehouse files.
+    // Documented difference: like VACUUM, VACUUM FREEZE emits no logical changes
+    // (it rewrites no logical row), so the record count must be unchanged across it.
     static void test11_vacuumFreeze() throws Exception {
         System.out.println("\n── T11: VACUUM FREEZE ──────────────────────────────");
         String tbl = "adv_vacfreeze";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(2,'b'),(3,'c')");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
+        PaimonRows before = waitAndRead(tbl, 3);
+        check("T11 vacuum freeze: 3 records before",      before.total == 3);
 
         boolean freezeOk = true;
         try (Connection conn = connect()) {
@@ -170,8 +188,10 @@ public class PaimonAdvancedTest {
         }
         check("T11 vacuum freeze: no error",              freezeOk);
 
+        Thread.sleep(3000);
         PaimonRows rows = readRows(tbl);
-        check("T11 vacuum freeze: 3 rows intact",         rows.total == 3);
+        check("T11 vacuum freeze: no record appeared (count unchanged)",  rows.total == before.total);
+        check("T11 vacuum freeze: all still inserts",     rows.ofKind(0) == 3);
 
         // Inserts after freeze must still work
         try (Connection conn = connect()) {
@@ -191,14 +211,10 @@ public class PaimonAdvancedTest {
         String tbl = "adv_alter_add";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
-        check("T12 add col: 2 rows captured before ALTER",  readRows(tbl).total == 2);
+        check("T12 add col: 2 rows captured before ALTER",  waitAndRead(tbl, 2).total == 2);
 
         boolean alterOk = true;
         try (Connection conn = connect()) {
@@ -216,7 +232,7 @@ public class PaimonAdvancedTest {
             check("T12 add col: 4 rows captured after ALTER",  rows.total == 4);
 
             // DDL hook sends PMSG_DDL_ADD_COL; bgworker adds column to schema
-            File schema1 = new File(warehouse + "/" + tbl + "/schema/schema-1");
+            File schema1 = new File(tableDir(tbl) + "/schema/schema-1");
             long deadline = System.currentTimeMillis() + 30_000;
             while (!schema1.exists() && System.currentTimeMillis() < deadline)
                 Thread.sleep(500);
@@ -237,14 +253,10 @@ public class PaimonAdvancedTest {
         String tbl = "adv_alter_drop";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v INT, extra TEXT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT, extra TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10,'a'),(2,20,'b')");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
-        check("T13 drop col: 2 rows before ALTER",  readRows(tbl).total == 2);
+        check("T13 drop col: 2 rows before ALTER",  waitAndRead(tbl, 2).total == 2);
 
         boolean ok = true;
         try (Connection conn = connect()) {
@@ -273,14 +285,10 @@ public class PaimonAdvancedTest {
         String tbl = "adv_alter_rename";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v_old INT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v_old INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,100),(2,200)");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
-        check("T14 rename: 2 rows before ALTER",  readRows(tbl).total == 2);
+        check("T14 rename: 2 rows before ALTER",  waitAndRead(tbl, 2).total == 2);
 
         boolean ok = true;
         try (Connection conn = connect()) {
@@ -297,7 +305,7 @@ public class PaimonAdvancedTest {
             check("T14 rename: 4 rows captured",  rows.total == 4);
 
             // DDL hook sends PMSG_DDL_RENAME; bgworker updates field name in schema
-            File schema1 = new File(warehouse + "/" + tbl + "/schema/schema-1");
+            File schema1 = new File(tableDir(tbl) + "/schema/schema-1");
             long deadline = System.currentTimeMillis() + 30_000;
             while (!schema1.exists() && System.currentTimeMillis() < deadline)
                 Thread.sleep(500);
@@ -320,14 +328,10 @@ public class PaimonAdvancedTest {
         String tbl = "adv_alter_type";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v SMALLINT) USING paimon_heap");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v SMALLINT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
         }
-        waitForParquet(tbl, 1);
-        Thread.sleep(1500);
-        check("T15 type change: 2 rows before ALTER",  readRows(tbl).total == 2);
+        check("T15 type change: 2 rows before ALTER",  waitAndRead(tbl, 2).total == 2);
 
         boolean ok = true;
         try (Connection conn = connect()) {
@@ -346,118 +350,197 @@ public class PaimonAdvancedTest {
     }
 
     // ── T16: CRASH RECOVERY ──────────────────────────────────────────────────
-    // Verifies that Paimon warehouse data written to Parquet files before a crash
-    // survives PostgreSQL immediate (crash-mode) shutdown + restart.
+    // Documented strengthening: main could only promise that files already written
+    // survive a crash.  Here the WRITER is killed (SIGKILL) in the middle of a load,
+    // more rows are committed in PostgreSQL while it is down (the slot retains the WAL),
+    // and it is restarted.  Zero loss and zero duplicates.  This rests on the slot's
+    // confirmed position advancing only after a Paimon commit returns, and on
+    // filterAndCommit dropping a replayed commitIdentifier.
     //
-    // Rows that were in the ring buffer at crash time are intentionally lost —
-    // paimon_heap provides best-effort capture with no WAL-based durability.
-    // The invariant being tested: any Parquet file fully written before the crash
-    // is intact and readable afterwards (Parquet is append-only and immutable).
-    //
-    // The test waits 10 s after the last INSERT to give the bgworker (default
-    // flush_interval_secs = 5 s) enough time to flush the rows before the crash.
+    // Duplicates are looked for in the raw changelog (every record as stored): a merged
+    // read collapses repeats of a key and would hide them.
+    static final int T16_BATCHES = 100, T16_PER_BATCH = 20;
+
     static void test16_crashRecovery() throws Exception {
-        System.out.println("\n── T16: CRASH RECOVERY ──────────────────────────────");
+        System.out.println("\n── T16: CRASH RECOVERY (writer killed mid-load) ─────");
+        String launcher = System.getenv("PGPAIMON_WRITER_LAUNCHER");
+        String pidFile = System.getenv("PGPAIMON_WRITER_PID_FILE");
+        if (launcher == null || pidFile == null) {
+            if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
+                check("T16 harness exports PGPAIMON_WRITER_LAUNCHER and PGPAIMON_WRITER_PID_FILE", false);
+            } else {
+                System.out.println("  SKIP  T16: no writer launcher (run via test/slot-acceptance/run_acceptance.sh)");
+            }
+            return;
+        }
         String tbl = "adv_crash_recovery";
+        // Isolate this test from the DDL the earlier tests ran: after the kill the slot replays
+        // everything past its confirmed position, so first let the confirmed position catch up
+        // with the WAL written so far.  (Replay across a DDL boundary is a separate matter,
+        // reported in the Task 16 report; this test is about a kill in the middle of a load.)
+        String target;
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT pg_current_wal_insert_lsn()::text")) {
+            rs.next();
+            target = rs.getString(1);
+        }
+        long settle = System.currentTimeMillis() + 60_000;
+        while (System.currentTimeMillis() < settle) {
+            try (Connection conn = connect(); Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                     "SELECT confirmed_flush_lsn >= '" + target + "'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'paimon'")) {
+                if (rs.next() && rs.getBoolean(1)) break;
+            }
+            Thread.sleep(250);
+        }
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
-            exec(conn, "DROP TABLE IF EXISTS " + tbl);
-            exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
-            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'pre-a'),(2,'pre-b'),(3,'pre-c')");
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");   // empty when registered
         }
+        final int total = T16_BATCHES * T16_PER_BATCH;
 
-        System.out.println("  Waiting 10 s for bgworker flush before crash...");
-        waitForParquet(tbl, 1);
-        Thread.sleep(10_000);
-
-        long rowsBeforeCrash = readRows(tbl).total;
-        check("T16 recovery: rows flushed to warehouse before crash",  rowsBeforeCrash >= 3);
-
-        // Immediate shutdown simulates a crash (equivalent to kill -SIGQUIT postmaster).
-        // No checkpoint is written; shared memory (ring buffer) is lost.
-        boolean stopOk = runPgCtl("stop", "-m", "immediate");
-        check("T16 recovery: pg_ctl stop -m immediate succeeded",  stopOk);
-
-        System.out.println("  Restarting PostgreSQL...");
-        boolean startOk = runPgCtl("start", "-l", pgData + "/pg.log");
-        check("T16 recovery: pg_ctl start succeeded",  startOk);
-
-        if (startOk) {
-            waitForServer(30_000);
-
-            // Warehouse files live on the local filesystem and survive restart intact.
-            long rowsAfterRestart = readRows(tbl).total;
-            check("T16 recovery: warehouse row count unchanged",  rowsAfterRestart == rowsBeforeCrash);
-
-            // The crashed table's RocksDB-backed heap may be unusable after immediate
-            // shutdown (RocksDB crash recovery may drop uncommitted data). Test that
-            // paimon_heap works correctly on a freshly created table after restart.
-            String tbl2 = tbl + "_post";
-            cleanup(tbl2);
-            boolean postOk = true;
+        AtomicReference<Throwable> loadError = new AtomicReference<>();
+        Thread loader = new Thread(() -> {
             try (Connection conn = connect()) {
-                disableMeta(conn);
-                exec(conn, "DROP TABLE IF EXISTS " + tbl2);
-                exec(conn, "CREATE TABLE " + tbl2 + " (id INT PRIMARY KEY, v TEXT) USING paimon_heap");
-                exec(conn, "INSERT INTO " + tbl2 + " VALUES (1,'post-restart-a'),(2,'post-restart-b')");
-            } catch (Exception e) {
-                postOk = false;
-                System.err.println("  post-restart DML error: " + e.getMessage());
+                conn.setAutoCommit(true);
+                for (int b = 0; b < T16_BATCHES; b++) {
+                    StringBuilder sb = new StringBuilder("INSERT INTO " + tbl + " VALUES ");
+                    for (int k = 0; k < T16_PER_BATCH; k++) {
+                        int id = b * T16_PER_BATCH + k + 1;
+                        if (k > 0) sb.append(',');
+                        sb.append('(').append(id).append(",'r").append(id).append("')");
+                    }
+                    exec(conn, sb.toString());       // one transaction per batch
+                    Thread.sleep(60);
+                }
+            } catch (Throwable t) {
+                loadError.set(t);
             }
-            check("T16 recovery: paimon_heap functional after restart",  postOk);
-            if (postOk) {
-                PaimonRows rows2 = waitAndRead(tbl2, 2);
-                check("T16 recovery: new rows captured after restart",  rows2.total == 2);
-            }
+        });
+        loader.start();
+
+        // Let the writer commit at least one snapshot, then kill it with the load still running.
+        File latest = new File(tableDir(tbl) + "/snapshot/LATEST");
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (!latest.exists() && System.currentTimeMillis() < deadline) Thread.sleep(50);
+        check("T16 recovery: writer committed a snapshot before the kill", latest.exists());
+
+        String pid = new String(Files.readAllBytes(new File(pidFile).toPath())).trim();
+        boolean loadStillRunning = loader.isAlive();
+        int killRc = new ProcessBuilder("kill", "-9", pid).inheritIO().start().waitFor();
+        check("T16 recovery: kill -9 of the writer succeeded", killRc == 0);
+        check("T16 recovery: load was still running when the writer was killed", loadStillRunning);
+        waitProcessGone(pid);
+        check("T16 recovery: writer process is gone", !processAlive(pid));
+
+        Thread.sleep(1500);   // rows keep arriving in PostgreSQL while the writer is down
+        check("T16 recovery: slot is inactive while the writer is down", !slotActive());
+
+        System.out.println("  Restarting the writer...");
+        Process p = new ProcessBuilder("bash", launcher)
+            .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        check("T16 recovery: launcher exited cleanly", p.waitFor() == 0);
+        deadline = System.currentTimeMillis() + 60_000;
+        while (!slotActive() && System.currentTimeMillis() < deadline) Thread.sleep(250);
+        check("T16 recovery: restarted writer reattached to the slot", slotActive());
+
+        loader.join();
+        check("T16 recovery: load completed without error", loadError.get() == null);
+        if (loadError.get() != null) loadError.get().printStackTrace();
+
+        // Wait for the changelog to reach every row.
+        List<int[]> recs = readIdsAndKinds(tbl);
+        deadline = System.currentTimeMillis() + 90_000;
+        while (recs.size() < total && System.currentTimeMillis() < deadline) {
+            Thread.sleep(500);
+            recs = readIdsAndKinds(tbl);
+        }
+        Thread.sleep(3000);   // a replayed batch would show up as extra records by now
+        recs = readIdsAndKinds(tbl);
+
+        Map<Integer, Integer> perId = new TreeMap<>();
+        int nonInsert = 0;
+        for (int[] r : recs) {
+            perId.merge(r[1], 1, Integer::sum);
+            if (r[0] != 0) nonInsert++;
+        }
+        List<Integer> lost = new ArrayList<>(), dup = new ArrayList<>();
+        for (int id = 1; id <= total; id++) {
+            int n = perId.getOrDefault(id, 0);
+            if (n == 0) lost.add(id);
+            if (n > 1) dup.add(id);
+        }
+        if (!lost.isEmpty()) System.out.println("  lost ids: " + lost);
+        if (!dup.isEmpty())  System.out.println("  duplicated ids: " + dup);
+        check("T16 recovery: zero loss (all " + total + " ids present)", lost.isEmpty());
+        check("T16 recovery: zero duplicates (each id exactly once)", dup.isEmpty());
+        check("T16 recovery: exactly " + total + " changelog records", recs.size() == total);
+        check("T16 recovery: all records are inserts", nonInsert == 0);
+    }
+
+    static boolean processAlive(String pid) throws Exception {
+        return new ProcessBuilder("kill", "-0", pid).redirectErrorStream(true)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD).start().waitFor() == 0;
+    }
+
+    static void waitProcessGone(String pid) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (processAlive(pid) && System.currentTimeMillis() < deadline) Thread.sleep(100);
+    }
+
+    static boolean slotActive() throws Exception {
+        try (Connection conn = connect();
+             Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT bool_or(active) FROM pg_replication_slots WHERE slot_name = 'paimon'")) {
+            return rs.next() && rs.getBoolean(1);
         }
     }
 
-    // ── T17: DEFAULT TABLE ACCESS METHOD ─────────────────────────────────────
-    // CREATE EXTENSION paimon_heap runs:
-    //   ALTER DATABASE <current> SET default_table_access_method = 'paimon_heap'
-    // so that plain CREATE TABLE (without USING) automatically creates paimon_heap
-    // tables. This test verifies:
-    //   1. SHOW default_table_access_method returns 'paimon_heap'
-    //   2. pg_class.relam for a table created without USING is paimon_heap
-    //   3. INSERTs into that table appear in the Paimon warehouse
-    static void test17_defaultTam() throws Exception {
-        System.out.println("\n── T17: DEFAULT TABLE ACCESS METHOD ─────────────────");
-        String tbl = "adv_default_tam";
+    // ── T17: UNTRACKED TABLE ─────────────────────────────────────────────────
+    // Documented difference: there is no table access method and no default; a table
+    // is captured only when it is passed to paimon.add_table().  A table that never
+    // was reaches neither paimon_pub nor the warehouse.  The writer is proven to have
+    // read past the untracked table's changes by a tracked sentinel written afterwards.
+    static void test17_untracked() throws Exception {
+        System.out.println("\n── T17: UNTRACKED TABLE ─────────────────────────────");
+        String tbl = "adv_untracked", sentinel = "adv_untracked_sentinel";
         cleanup(tbl);
-
-        String showResult = null;
-        try (Connection conn = connect();
-             Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SHOW default_table_access_method")) {
-            if (rs.next()) showResult = rs.getString(1).trim();
-        }
-        check("T17 default tam: GUC = 'paimon_heap'",  "paimon_heap".equals(showResult));
-
-        // Create table WITHOUT USING clause
-        String actualAm = null;
+        cleanup(sentinel);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             exec(conn, "CREATE TABLE " + tbl + " (id INT PRIMARY KEY, v TEXT)");
-            try (Statement s = conn.createStatement();
-                 ResultSet rs = s.executeQuery(
-                     "SELECT am.amname " +
-                     "FROM pg_class c JOIN pg_am am ON c.relam = am.oid " +
-                     "WHERE c.relname = '" + tbl + "' AND c.relkind = 'r'")) {
-                if (rs.next()) actualAm = rs.getString(1);
-            }
+            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'plain'),(2,'heap')");
+            exec(conn, "UPDATE " + tbl + " SET v = 'changed' WHERE id = 1");
+            exec(conn, "DELETE FROM " + tbl + " WHERE id = 2");
         }
-        check("T17 default tam: pg_class.relam = 'paimon_heap'",  "paimon_heap".equals(actualAm));
+        try (Connection conn = connect()) {
+            createTracked(conn, sentinel, "id INT PRIMARY KEY");
+            exec(conn, "INSERT INTO " + sentinel + " VALUES (1)");
+        }
+        check("T17 sentinel (tracked, written after the plain table) reached the warehouse",
+              waitAndRead(sentinel, 1).total == 1);
 
-        if ("paimon_heap".equals(actualAm)) {
-            try (Connection conn = connect()) {
-                exec(conn, "INSERT INTO " + tbl + " VALUES (1,'default-am'),(2,'test')");
+        long inPub = -1, inRegistry = -1;
+        String am = null;
+        try (Connection conn = connect(); Statement s = conn.createStatement()) {
+            try (ResultSet rs = s.executeQuery(
+                     "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub' AND tablename = '" + tbl + "'")) {
+                rs.next(); inPub = rs.getLong(1);
             }
-            PaimonRows rows = waitAndRead(tbl, 2);
-            check("T17 default tam: inserts captured in warehouse",  rows.total == 2);
-            check("T17 default tam: all are insert rows",            rows.ofKind(0) == 2);
+            try (ResultSet rs = s.executeQuery(
+                     "SELECT count(*) FROM paimon.table_registry WHERE relid = '" + tbl + "'::regclass")) {
+                rs.next(); inRegistry = rs.getLong(1);
+            }
+            try (ResultSet rs = s.executeQuery(
+                     "SELECT am.amname FROM pg_class c JOIN pg_am am ON c.relam = am.oid WHERE c.oid = '" + tbl + "'::regclass")) {
+                if (rs.next()) am = rs.getString(1);
+            }
         }
+        check("T17 untracked: plain CREATE TABLE uses the ordinary heap", "heap".equals(am));
+        check("T17 untracked: not in paimon_pub", inPub == 0);
+        check("T17 untracked: not in paimon.table_registry", inRegistry == 0);
+        check("T17 untracked: no table directory in the warehouse", !new File(tableDir(tbl)).exists());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -470,14 +553,20 @@ public class PaimonAdvancedTest {
         try (Statement s = c.createStatement()) { s.execute(sql); }
     }
 
-    static void disableMeta(Connection c) throws SQLException {
-        exec(c, "SET paimon_heap.meta_field_xid = ''");
-        exec(c, "SET paimon_heap.meta_field_op  = ''");
-        exec(c, "SET paimon_heap.meta_field_tid = ''");
+    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    static void createTracked(Connection conn, String tbl, String columns) throws Exception {
+        exec(conn, "DROP TABLE IF EXISTS " + tbl);
+        exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
+        exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
+    }
+
+    /** Paimon's filesystem catalog nests tables under <database>.db/. */
+    static String tableDir(String tbl) {
+        return warehouse + "/default.db/" + tbl;
     }
 
     static void cleanup(String tbl) {
-        File dir = new File(warehouse + "/" + tbl);
+        File dir = new File(tableDir(tbl));
         if (dir.exists()) deleteDir(dir);
     }
 
@@ -487,136 +576,99 @@ public class PaimonAdvancedTest {
     }
 
     static void waitForParquet(String tbl, int minFiles) throws InterruptedException {
-        File bucketDir      = new File(warehouse + "/" + tbl + "/bucket-0");
-        File snapshotLatest = new File(warehouse + "/" + tbl + "/snapshot/LATEST");
+        File bucketDir      = new File(tableDir(tbl) + "/bucket-0");
+        File snapshotLatest = new File(tableDir(tbl) + "/snapshot/LATEST");
         long deadline = System.currentTimeMillis() + 120_000;
         while (System.currentTimeMillis() < deadline) {
             File[] f = bucketDir.listFiles((d, n) -> n.endsWith(".parquet"));
             if (f != null && f.length >= minFiles && snapshotLatest.exists()) return;
             Thread.sleep(500);
         }
-        throw new RuntimeException("Timed out waiting for parquet in " + tbl);
+        throw new RuntimeException("Timed out waiting for snapshot in " + tbl);
     }
 
     static TableSchema readSchema(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
+        Path tablePath = new Path(tableDir(tbl));
         return new SchemaManager(fileIO, tablePath).latest()
             .orElseThrow(() -> new RuntimeException("No schema: " + tbl));
     }
 
     static PaimonRows waitAndRead(String tbl, int minTotal) throws Exception {
         waitForParquet(tbl, 1);
-        return readRows(tbl);
+        // The writer commits asynchronously: poll until the changelog is complete (the
+        // assertions that follow are exact, so this only waits, it never relaxes them).
+        long deadline = System.currentTimeMillis() + 60_000;
+        PaimonRows rows = readRows(tbl);
+        while (rows.total < minTotal && System.currentTimeMillis() < deadline) {
+            Thread.sleep(500);
+            rows = readRows(tbl);
+        }
+        return rows;
     }
 
     static PaimonRows readRows(String tbl) throws Exception {
-        Path tablePath = new Path(warehouse + "/" + tbl);
-
-        TableSchema stored = new SchemaManager(fileIO, tablePath).latest()
-            .orElseThrow(() -> new RuntimeException("No schema: " + tbl));
-        Map<String, String> opts = new HashMap<>(stored.options());
-        opts.put("bucket", "-1");
-        opts.remove("merge-engine");
-        opts.remove("changelog-producer");
-        opts.remove("sequence.field");
-
-        List<DataField> fields = new ArrayList<>();
-        fields.add(new DataField(-1, "_row_kind", DataTypes.TINYINT().notNull()));
-        fields.addAll(stored.fields());
-
-        TableSchema schema = new TableSchema(
-            stored.id(), fields, stored.highestFieldId(),
-            stored.partitionKeys(), stored.primaryKeys(), opts, stored.comment());
-        FileStoreTable table = FileStoreTableFactory.create(fileIO, tablePath, schema);
-
-        ReadBuilder rb = table.newReadBuilder();
-        List<Split> splits = rb.newScan().plan().splits();
-
         PaimonRows result = new PaimonRows();
-        try (RecordReader<InternalRow> reader = rb.newRead().createReader(splits)) {
-            RecordReader.RecordIterator<InternalRow> batch;
-            while ((batch = reader.readBatch()) != null) {
-                InternalRow r;
-                while ((r = batch.next()) != null) {
-                    result.total++;
-                    if (!r.isNullAt(0)) result.kindCounts.merge((int) r.getByte(0), 1L, Long::sum);
-                }
-                batch.releaseBatch();
-            }
-        } catch (Exception e) {
-            System.err.println("  warn: row read failed for " + tbl + ": " + e.getMessage());
+        for (int[] r : readIdsAndKinds(tbl)) {
+            result.total++;
+            result.kindCounts.merge(r[0], 1L, Long::sum);
         }
         return result;
     }
 
-    static boolean runPgCtl(String... extraArgs) {
+    /**
+     * Every changelog record as stored, as {kindOrdinal, id}.  Row kinds come from the
+     * $audit_log system table over a streaming scan: Paimon stores the kind as the reserved
+     * _VALUE_KIND, so a batch read (merged, or with a faked _row_kind column) cannot report it.
+     * Column 0 is the kind as a string; the key is the column named "id".
+     */
+    static List<int[]> readIdsAndKinds(String tbl) {
+        List<int[]> out = new ArrayList<>();
         try {
-            // Build the inner pg_ctl command as a shell string
-            List<String> inner = new ArrayList<>();
-            inner.add(pgCtl);
-            inner.addAll(Arrays.asList(extraArgs));
-            inner.add("-D");
-            inner.add(pgData);
-            String innerCmd = String.join(" ", inner);
-            System.out.println("  Running: su - ubuntu -c \"" + innerCmd + "\"");
-
-            // pg_ctl refuses to run as root; delegate to the postgres owner via su
-            ProcessBuilder pb = new ProcessBuilder("su", "-", "ubuntu", "-c", innerCmd);
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
-            new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                    String line;
-                    while ((line = br.readLine()) != null) System.out.println("  [pg_ctl] " + line);
-                } catch (IOException ignored) {}
-            }).start();
-            boolean done = p.waitFor(60, TimeUnit.SECONDS);
-            return done && p.exitValue() == 0;
+            Options o = new Options();
+            o.set("warehouse", warehouse);
+            try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+                Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+                    .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
+                int idIdx = al.rowType().getFieldNames().indexOf("id");
+                StreamTableScan scan = al.newReadBuilder().newStreamScan();
+                scan.plan();                          // the first plan() is always empty: discard
+                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+                    .snapshotManager().latestSnapshotId();
+                List<Split> splits = new ArrayList<>();
+                for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {
+                    splits.addAll(scan.plan().splits());
+                }
+                try (RecordReader<InternalRow> reader = al.newReadBuilder().newRead().createReader(splits)) {
+                    reader.forEachRemaining(r ->
+                        out.add(new int[] {kindOf(r.getString(0).toString()), r.getInt(idIdx)}));
+                }
+            }
         } catch (Exception e) {
-            System.err.println("  pg_ctl error: " + e.getMessage());
-            return false;
+            System.err.println("  warn: row-kind read failed for " + tbl + ": " + e.getMessage());
         }
+        return out;
     }
 
-    // Waits until the server accepts connections AND user-table DDL succeeds.
-    // On clouddb, the RocksDB KVServer starts asynchronously after the postmaster:
-    // plain connections succeed before RocksDB WAL replay finishes, so a bare
-    // connection check is not sufficient.
-    static void waitForServer(long timeoutMs) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-
-        // Phase 1: wait for basic TCP connectivity
-        while (System.currentTimeMillis() < deadline) {
-            try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
-                System.out.println("  Server accepting connections.");
-                break;
-            } catch (SQLException ignored) {
-                Thread.sleep(500);
-            }
+    /** $audit_log's rowkind string to the ordinal the assertions use: +I 0, -U 1, +U 2, -D 3. */
+    static int kindOf(String k) {
+        switch (k) {
+            case "+I": return 0;
+            case "-U": return 1;
+            case "+U": return 2;
+            case "-D": return 3;
+            default: throw new IllegalStateException("unknown row kind " + k);
         }
-
-        // Phase 2: wait until user-table DDL works (RocksDB recovery may lag).
-        // Use a throwaway paimon_heap table as the canary.
-        while (System.currentTimeMillis() < deadline) {
-            try (Connection conn = DriverManager.getConnection(jdbcUrl);
-                 Statement s = conn.createStatement()) {
-                s.execute("DROP TABLE IF EXISTS _kv_ready_probe");
-                s.execute("CREATE TABLE _kv_ready_probe (x INT) USING paimon_heap");
-                s.execute("DROP TABLE _kv_ready_probe");
-                System.out.println("  Storage manager ready.");
-                return;
-            } catch (Exception e) {
-                System.out.println("  Waiting for storage manager recovery...");
-                Thread.sleep(2000);
-            }
-        }
-        System.out.println("  Warning: storage may not be fully recovered within timeout.");
     }
 
     static class PaimonRows {
         long total = 0;
         Map<Integer, Long> kindCounts = new HashMap<>();
         long ofKind(int k) { return kindCounts.getOrDefault(k, 0L); }
+    }
+
+    static String env(String name, String dflt) {
+        String v = System.getenv(name);
+        return v != null ? v : dflt;
     }
 
     static void check(String name, boolean condition) {
@@ -626,6 +678,7 @@ public class PaimonAdvancedTest {
         } else {
             System.out.printf("  FAIL  %s%n", name);
             failed++;
+            failures.add(name);
         }
     }
 }
