@@ -497,13 +497,36 @@ One case makes the rule concrete:
 UPDATE t SET id = id + 1;        -- rewrites every key, in an unspecified row order
 ```
 
-Each row decomposes to `-D(old_key)` + `+I(new_key)`, and those pairs interleave across
-keys: the `+I` for key 3 may arrive before the `-D` that vacates it. Because every event
-carries its own LSN and Paimon applies events in LSN order, the final state is correct for
-any interleaving — the highest-LSN event for a key wins. The obligation this places on the
-writer is narrow and absolute: **never reorder, collapse or deduplicate within a batch**,
-because the batch's correctness rests entirely on LSN order surviving intact. T20 (§9) is
-the named acceptance test.
+Each row decomposes to `-D(old_key)` + `+I(new_key)`. The claim previously made here — that
+LSN order makes the final state correct for any interleaving — is **false**, and T20 was written
+to prove it. With rows `1..200` processed in ascending order the stream is
+`-D(1), +I(2), -D(2), +I(3), …`, so for key 2 the `-D` carries a *higher* LSN than the `+I` that
+filled it, the delete wins the merge, and only key 201 survives. The two events concern the same
+key but different rows, and a Paimon primary-key table cannot hold both.
+
+What rescues this is that **PostgreSQL rejects the statement outright** on a non-deferrable
+primary key:
+
+```
+ERROR:  duplicate key value violates unique constraint "km_nd_pkey"
+DETAIL:  Key (id)=(2) already exists.
+```
+
+Uniqueness is checked per row, so an ascending cascade cannot commit and the problematic
+interleaving never reaches the WAL. It commits only when the key is
+`DEFERRABLE INITIALLY DEFERRED`, and then the transaction genuinely passes through states in which
+two rows share a key — states a Paimon primary-key table has no way to represent, at any LSN
+ordering.
+
+So `paimon.add_table()` **refuses a table whose primary key is deferrable**, which is what makes
+the rule below sound rather than hopeful. A descending cascade (`id = id - 1`) commits normally,
+vacates each key before filling it, and converges correctly; that is the case T20 asserts.
+
+The obligation on the writer is unchanged and absolute: **never reorder, collapse or deduplicate
+within a batch**, because correctness rests on LSN order surviving intact. Collapsing per key would
+not have saved the deferred case either — `BEGIN; INSERT(5); DELETE(5); COMMIT;` must leave key 5
+absent, so a rule of "any `+I` beats a `-D`" is wrong in the opposite direction. T20 (§9) is the
+named acceptance test.
 
 ### Complete transactions only
 
