@@ -10,6 +10,7 @@ The extension implements a custom **Table Access Method (TAM)** that intercepts 
 
 ## Contents
 
+- [Two architectures on this branch](#two-architectures-on-this-branch)
 - [Use cases](#use-cases)
 - [Architecture](#architecture)
 - [Design decisions](#design-decisions)
@@ -22,6 +23,26 @@ The extension implements a custom **Table Access Method (TAM)** that intercepts 
 - [Java reader and compaction](#java-reader-and-compaction)
 - [Performance](#performance)
 - [Limitations](#limitations)
+
+---
+
+## Two architectures on this branch
+
+The `feat/logical-slot-writer` branch carries two implementations of the same idea, side by side.
+**Everything below this section documents the original one**: the `paimon_heap` table access method
+and background worker in `extension/`, which is unchanged.
+
+The other is a pure-SQL extension (`sql/paimon_slot/`) that captures changes through a logical
+replication slot, plus an external Java writer (`java/writer/`) that writes them to Paimon. It needs
+no C++ build, no `shared_preload_libraries` and no `USING paimon_heap`, but it needs
+`wal_level = logical` and introduces an operational hazard the TAM design does not have: a stopped
+writer makes the slot retain WAL until the disk fills. Setup, that hazard and how to monitor it, the
+limitations (each with its reason) and troubleshooting are in
+[docs/logical-slot-architecture.md](docs/logical-slot-architecture.md). Its design is in
+[docs/superpowers/specs/2026-10-09-logical-slot-writer-design.md](docs/superpowers/specs/2026-10-09-logical-slot-writer-design.md).
+
+If your tables are created `USING paimon_heap`, you are using the architecture documented in the rest
+of this README. If you call `paimon.add_table()`, you are using the other one.
 
 ---
 

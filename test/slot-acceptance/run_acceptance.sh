@@ -131,17 +131,18 @@ LAUNCH
 
 run_suites() {
   local args=(-f "$REPO/java/pom.xml" test)
-  if [ "$#" -gt 0 ]; then
-    # The smoke suite always runs: it proves a JDBC suite can see replicated changes.
-    local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
-  fi
-  echo ">> mvn ${args[*]}"
+  # (Before the IFS=, below: `local IFS` lasts to the end of the function and would break "$*".)
   # PaimonOffloadTest T18 needs a MinIO binary; say so up front rather than only in the test log.
   local minio="${E2E_MINIO_BIN:-/root/cloud-db/opt/minio3}"
   if { [ "$#" -eq 0 ] || [[ " $* " == *" PaimonOffloadTest "* ]]; } && [ ! -x "$minio" ]; then
     NOT_RUN="T18 (S3) NOT RUN: no executable MinIO at '$minio'; enable with E2E_MINIO_BIN=/path/to/minio"
     echo ">> NOTE: $NOT_RUN" >&2
   fi
+  if [ "$#" -gt 0 ]; then
+    # The smoke suite always runs: it proves a JDBC suite can see replicated changes.
+    local IFS=,; args+=("-Dtest=SlotHarnessSmokeIT,$*")
+  fi
+  echo ">> mvn ${args[*]}"
   # Surefire exits 0 when a -Dtest name matches nothing as long as another name matches (the smoke
   # test always does), and -DfailIfNoSpecifiedTests does not change that. So a mistyped suite, or a
   # class with no @Test, would print "ALL SUITES PASSED" having run nothing. Prove each named suite
