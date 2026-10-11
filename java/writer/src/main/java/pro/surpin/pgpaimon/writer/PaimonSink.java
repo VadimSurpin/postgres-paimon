@@ -80,16 +80,22 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
 
     @Override
     public void flush(List<SinkRecord> records, long commitLsn, long endLsn) throws Exception {
-        flushApplied(records, commitLsn, endLsn);
+        flush0(records, commitLsn, endLsn, true);
     }
 
     /**
      * As {@link #flush}, returning false if any table's commit was filtered as already
      * committed. A replay may expect that; a caller minting fresh identifiers (the Backfiller)
-     * must treat it as an error.
+     * must treat it as an error. Records reaching this entry point come from the initial load,
+     * not from the slot, which changes only what an undecodable value is diagnosed as.
      */
     public boolean flushApplied(List<SinkRecord> records, long commitLsn, long endLsn)
             throws Exception {
+        return flush0(records, commitLsn, endLsn, false);
+    }
+
+    private boolean flush0(List<SinkRecord> records, long commitLsn, long endLsn,
+                           boolean fromTheSlot) throws Exception {
         boolean allApplied = true;
         if (records.isEmpty()) {
             return true;    // a DDL-only transaction: nothing to commit, no empty snapshot
@@ -108,7 +114,13 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
             try {
                 RowBuilder rb = registry.rowBuilder(relid, meta);
                 for (SinkRecord r : g.getValue()) {
-                    e.write().write(rb.build(r), 0);
+                    org.apache.paimon.data.GenericRow row;
+                    try {
+                        row = rb.build(r);
+                    } catch (RuntimeException bad) {
+                        throw undecodable(meta, r, commitLsn, fromTheSlot, bad);
+                    }
+                    e.write().write(row, 0);
                 }
                 List<CommitMessage> msgs = e.write().prepareCommit(false, commitLsn);
                 int applied = e.commit().filterAndCommit(Map.of(commitLsn, msgs));
@@ -137,6 +149,47 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
             }
         }
         return allApplied;
+    }
+
+    /**
+     * A value PostgreSQL stores happily that Paimon cannot represent -- {@code timestamp
+     * 'infinity'}, a {@code numeric} outside {@code DECIMAL(38, 18)}, a BC date -- is a
+     * <em>poison record</em>, not a transient failure, and the distinction is the whole point of
+     * this message. No guardrail can prevent one (a {@code timestamp} column can always hold
+     * infinity), the slot only advances after a successful Paimon commit, and the offending WAL
+     * record is in the slot, so every restart replays it and fails identically. Deleting or
+     * correcting the row in PostgreSQL does not help. Spec section 8's "transaction replayed on
+     * retry" does not cover a replay that can never succeed; there is no quarantine mechanism, by
+     * decision, so the message has to carry everything an operator needs at three in the morning:
+     * the table, the column, the value, the LSN, and what the only recourse is.
+     *
+     * <p>A record from the initial load is a different situation -- it came from a COPY, not from
+     * the slot, and fixing the row does help -- so it is diagnosed differently.
+     */
+    private IllegalStateException undecodable(RelationMeta meta, SinkRecord r, long commitLsn,
+                                              boolean fromTheSlot, RuntimeException cause) {
+        String where = meta.namespace() + "." + meta.relName()
+            + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+        if (!fromTheSlot) {
+            return new IllegalStateException("cannot load " + where + " during the initial"
+                + " backfill: " + cause.getMessage() + ". The value came from the table itself,"
+                + " not from the replication slot, so correcting or deleting that row and running"
+                + " the backfill again will fix it.", cause);
+        }
+        return new IllegalStateException("POISON RECORD in " + where
+            + ", transaction committing at " + SlotConsumer.formatLsn(commitLsn) + ": "
+            + cause.getMessage()
+            + ". THIS IS NOT TRANSIENT and will not clear by itself: the change is already in"
+            + " replication slot '" + config.slotName() + "', the slot advances only after a"
+            + " successful Paimon commit, so every restart replays this same record and fails"
+            + " identically. Deleting or correcting the row in PostgreSQL does NOT help -- the"
+            + " offending WAL record stays in the slot. The only recourse today is the"
+            + " re-bootstrap procedure: stop the writer, SELECT"
+            + " pg_drop_replication_slot('" + config.slotName() + "'); UPDATE"
+            + " paimon.table_registry SET backfill_due = true; and start the writer again. That"
+            + " reloads every tracked table from a fresh snapshot and loses Paimon-side changelog"
+            + " history. See docs/logical-slot-architecture.md, 'A record the writer can never"
+            + " apply'.", cause);
     }
 
     /**

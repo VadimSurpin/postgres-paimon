@@ -199,6 +199,51 @@ The writer prints this same recipe when it refuses to start (section 5). One cav
 copies each table using the name recorded at registration, so if a tracked table has been renamed
 since (section 5), rename it back first or the reload fails with `relation "public.<name>" does not exist`.
 
+### A record the writer can never apply (a poison record)
+
+**This is an unsolved gap, not a bug with a workaround.** One ordinary INSERT can permanently stop
+replication for the whole database:
+
+```sql
+CREATE TABLE v (id int PRIMARY KEY, ts timestamp, amt numeric(10,2));
+SELECT paimon.add_table('v'::regclass);
+INSERT INTO v VALUES (2, 'infinity', 2.5);
+```
+
+`timestamp 'infinity'` has no Paimon representation. The writer refuses it rather than clamping it
+(silently storing the wrong instant is worse), which is right, but the refusal is fatal and the
+failure is permanent:
+
+```
+SEVERE: fatal: java.lang.IllegalStateException: POISON RECORD in public.v (INSERT at _seq 0/14CD98C8), transaction committing at 0/14CD9958: column 'ts': cannot parse TIMESTAMP(6) from "infinity": infinity has no Paimon representation. THIS IS NOT TRANSIENT and will not clear by itself: the change is already in replication slot 'paimon', the slot advances only after a successful Paimon commit, so every restart replays this same record and fails identically. Deleting or correcting the row in PostgreSQL does NOT help -- the offending WAL record stays in the slot. ...
+```
+
+**`DELETE FROM v WHERE id = 2` does not help** (verified: the restart after the delete exits 1 with
+the same message). The slot only advances past a transaction after that transaction's Paimon commit
+has returned, so the record is replayed on every start, for ever, and no later DML can remove it
+from the slot.
+
+The same applies to any value PostgreSQL stores happily that Paimon cannot represent: `numeric`
+beyond `DECIMAL(38, 18)`, a BC date, `timestamp '-infinity'`.
+
+**No guardrail can prevent this.** The extension refuses column *types* it cannot map, but a
+`timestamp` column is mappable and can always be given the value `infinity`. The check can only
+happen on the write path, by which time PostgreSQL has committed and the record is in the slot.
+
+**Recourse today: the re-bootstrap procedure above, and nothing else.** It works (verified end to
+end) at the price it always costs: every tracked table is reloaded from a fresh snapshot and
+Paimon-side changelog history restarts. Before re-bootstrapping, correct the offending value in
+PostgreSQL, or the next write of that row will poison the slot again.
+
+**What is missing.** There is no quarantine: no way to record the record as unapplied, advance past
+it and carry on, and no way to tell the writer to skip one LSN. That is a design decision, not an
+oversight to be patched in passing: a skip is a silent data loss unless it is recorded somewhere
+durable and surfaced, and deciding where that lives is the same decision as deciding what a
+dead-letter table looks like. Until then, the guarantee to read from spec section 8 is narrower
+than its table suggests: a failed Paimon commit is replayed on retry, but a replay that can never
+succeed is a permanent stop. Watch for `SEVERE: fatal:` and alert on the writer being down
+(section 3, first item) — that is the only protection there is.
+
 ### Other operational notes
 
 * The writer is one process per slot. Multi-writer and HA are non-goals.

@@ -348,4 +348,66 @@ class PaimonSinkTest {
             "PGPAIMON_COMMIT_USER", "someone-else"));
         assertFalse(new OffsetStore(reg, other).hasCommitted(RELID));
     }
+
+    /**
+     * Finding 5. INSERT INTO v VALUES (2, 'infinity', 2.5) on an accepted table permanently stops
+     * replication for the whole database, and still does after the row is deleted, because the
+     * WAL record is in the slot. No guardrail can refuse it -- a timestamp column can always hold
+     * infinity -- and there is no quarantine mechanism by decision, so the one thing that must be
+     * true is that the error says what it is: the table, the column, the value, the LSN, that the
+     * record is in the slot, and what the only recourse is.
+     */
+    @Test @Order(16)
+    void anUndecodableStreamedValueIsDiagnosedAsAPoisonRecord() throws Exception {
+        long poisonRelid = 16700L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16700,"schema":"public","table":"poison",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"ts","type":"TIMESTAMP"}],
+              "options":{"changelog-producer":"input"}}"""));
+        RelationMeta meta = new RelationMeta(poisonRelid, "public", "poison",
+            List.of("id", "ts"), List.of(true, false));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(poisonRelid, meta);
+            SinkRecord bad = new SinkRecord(poisonRelid, RowKind.INSERT,
+                Arrays.asList("2", "infinity"), 0x1_9ABC_DEF0L, 0, 4711L);
+
+            IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> s.flush(List.of(bad), 0x1_9ABC_DEF1L, 0x1_9ABC_DEF2L));
+            String m = e.getMessage();
+            assertTrue(m.contains("POISON RECORD"), m);
+            assertTrue(m.contains("public.poison"), m);          // the table
+            assertTrue(m.contains("'ts'"), m);                   // the column
+            assertTrue(m.contains("infinity"), m);               // the value
+            assertTrue(m.contains("1/9ABCDEF0"), m);             // the LSN of the change
+            assertTrue(m.contains("1/9ABCDEF1"), m);             // and of its commit
+            assertTrue(m.contains("already in"), m);             // the record is in the slot
+            assertTrue(m.contains(cfg.slotName()), m);
+            assertTrue(m.contains("does NOT help"), m);          // deleting the row will not do
+            assertTrue(m.contains("pg_drop_replication_slot"), m);   // the recourse that exists
+            assertTrue(m.contains("NOT TRANSIENT"), m);
+        }
+    }
+
+    /** The same value arriving from the initial load is not in the slot, and says so. */
+    @Test @Order(17)
+    void anUndecodableBackfilledValueIsDiagnosedDifferently() throws Exception {
+        long relid = 16701L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16701,"schema":"public","table":"poison2",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"ts","type":"TIMESTAMP"}],
+              "options":{"changelog-producer":"input"}}"""));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, new RelationMeta(relid, "public", "poison2",
+                List.of("id", "ts"), List.of(true, false)));
+            SinkRecord bad = new SinkRecord(relid, RowKind.INSERT,
+                Arrays.asList("2", "infinity"), 500L, 0, 0L);
+            IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> s.flushApplied(List.of(bad), 500L, 500L));
+            assertFalse(e.getMessage().contains("POISON RECORD"), e.getMessage());
+            assertTrue(e.getMessage().contains("initial backfill"), e.getMessage());
+            assertTrue(e.getMessage().contains("will fix it"), e.getMessage());
+        }
+    }
 }

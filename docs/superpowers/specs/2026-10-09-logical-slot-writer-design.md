@@ -582,6 +582,41 @@ counterpart here.
 | DDL arrives for an unregistered table | Message ignored with a warning. |
 | Writer restarts | `SchemaRegistry` is rebuilt from `paimon.table_registry` before the slot is consumed. See below. |
 
+### What "replayed on retry" does not cover
+
+**Amendment (final whole-branch review).** The row "Paimon commit fails → LSN not advanced;
+transaction replayed on retry" reads as though every write-path failure were transient. It is not,
+and the table says nothing about the case that matters:
+
+> a **non-retryable** failure in the write path, plus a slot that advances only after a successful
+> commit, equals a **permanent stop**.
+
+The replay is faithful, so a replay that can never succeed repeats for ever. Three independent
+defects landed in that blind spot: non-idempotent DDL replay, two ALTERs Paimon refuses after
+PostgreSQL has committed them, and a value Paimon cannot represent.
+
+The first two are closed, and closed in the only place they can be — by making the operation
+replay-safe (`SchemaRegistry`, every DDL op is now a no-op when already applied) or by refusing it
+before it reaches WAL (`paimon_slot`'s guardrails on a key-column type change and on
+nullable → NOT NULL). That is the general rule this section should be read with: **anything the
+write path cannot retry must be impossible to enqueue.**
+
+The third cannot be closed that way. `INSERT INTO v VALUES (2, 'infinity', 2.5)` into a `timestamp`
+column is accepted by every guardrail — the column *type* maps, only that one *value* does not —
+and Paimon has no representation for it. Reject-never-clamp is still right; what was never
+considered is that the rejection is unbounded, so one ordinary INSERT stops replication for the
+whole database, permanently, and still does after the row is deleted, because the WAL record is in
+the slot. The same holds for `numeric` beyond `DECIMAL(38, 18)` and for BC dates.
+
+**v1 ships without a quarantine, deliberately.** The failure is made diagnosable instead: the error
+names the table, the column, the value, the change LSN and its commit LSN, states that the record is
+in the slot so deleting the row will not help, and gives the one recourse that exists
+(re-bootstrap, which loses Paimon-side changelog history). A mechanism that records such a record as
+unapplied and advances past it is a design decision in its own right — a skip is silent data loss
+unless it is durable and surfaced, which is the same decision as what a dead-letter table looks
+like — and is left to a follow-up spec. The hazard is written up for operators in
+`docs/logical-slot-architecture.md`, "A record the writer can never apply".
+
 ### Registry bootstrap on startup
 
 `SchemaRegistry` learns a table's identity from a `create` DDL message, and `add_table()` emits
