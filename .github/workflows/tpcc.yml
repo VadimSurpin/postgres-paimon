@@ -53,7 +53,6 @@ jobs:
     timeout-minutes: 90
 
     env:
-      TPCC_RUN_DIR: ${{ runner.temp }}/tpcc-run
       TPCC_WAREHOUSES: ${{ inputs.warehouses }}
       TPCC_TIME: ${{ inputs.time }}
       TPCC_RATE: ${{ inputs.rate }}
@@ -62,6 +61,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # $RUNNER_TEMP is a plain environment variable available in every step. The `runner`
+      # expression context is NOT available in a job-level `env:` block, which is why this is
+      # resolved here rather than beside the other TPCC_* variables above.
+      - name: Resolve the run directory
+        run: echo "TPCC_RUN_DIR=$RUNNER_TEMP/tpcc-run" >> "$GITHUB_ENV"
 
       # BenchBase v2023 targets Java 21 and the repository's own code targets 17. Install both:
       # setup-java exports JAVA_HOME_21_X64, which test/tpcc/run_tpcc.sh looks for, and the second
