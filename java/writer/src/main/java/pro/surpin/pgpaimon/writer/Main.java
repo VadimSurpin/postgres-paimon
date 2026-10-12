@@ -55,6 +55,30 @@ public final class Main {
             //    writer knows no tables and silently discards every replicated row.
             rows = readRegistry(conn);
         }
+        // 3a. the relid to Paimon identity mapping only. No catalog call, no warehouse write:
+        //     step 3b may refuse to start, and "the writer refused to start, so nothing
+        //     happened" has to be TRUE. It was not: the bootstrap used to create tables and add
+        //     reconciled columns first and throw afterwards, so a failed start had already
+        //     bumped schema versions in the warehouse.
+        for (RegistryRow r : rows) {
+            registry.register(r.relid(), r.table());
+        }
+
+        // 3b. decide what startup will do, which is where a refusal belongs.
+        OffsetStore offsets = new OffsetStore(registry, config);
+        List<RegistryRow> due = new ArrayList<>();
+        List<String> stranded = new ArrayList<>();
+        for (RegistryRow r : rows) {
+            switch (classify(r.backfillDue(), offsets.hasCommitted(r.relid()), slotExists)) {
+                case DUE -> due.add(r);
+                case STRANDED -> stranded.add(r.schema() + "." + r.table());
+                case STREAMING -> { }
+            }
+        }
+        BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(), stranded,
+                                               config.slotName());
+
+        // 3c. only now does anything in the warehouse change.
         for (RegistryRow r : rows) {
             // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
             registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
@@ -75,8 +99,7 @@ public final class Main {
         // 5. initial backfill (and slot creation) for anything due. A backfill moves the
         //    committed offsets (each loaded table now stands at the slot's consistent point), so
         //    resume is read again afterwards.
-        backfillIfDue(config, registry, sink, rows, slotExists,
-                      new OffsetStore(registry, config));
+        runBackfill(config, registry, sink, rows, due, action);
         resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
         warnOnStaleSkipLsn(config.skipLsn(), resume);
@@ -250,20 +273,10 @@ public final class Main {
      * that the slot's creation exports. The replication connection holding that snapshot is
      * kept open until every due table is loaded.
      */
-    private static void backfillIfDue(WriterConfig config, SchemaRegistry registry,
-                                      PaimonSink sink, List<RegistryRow> rows,
-                                      boolean slotExists, OffsetStore offsets) throws Exception {
-        List<RegistryRow> due = new ArrayList<>();
-        List<String> stranded = new ArrayList<>();
-        for (RegistryRow r : rows) {
-            switch (classify(r.backfillDue(), offsets.hasCommitted(r.relid()), slotExists)) {
-                case DUE -> due.add(r);
-                case STRANDED -> stranded.add(r.schema() + "." + r.table());
-                case STREAMING -> { }
-            }
-        }
-        BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(), stranded,
-                                               config.slotName());
+    private static void runBackfill(WriterConfig config, SchemaRegistry registry,
+                                    PaimonSink sink, List<RegistryRow> rows,
+                                    List<RegistryRow> due, BackfillAction action)
+            throws Exception {
         if (action == BackfillAction.NONE) {
             return;
         }

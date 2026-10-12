@@ -58,7 +58,18 @@ public final class OffsetStore {
      * <p>An untracked relation answers false.
      */
     public boolean hasCommitted(long relid) {
-        return registry.tracked(relid) && ourHighest(relid) != null;
+        if (!registry.tracked(relid)) {
+            return false;
+        }
+        try {
+            return ourHighest(relid) != null;
+        } catch (RuntimeException e) {
+            // The relid is registered but its Paimon table does not exist yet. That is the
+            // normal state when startup asks this BEFORE creating the tables, which it must do
+            // so that a refusal can happen before anything in the warehouse is touched. Nothing
+            // has been committed to a table that does not exist.
+            return false;
+        }
     }
 
     /** The highest identifier committed by our commitUser to one table, or null if there is none. */
