@@ -43,13 +43,19 @@ public final class DdlMessageHandler {
                     LOG.warning("ignoring " + op + " for unregistered relation " + d.relid());
                     return;
                 }
+                // m.lsn() is the message's own position in WAL, from the pgoutput 'M' header.
+                // It is stable across replays and is what SchemaRegistry records as the DDL
+                // commit identifier, so a replayed message is skipped the way filterAndCommit
+                // skips a replayed data commit.
                 switch (op) {
-                    case "add_col" -> registry.addColumn(d.relid(), need(d.col(), "col", op));
-                    case "drop_col" -> registry.dropColumn(d.relid(), need(d.name(), "name", op));
+                    case "add_col" ->
+                        registry.addColumn(d.relid(), need(d.col(), "col", op), m.lsn());
+                    case "drop_col" ->
+                        registry.dropColumn(d.relid(), need(d.name(), "name", op), m.lsn());
                     case "rename_col" -> registry.renameColumn(d.relid(),
-                        need(d.from(), "from", op), need(d.to(), "to", op));
+                        need(d.from(), "from", op), need(d.to(), "to", op), m.lsn());
                     case "alter_col" -> registry.alterColumn(d.relid(),
-                        need(d.name(), "name", op), need(d.type(), "type", op));
+                        need(d.name(), "name", op), need(d.type(), "type", op), m.lsn());
                     default -> registry.dropTable(d.relid(), d.schema(), d.table());
                 }
             }

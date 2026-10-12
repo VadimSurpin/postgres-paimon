@@ -176,53 +176,84 @@ public final class SchemaRegistry {
      *
      * A DDL-only transaction produces no records, so nothing about it reaches Paimon and
      * filterAndCommit has no identifier to filter on. The slot position is confirmed to pgjdbc
-     * immediately but reaches the server only at the next status tick (10 s), so a hard kill
-     * replays up to 10 s of DDL that was already applied. Paimon's own errors for that replay
-     * (ColumnAlreadyExistException, ColumnNotExistException) are not retryable, and the slot
-     * only advances after a successful commit, so the writer stops permanently. Replay must be
-     * a no-op here exactly as filterAndCommit makes it one for data.
+     * immediately but reaches the server only at the next status tick, and the resume position is
+     * the highest Paimon commit identifier, which a DDL-only transaction never moves -- so a DDL
+     * that is the last thing in the stream replays on EVERY restart, clean or not. Paimon's own
+     * errors for that replay (ColumnAlreadyExistException, ColumnNotExistException) are not
+     * retryable, and the slot only advances after a successful commit, so the writer stopped
+     * permanently.
      *
-     * "Already applied" is not the same as "conflicting": a column that exists with a different
-     * type than the message declares is not a replay, and still fails loudly.
+     * The fix is the mechanism data already had, applied to the thing that lacked it. Data replay
+     * is safe because filterAndCommit compares a commit IDENTIFIER; DDL had no equivalent. Each
+     * DDL message carries its own WAL LSN, which is stable across replays, so the LSN of the last
+     * applied DDL message is recorded in the Paimon table's own schema options
+     * ({@value #DDL_LSN_OPTION}) -- written in the SAME alterTable call as the column change, so
+     * the two cannot diverge (measured against Paimon 1.4.1: a list of SchemaChanges becomes one
+     * atomic schema commit, and a failing change in the list leaves the option unwritten too).
+     * Any DDL message at or below the recorded LSN is skipped.
+     *
+     * This is what makes replaying a SEQUENCE safe, which per-op state inspection cannot be:
+     * "ADD COLUMN num int" then "ALTER COLUMN num TYPE bigint" leaves a replayed add_col looking
+     * at a BIGINT column, indistinguishable from a genuine conflict, and "ADD COLUMN x" then
+     * "RENAME x TO y" leaves a replayed add_col re-creating a spurious x for the replayed rename
+     * to collide with. The invariant the LSN gate gives by construction: replaying any suffix of
+     * an already-applied DDL sequence converges to the same schema and never fails.
+     *
+     * The state-based tolerances below remain as a second line for a table with no recorded LSN
+     * (one whose DDL was applied before this mechanism existed, or reconciled at bootstrap). They
+     * never throw: a column that already exists with a different type is logged and left alone,
+     * because in the replay case the stored type is the later, correct one.
      */
 
-    public void addColumn(long relid, DdlMessage.Col col) {
+    /** Schema option holding the WAL LSN of the last DDL message applied to this table. */
+    static final String DDL_LSN_OPTION = "pgpaimon.applied-ddl-lsn";
+
+    public void addColumn(long relid, DdlMessage.Col col, long ddlLsn) {
+        if (replayed(relid, ddlLsn, "add_col '" + col.name() + "'")) {
+            return;
+        }
+        DataType wanted = parseType(col.type());
         DataField existing = field(relid, col.name());
         if (existing != null) {
-            DataType wanted = parseType(col.type());
-            if (!existing.type().equals(wanted)) {
-                throw new IllegalStateException("add_col '" + col.name() + "' on "
-                    + identifiers.get(relid) + ": the column already exists as "
-                    + existing.type().asSQLString() + " but the message declares "
-                    + wanted.asSQLString() + ", so this is not a replay of an applied add_col");
+            if (existing.type().equals(wanted)) {
+                LOG.info("add_col '" + col.name() + "' on " + identifiers.get(relid)
+                    + " is already applied as " + wanted.asSQLString() + ": no-op");
+            } else {
+                // Not a throw, deliberately. A replayed add superseded by a replayed alter_col
+                // looks exactly like this, and the stored type is then the later, correct one.
+                LOG.warning("add_col '" + col.name() + "' on " + identifiers.get(relid)
+                    + ": the column already exists as " + existing.type().asSQLString()
+                    + " but the message declares " + wanted.asSQLString()
+                    + "; leaving the stored type alone");
             }
-            LOG.info("add_col '" + col.name() + "' on " + identifiers.get(relid)
-                + " is already applied as " + wanted.asSQLString() + ": replay, no-op");
             return;
         }
-        alter(relid, SchemaChange.addColumn(col.name(), parseType(col.type())));
+        alter(relid, SchemaChange.addColumn(col.name(), wanted), ddlLsn);
     }
 
-    public void dropColumn(long relid, String name) {
+    public void dropColumn(long relid, String name, long ddlLsn) {
+        if (replayed(relid, ddlLsn, "drop_col '" + name + "'")) {
+            return;
+        }
         if (field(relid, name) == null) {
             LOG.info("drop_col '" + name + "' on " + identifiers.get(relid)
-                + " is already applied (no such column): replay, no-op");
+                + " is already applied (no such column): no-op");
             return;
         }
-        alter(relid, SchemaChange.dropColumn(name));
+        alter(relid, SchemaChange.dropColumn(name), ddlLsn);
     }
 
-    /**
-     * A rename is already applied when the source is gone and the target is there. Any other
-     * shape (both gone, both present) is a conflict and is left to Paimon to refuse.
-     */
-    public void renameColumn(long relid, String from, String to) {
-        if (field(relid, from) == null && field(relid, to) != null) {
-            LOG.info("rename_col '" + from + "' -> '" + to + "' on " + identifiers.get(relid)
-                + " is already applied: replay, no-op");
+    /** A rename is already applied when the source is gone and the target is there. */
+    public void renameColumn(long relid, String from, String to, long ddlLsn) {
+        if (replayed(relid, ddlLsn, "rename_col '" + from + "' -> '" + to + "'")) {
             return;
         }
-        alter(relid, SchemaChange.renameColumn(from, to));
+        if (field(relid, from) == null && field(relid, to) != null) {
+            LOG.info("rename_col '" + from + "' -> '" + to + "' on " + identifiers.get(relid)
+                + " is already applied: no-op");
+            return;
+        }
+        alter(relid, SchemaChange.renameColumn(from, to), ddlLsn);
     }
 
     /** One field of the relation's Paimon schema by name, or null if there is none. */
@@ -236,20 +267,60 @@ public final class SchemaRegistry {
     }
 
     /**
-     * A no-op when the stored type already equals the new one (varchar vs text are both STRING),
-     * which also makes a replayed alter_col a no-op.
+     * A no-op when the stored type already equals the new one (varchar vs text are both STRING).
+     * A column the message names and Paimon does not have is logged and skipped rather than
+     * thrown: in a replayed sequence the column may since have been renamed or dropped.
      */
-    public void alterColumn(long relid, String name, String type) {
+    public void alterColumn(long relid, String name, String type, long ddlLsn) {
+        if (replayed(relid, ddlLsn, "alter_col '" + name + "'")) {
+            return;
+        }
         DataType wanted = parseType(type);
         DataField current = field(relid, name);
         if (current == null) {
-            throw new IllegalStateException("no column '" + name + "' in "
-                + identifiers.get(relid));
+            LOG.warning("alter_col '" + name + "' on " + identifiers.get(relid)
+                + ": no such column in the Paimon schema; skipped (renamed or dropped since)");
+            return;
         }
         if (current.type().equals(wanted)) {
             return;
         }
-        alter(relid, SchemaChange.updateColumnType(name, wanted));
+        alter(relid, SchemaChange.updateColumnType(name, wanted), ddlLsn);
+    }
+
+    /**
+     * Whether this DDL message is at or below the last DDL LSN applied to the table, and so has
+     * already been applied. LSNs are compared unsigned. An {@code ddlLsn} of 0 means the caller
+     * has no LSN (the startup bootstrap, which replays registry rows rather than messages) and
+     * disables the gate.
+     */
+    private boolean replayed(long relid, long ddlLsn, String what) {
+        if (ddlLsn == 0) {
+            return false;
+        }
+        long applied = appliedDdlLsn(relid);
+        if (applied != 0 && Long.compareUnsigned(ddlLsn, applied) <= 0) {
+            LOG.info(what + " on " + identifiers.get(relid) + " at "
+                + SlotConsumer.formatLsn(ddlLsn) + " is at or below the last applied DDL LSN "
+                + SlotConsumer.formatLsn(applied) + ": replay, no-op");
+            return true;
+        }
+        return false;
+    }
+
+    /** The recorded last-applied DDL LSN of a table, or 0 if it has none. */
+    long appliedDdlLsn(long relid) {
+        String v = table(relid).schema().options().get(DDL_LSN_OPTION);
+        if (v == null) {
+            return 0;
+        }
+        try {
+            return Long.parseUnsignedLong(v);
+        } catch (NumberFormatException e) {
+            LOG.warning("ignoring unparseable " + DDL_LSN_OPTION + " '" + v + "' on "
+                + identifiers.get(relid));
+            return 0;
+        }
     }
 
     /** Purges the warehouse data. Untracked relids are ignored. */
@@ -317,13 +388,23 @@ public final class SchemaRegistry {
         builders.remove(relid);
     }
 
-    private void alter(long relid, SchemaChange change) {
+    /**
+     * One schema change, plus the DDL message's LSN, in a single alterTable call. Paimon turns a
+     * list of SchemaChanges into one atomic schema commit, so the column change and the recorded
+     * LSN land together or not at all; recording the LSN in a second call would leave a window in
+     * which a crash makes the change replay.
+     */
+    private void alter(long relid, SchemaChange change, long ddlLsn) {
         Identifier id = identifiers.get(relid);
         if (id == null) {
             throw new IllegalStateException("relation " + relid + " is not tracked");
         }
+        List<SchemaChange> changes = ddlLsn == 0
+            ? List.of(change)
+            : List.of(change, SchemaChange.setOption(DDL_LSN_OPTION,
+                                                     Long.toUnsignedString(ddlLsn)));
         try {
-            catalog.alterTable(id, List.of(change), false);
+            catalog.alterTable(id, changes, false);
         } catch (Exception e) {
             throw new IllegalStateException("cannot alter Paimon table " + id + ": " + change, e);
         }

@@ -36,8 +36,21 @@ class SchemaRegistryTest {
         handler = new DdlMessageHandler(reg, "paimon");
     }
 
+    /**
+     * A DDL message with a fresh, ascending LSN, as the stream delivers them. The LSN is the DDL
+     * commit identifier (SchemaRegistry.DDL_LSN_OPTION), so reusing one would make the registry
+     * treat the second message as a replay; tests that WANT a replay pass the LSN explicitly.
+     */
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_LSN =
+        new java.util.concurrent.atomic.AtomicLong(0x1000);
+
     private static PgEvent.Message msg(String json) {
-        return new PgEvent.Message(true, 1L, "paimon", json.getBytes(StandardCharsets.UTF_8));
+        return msg(json, NEXT_LSN.addAndGet(0x10));
+    }
+
+    /** The same message at a chosen LSN: this is how a replay is spelled. */
+    private static PgEvent.Message msg(String json, long lsn) {
+        return new PgEvent.Message(true, lsn, "paimon", json.getBytes(StandardCharsets.UTF_8));
     }
 
     @Test @Order(1)
@@ -235,11 +248,21 @@ class SchemaRegistryTest {
             {"v":1,"op":"add_col","col":{"id":5,"name":"note","type":"BIGINT"},"relid":"30001"}"""));
         assertEquals("BIGINT",
             reg.table(r).rowType().getField("note").type().asSQLString());
-        // out of order would collide:
+        // Out of order, the add does not take effect: the name still belongs to the old column,
+        // so there is nothing to add. It is reported and the stored type left alone. (It used to
+        // throw. Throwing here is what wedged the writer on "ADD COLUMN num int" followed by
+        // "ALTER COLUMN num TYPE bigint": the replayed add sees BIGINT and cannot tell a
+        // superseded replay from a real conflict.)
         long r2 = 30002L;
         handler.handle(msg(CREATE_FIXTURE.replace("19228", "30002").replace("cap_t", "reuse2_t")));
-        assertThrows(IllegalStateException.class, () -> handler.handle(msg("""
-            {"v":1,"op":"add_col","col":{"id":5,"name":"note","type":"BIGINT"},"relid":"30002"}""")));
+        List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg("""
+                {"v":1,"op":"add_col","col":{"id":5,"name":"note","type":"BIGINT"},"relid":"30002"}""")));
+        assertEquals(1, warn.size(), warn.toString());
+        assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
+                   warn.get(0).getMessage());
+        assertEquals("STRING", reg.table(r2).rowType().getField("note").type().asSQLString(),
+                     "an out-of-order add must not change the stored type");
     }
 
     @Test @Order(22)
@@ -446,17 +469,30 @@ class SchemaRegistryTest {
                           .filter("extra"::equals).count());
     }
 
-    /** The one case that is NOT a replay: same name, different type. */
+    /**
+     * Same name, different type: reported, never thrown, and the stored type is left alone.
+     *
+     * This test used to assert the opposite, and that assertion was wrong. An add_col whose
+     * column exists with a different type is indistinguishable from a replayed add_col that a
+     * replayed alter_col has already superseded -- "ADD COLUMN num int; ALTER COLUMN num TYPE
+     * bigint" produces exactly this on replay -- so throwing turned an ordinary two-statement
+     * ALTER into a permanent stop. Leaving the stored type alone is also the right outcome in
+     * the replay case: it is the later, correct type.
+     */
     @Test @Order(42)
-    void addColumnThatConflictsOnTypeStillFails() throws Exception {
-        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
+    void addColumnOnAColumnOfAnotherTypeIsReportedNotThrown() throws Exception {
+        long before = reg.table(IDEM).schema().id();
+        List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
             handler.handle(msg(idem("""
                 {"v":1,"op":"add_col","relid":"RELID",
                  "col":{"id":4,"name":"extra","type":"STRING"}}"""))));
-        assertTrue(e.getMessage().contains("extra"), e.getMessage());
-        assertTrue(e.getMessage().contains("not a replay"), e.getMessage());
+        assertEquals(1, warn.size(), warn.toString());
+        assertTrue(warn.get(0).getMessage().contains("extra"), warn.get(0).getMessage());
+        assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
+                   warn.get(0).getMessage());
         assertEquals("BIGINT",
             reg.table(IDEM).rowType().getField("extra").type().asSQLString());
+        assertEquals(before, reg.table(IDEM).schema().id());
     }
 
     @Test @Order(43)
@@ -507,4 +543,192 @@ class SchemaRegistryTest {
         assertThrows(Catalog.TableNotExistException.class,
             () -> catalog.getTable(Identifier.create(cfg.database(), "idem_t")));
     }
+
+    /*
+     * Finding 2, second layer and the actual mechanism: a commit identifier for DDL.
+     *
+     * Per-op state inspection cannot make a SEQUENCE safe. "ADD COLUMN num int" then "ALTER
+     * COLUMN num TYPE bigint" leaves a replayed add_col looking at a BIGINT column, which is
+     * indistinguishable from a real conflict; "ADD COLUMN x" then "RENAME x TO y" leaves a
+     * replayed add_col re-creating a spurious x for the replayed rename to collide with; two
+     * renames in a row fail either way round. Data replay is safe because filterAndCommit
+     * compares a commit IDENTIFIER, and DDL had none.
+     *
+     * Each DDL message carries its own WAL LSN, stable across replays. The LSN of the last
+     * applied one is stored in the Paimon table's own schema options, written in the SAME
+     * alterTable call as the column change, and any message at or below it is skipped. The
+     * invariant: replaying any suffix of an applied sequence converges to the same schema and
+     * never fails.
+     */
+
+    private static final long SEQ = 42000L;
+
+    /** One DDL message of a sequence: its JSON and the LSN the stream gave it. */
+    private record Step(long lsn, String json) {}
+
+    private static List<Step> sequence() {
+        return List.of(
+            new Step(0xA100L, """
+                {"v":1,"op":"add_col","relid":"42000","col":{"id":2,"name":"num","type":"INT"}}"""),
+            new Step(0xA200L, """
+                {"v":1,"op":"alter_col","relid":"42000","id":2,"name":"num","type":"BIGINT"}"""),
+            new Step(0xA300L, """
+                {"v":1,"op":"add_col","relid":"42000","col":{"id":3,"name":"x","type":"STRING"}}"""),
+            new Step(0xA400L, """
+                {"v":1,"op":"rename_col","relid":"42000","id":3,"from":"x","to":"y"}"""),
+            new Step(0xA500L, """
+                {"v":1,"op":"add_col","relid":"42000","col":{"id":4,"name":"extra","type":"STRING"}}"""),
+            new Step(0xA600L, """
+                {"v":1,"op":"rename_col","relid":"42000","id":4,"from":"extra","to":"extra2"}"""),
+            new Step(0xA700L, """
+                {"v":1,"op":"rename_col","relid":"42000","id":4,"from":"extra2","to":"extra3"}"""),
+            new Step(0xA800L, """
+                {"v":1,"op":"drop_col","relid":"42000","name":"y"}"""));
+    }
+
+    private static void apply(List<Step> steps, int from) throws Exception {
+        for (int i = from; i < steps.size(); i++) {
+            handler.handle(msg(steps.get(i).json(), steps.get(i).lsn()));
+        }
+    }
+
+    @Test @Order(49)
+    void theAppliedDdlLsnIsRecordedByTheSameAlterTableAsTheColumnChange() throws Exception {
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":"42000","schema":"public","table":"seq_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}"""));
+        assertEquals(0L, reg.appliedDdlLsn(SEQ), "a fresh table has no applied DDL LSN");
+
+        handler.handle(msg("""
+            {"v":1,"op":"add_col","relid":"42000","col":{"id":9,"name":"probe","type":"INT"}}""",
+            0x9000L));
+        assertTrue(reg.table(SEQ).schema().fieldNames().contains("probe"));
+        assertEquals(0x9000L, reg.appliedDdlLsn(SEQ));
+        assertEquals("36864", reg.table(SEQ).schema().options().get(SchemaRegistry.DDL_LSN_OPTION),
+                     "the LSN lives in the table's own schema options");
+
+        // a lower or equal LSN is a replay and is skipped outright, whatever the schema looks like
+        long ver = reg.table(SEQ).schema().id();
+        handler.handle(msg("""
+            {"v":1,"op":"drop_col","relid":"42000","name":"probe"}""", 0x8FFFL));
+        assertTrue(reg.table(SEQ).schema().fieldNames().contains("probe"),
+                   "a message below the applied LSN must not be applied at all");
+        assertEquals(ver, reg.table(SEQ).schema().id());
+
+        handler.handle(msg("""
+            {"v":1,"op":"drop_col","relid":"42000","name":"probe"}""", 0x9100L));
+        assertFalse(reg.table(SEQ).schema().fieldNames().contains("probe"));
+        assertEquals(0x9100L, reg.appliedDdlLsn(SEQ));
+    }
+
+    @Test @Order(50)
+    void replayingAnySuffixOfAnAppliedSequenceConvergesAndNeverThrows() throws Exception {
+        List<Step> steps = sequence();
+        apply(steps, 0);
+        List<String> want = reg.table(SEQ).schema().fieldNames();
+        long version = reg.table(SEQ).schema().id();
+        assertEquals(List.of("id", "_seq", "_op_seq", "num", "extra3"), want,
+                     "added columns append after the metadata columns; RowBuilder maps by name");
+        assertEquals("BIGINT", reg.table(SEQ).rowType().getField("num").type().asSQLString());
+
+        for (int from = 0; from < steps.size(); from++) {
+            final int f = from;
+            assertDoesNotThrow(() -> apply(steps, f),
+                "replaying the suffix from step " + f + " must not throw");
+            assertEquals(want, reg.table(SEQ).schema().fieldNames(),
+                         "suffix from step " + f + " must converge to the same schema");
+            assertEquals(version, reg.table(SEQ).schema().id(),
+                         "a replayed suffix must not alter the schema at all");
+        }
+    }
+
+    /**
+     * The partial case a crash actually produces: the first op of a sequence was applied and
+     * recorded, the second never ran. Replaying the whole sequence must skip the first and apply
+     * the second.
+     */
+    @Test @Order(51)
+    void aPartiallyAppliedSequenceResumesAtTheRightStep() throws Exception {
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":"42001","schema":"public","table":"part_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}"""));
+        String add = """
+            {"v":1,"op":"add_col","relid":"42001","col":{"id":2,"name":"num","type":"INT"}}""";
+        String alter = """
+            {"v":1,"op":"alter_col","relid":"42001","id":2,"name":"num","type":"BIGINT"}""";
+
+        handler.handle(msg(add, 0xB100L));                 // applied, then the writer died
+        assertEquals("INT", reg.table(42001L).rowType().getField("num").type().asSQLString());
+
+        assertDoesNotThrow(() -> {                          // the replay covers both
+            handler.handle(msg(add, 0xB100L));
+            handler.handle(msg(alter, 0xB200L));
+        });
+        assertEquals("BIGINT", reg.table(42001L).rowType().getField("num").type().asSQLString());
+        assertEquals(0xB200L, reg.appliedDdlLsn(42001L));
+    }
+
+    /** The review's three live reproductions, each a permanent wedge before the LSN gate. */
+    @Test @Order(52)
+    void theThreeReportedSequencesSurviveAReplay() throws Exception {
+        // 1. ADD COLUMN num int; ALTER COLUMN num TYPE bigint
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":"42002","schema":"public","table":"wedge1_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}"""));
+        String a1 = """
+            {"v":1,"op":"add_col","relid":"42002","col":{"id":2,"name":"num","type":"INT"}}""";
+        String a2 = """
+            {"v":1,"op":"alter_col","relid":"42002","id":2,"name":"num","type":"BIGINT"}""";
+        handler.handle(msg(a1, 0xC100L));
+        handler.handle(msg(a2, 0xC200L));
+        assertDoesNotThrow(() -> {
+            handler.handle(msg(a1, 0xC100L));
+            handler.handle(msg(a2, 0xC200L));
+        });
+        assertEquals("BIGINT", reg.table(42002L).rowType().getField("num").type().asSQLString());
+        assertEquals(List.of("id", "_seq", "_op_seq", "num"),
+                     reg.table(42002L).schema().fieldNames());
+
+        // 2. ADD COLUMN x text; RENAME COLUMN x TO y
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":"42003","schema":"public","table":"wedge2_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}"""));
+        String b1 = """
+            {"v":1,"op":"add_col","relid":"42003","col":{"id":2,"name":"x","type":"STRING"}}""";
+        String b2 = """
+            {"v":1,"op":"rename_col","relid":"42003","id":2,"from":"x","to":"y"}""";
+        handler.handle(msg(b1, 0xD100L));
+        handler.handle(msg(b2, 0xD200L));
+        assertDoesNotThrow(() -> {
+            handler.handle(msg(b1, 0xD100L));
+            handler.handle(msg(b2, 0xD200L));
+        });
+        assertEquals(List.of("id", "_seq", "_op_seq", "y"),
+                     reg.table(42003L).schema().fieldNames(),
+                     "no spurious 'x' may be re-created by the replayed add");
+
+        // 3. RENAME extra -> extra2; RENAME extra2 -> extra3
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":"42004","schema":"public","table":"wedge3_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                 {"id":2,"name":"extra","type":"STRING"}],
+             "options":{"changelog-producer":"input"}}"""));
+        String c1 = """
+            {"v":1,"op":"rename_col","relid":"42004","id":2,"from":"extra","to":"extra2"}""";
+        String c2 = """
+            {"v":1,"op":"rename_col","relid":"42004","id":2,"from":"extra2","to":"extra3"}""";
+        handler.handle(msg(c1, 0xE100L));
+        handler.handle(msg(c2, 0xE200L));
+        assertDoesNotThrow(() -> {
+            handler.handle(msg(c1, 0xE100L));
+            handler.handle(msg(c2, 0xE200L));
+        });
+        assertEquals(List.of("id", "extra3", "_seq", "_op_seq"),
+                     reg.table(42004L).schema().fieldNames());
+    }
+
 }
