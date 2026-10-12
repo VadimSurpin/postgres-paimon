@@ -130,7 +130,6 @@ DECLARE
     v_cols   jsonb;
     v_kind   "char";
     v_has_rows boolean;
-    v_other_nsp text;
 BEGIN
     IF replica_identity <> 'full' THEN
         RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
@@ -169,18 +168,6 @@ BEGIN
                WHERE conrelid = v_relid AND contype = 'p' AND condeferrable) THEN
         RAISE EXCEPTION 'paimon_slot: the primary key of % must not be DEFERRABLE', rel
               USING HINT = 'a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7';
-    END IF;
-
-    -- The writer's Paimon table identity is (database, table name) and ignores the
-    -- PostgreSQL schema, so same-named tables in different schemas would interleave
-    -- into one Paimon table.  Compare by name only, against a DIFFERENT relid, so
-    -- re-registering after remove_table() is unaffected.
-    SELECT schema_name INTO v_other_nsp FROM paimon.table_registry
-     WHERE table_name = v_name AND relid <> v_relid LIMIT 1;
-    IF FOUND THEN
-        RAISE EXCEPTION 'paimon_slot: table name "%" is already replicated from schema "%"',
-                        v_name, v_other_nsp
-              USING HINT = 'the Paimon table identity does not include the PostgreSQL schema, so two same-named tables would interleave into one Paimon table. Rename one, or replicate only one of them. See design spec section 4.';
     END IF;
 
     v_cols := paimon.table_cols(v_relid);

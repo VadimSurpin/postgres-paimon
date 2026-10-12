@@ -721,11 +721,14 @@ startup cost is one query, independent of how much WAL the slot is holding.
   tracked table. Refusing loudly is deliberate — the alternative is a table whose Paimon copy
   silently begins mid-history. The recourse is to stop the writer, drop and recreate the slot, and
   let the first start backfill every registered table together.
-- **Same-named tables in different PostgreSQL schemas cannot both be replicated.** The writer
-  derives the Paimon identity from the configured database and the table name only, so
-  `public.f` and `s2.f` would interleave into one Paimon table; `add_table()` refuses the second
-  registration. Mapping each PostgreSQL schema to its own Paimon database is the proper fix,
-  deliberately deferred because it changes the warehouse layout away from main's.
+- **Each PostgreSQL schema becomes its own Paimon database**, so a table lands at
+  `<warehouse>/<schema>.db/<table>` rather than in one configured database. Main puts every table
+  in `default.db`, so this is a deliberate layout difference from it, and a warehouse written by
+  an earlier build of this branch is NOT readable by this one. It is what lets `public.f` and
+  `s2.f` both be replicated: with the schema dropped from the identity they resolved to one Paimon
+  table and interleaved into it, two tables' rows merging on a shared primary key. There is
+  consequently no Paimon database setting; `PGPAIMON_DATABASE` was removed rather than left
+  naming nothing.
 - A crash after some tables are marked backfilled but before others leaves a state that needs
   manual re-registration, for the same reason.
 
