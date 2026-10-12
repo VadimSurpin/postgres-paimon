@@ -996,6 +996,89 @@ SELECT paimon.peek_messages() - 'relid';
 ----------
 (0 rows)
 
+-- numeric must have explicit precision <= 38
+CREATE TABLE nm_plain (id int PRIMARY KEY, amount numeric);
+CREATE TABLE nm_big (id int PRIMARY KEY, amount numeric(50, 2));
+CREATE TABLE nm_dec (id int PRIMARY KEY, amount decimal);
+CREATE TABLE nm_dec2 (id int PRIMARY KEY, amount dec);
+CREATE TABLE nm_decp (id int PRIMARY KEY, amount decimal(40, 2));
+CREATE TABLE nm_ok1 (id int PRIMARY KEY, amount numeric(10, 2));
+CREATE TABLE nm_ok2 (id int PRIMARY KEY, amount numeric(38, 18));
+SELECT paimon.add_table('nm_plain'::regclass);    -- expect ERROR
+ERROR:  paimon_slot: column "amount" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT paimon.add_table('nm_big'::regclass);      -- expect ERROR
+ERROR:  paimon_slot: column "amount" is numeric(50) but Paimon DECIMAL supports at most 38 digits
+HINT:  Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT paimon.add_table('nm_dec'::regclass);      -- expect ERROR (alias)
+ERROR:  paimon_slot: column "amount" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT paimon.add_table('nm_dec2'::regclass);     -- expect ERROR (alias)
+ERROR:  paimon_slot: column "amount" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT paimon.add_table('nm_decp'::regclass);     -- expect ERROR (alias, p > 38)
+ERROR:  paimon_slot: column "amount" is numeric(40) but Paimon DECIMAL supports at most 38 digits
+HINT:  Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT paimon.add_table('nm_ok1'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.add_table('nm_ok2'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT j->>'table' AS tbl, j->'cols'->1->>'type' AS amount_type
+FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 1;
+  tbl   |   amount_type   
+--------+-----------------
+ nm_ok1 | DECIMAL(10, 2)
+ nm_ok2 | DECIMAL(38, 18)
+(2 rows)
+
+ALTER TABLE nm_ok1 ADD COLUMN bad numeric;        -- expect ERROR
+ERROR:  paimon_slot: column "bad" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+ALTER TABLE nm_ok1 ADD COLUMN bad2 numeric(39);   -- expect ERROR
+ERROR:  paimon_slot: column "bad2" is numeric(39) but Paimon DECIMAL supports at most 38 digits
+HINT:  Use numeric(p,s) with p <= 38. See design spec section 5.
+ALTER TABLE nm_ok1 ALTER COLUMN amount TYPE numeric;   -- expect ERROR
+ERROR:  paimon_slot: column "amount" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+ALTER TABLE nm_ok1 DROP COLUMN amount, ADD COLUMN bad3 decimal;   -- expect ERROR
+ERROR:  paimon_slot: column "bad3" is numeric without precision
+HINT:  Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.
+SELECT count(*) FROM pg_attribute
+WHERE attrelid = 'nm_ok1'::regclass AND attname LIKE 'bad%';
+ count 
+-------
+     0
+(1 row)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'nm_ok1'::regclass AND attname = 'amount';
+  format_type  
+---------------
+ numeric(10,2)
+(1 row)
+
+ALTER TABLE nm_ok1 ADD COLUMN good numeric(12, 3);
+SELECT paimon.peek_messages() - 'relid';
+                                       ?column?                                        
+---------------------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 3, "name": "good", "type": "DECIMAL(12, 3)"}}
+(1 row)
+
+DROP TABLE nm_plain, nm_big, nm_dec, nm_dec2, nm_decp, nm_ok1, nm_ok2;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     2
+(1 row)
+
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
 --------------------------

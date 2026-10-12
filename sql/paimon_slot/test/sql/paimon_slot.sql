@@ -338,4 +338,34 @@ DROP TABLE key2_t;
 SELECT paimon.peek_messages() - 'relid';
 DROP TABLE key_plain;
 SELECT paimon.peek_messages() - 'relid';
+-- numeric must have explicit precision <= 38
+CREATE TABLE nm_plain (id int PRIMARY KEY, amount numeric);
+CREATE TABLE nm_big (id int PRIMARY KEY, amount numeric(50, 2));
+CREATE TABLE nm_dec (id int PRIMARY KEY, amount decimal);
+CREATE TABLE nm_dec2 (id int PRIMARY KEY, amount dec);
+CREATE TABLE nm_decp (id int PRIMARY KEY, amount decimal(40, 2));
+CREATE TABLE nm_ok1 (id int PRIMARY KEY, amount numeric(10, 2));
+CREATE TABLE nm_ok2 (id int PRIMARY KEY, amount numeric(38, 18));
+SELECT paimon.add_table('nm_plain'::regclass);    -- expect ERROR
+SELECT paimon.add_table('nm_big'::regclass);      -- expect ERROR
+SELECT paimon.add_table('nm_dec'::regclass);      -- expect ERROR (alias)
+SELECT paimon.add_table('nm_dec2'::regclass);     -- expect ERROR (alias)
+SELECT paimon.add_table('nm_decp'::regclass);     -- expect ERROR (alias, p > 38)
+SELECT paimon.add_table('nm_ok1'::regclass);
+SELECT paimon.add_table('nm_ok2'::regclass);
+SELECT j->>'table' AS tbl, j->'cols'->1->>'type' AS amount_type
+FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 1;
+ALTER TABLE nm_ok1 ADD COLUMN bad numeric;        -- expect ERROR
+ALTER TABLE nm_ok1 ADD COLUMN bad2 numeric(39);   -- expect ERROR
+ALTER TABLE nm_ok1 ALTER COLUMN amount TYPE numeric;   -- expect ERROR
+ALTER TABLE nm_ok1 DROP COLUMN amount, ADD COLUMN bad3 decimal;   -- expect ERROR
+SELECT count(*) FROM pg_attribute
+WHERE attrelid = 'nm_ok1'::regclass AND attname LIKE 'bad%';
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'nm_ok1'::regclass AND attname = 'amount';
+ALTER TABLE nm_ok1 ADD COLUMN good numeric(12, 3);
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE nm_plain, nm_big, nm_dec, nm_dec2, nm_decp, nm_ok1, nm_ok2;
+SELECT count(*) FROM paimon.peek_messages();
+
 SELECT pg_drop_replication_slot('paimon_test');

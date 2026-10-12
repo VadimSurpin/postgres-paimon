@@ -85,6 +85,39 @@ LANGUAGE sql AS $$
     SELECT pg_logical_emit_message(true, 'paimon', payload::text);
 $$;
 
+/*
+ * numeric guardrail.  numeric(p,s) with p <= 38 maps exactly to DECIMAL(p,s), so
+ * no value it holds can be unrepresentable.  Plain numeric maps to DECIMAL(38,18)
+ * but PostgreSQL holds far more; one such value would be a record the writer
+ * refuses forever, stopping replication.  p > 38 exceeds Paimon's maximum.
+ * The precision is read from pg_type_to_paimon's output so the typmod
+ * arithmetic lives in one place.
+ */
+CREATE FUNCTION paimon.reject_unsafe_numeric(v_relid oid, v_attnum int) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    a    pg_attribute;
+    prec int;
+BEGIN
+    SELECT * INTO a FROM pg_attribute WHERE attrelid = v_relid AND attnum = v_attnum;
+    IF NOT FOUND OR a.atttypid <> 1700 THEN
+        RETURN;
+    END IF;
+
+    IF a.atttypmod <= 4 THEN
+        RAISE EXCEPTION 'paimon_slot: column "%" is numeric without precision', a.attname
+              USING HINT = 'Paimon maps it to DECIMAL(38, 18), which cannot hold every value PostgreSQL allows; a value outside that range would stop replication permanently. Use numeric(p,s) with p <= 38. See design spec section 5.';
+    END IF;
+
+    prec := substring(paimon.pg_type_to_paimon(a.atttypid, a.atttypmod, false)
+                      from 'DECIMAL\((\d+),')::int;
+    IF prec > 38 THEN
+        RAISE EXCEPTION 'paimon_slot: column "%" is numeric(%) but Paimon DECIMAL supports at most 38 digits',
+                        a.attname, prec
+              USING HINT = 'Use numeric(p,s) with p <= 38. See design spec section 5.';
+    END IF;
+END $$;
+
 CREATE FUNCTION paimon.add_table(rel regclass,
                                  replica_identity text DEFAULT 'full',
                                  changelog_producer text DEFAULT 'input')
@@ -139,6 +172,7 @@ BEGIN
 
     v_cols := paimon.table_cols(v_relid);
     PERFORM paimon.reject_reserved_name(c->>'name') FROM jsonb_array_elements(v_cols) c;
+    PERFORM paimon.reject_unsafe_numeric(v_relid, (c->>'id')::int) FROM jsonb_array_elements(v_cols) c;
 
     -- ORDER IS LOAD-BEARING: do both ALTERs BEFORE inserting the registry row.
     -- The ddl_command_end event trigger decides what to emit by looking the
@@ -293,6 +327,10 @@ BEGIN
     LOOP
         SELECT x INTO o FROM jsonb_array_elements(reg.cols) x
          WHERE (x->>'id') = (c->>'id');
+
+        IF o IS NULL OR (o->>'type') <> (c->>'type') THEN
+            PERFORM paimon.reject_unsafe_numeric(v_relid, (c->>'id')::int);
+        END IF;
 
         IF o IS NULL THEN
             /* added column */
