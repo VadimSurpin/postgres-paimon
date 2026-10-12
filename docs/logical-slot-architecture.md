@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 230 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 235 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -214,8 +214,19 @@ it, which is what an ordinary `RENAME COLUMN` performed while the writer was sto
 Only that one direction is reconciled, and only then. A column present in both with a different
 type, a different primary key, or a column Paimon has that the registry does not, stays a warning
 and nothing more: neither side can be shown to be right, and guessing would be worse than saying
-so. A lost **rename** therefore leaves the pre-rename column behind as a reported orphan full of
-nulls alongside the correctly reloaded new one; drop it by hand if it bothers you.
+so.
+
+A lost **rename** therefore leaves the pre-rename column behind, beside the correctly reloaded new
+one, and that deserves more than a shrug: **it reads NULL for every row and every `SELECT *`
+downstream will return it.** It gets its own warning at every start —
+
+```
+WARNING: table Identifier{database='default', object='o'} has a column 'note' that paimon.table_registry does not: it is NOT maintained, reads NULL for every row, and any SELECT * will return it. ... Check it holds nothing you need, then remove it from a compute engine: ALTER TABLE `default`.`o` DROP COLUMN `note`
+```
+
+The writer does not drop it, because the registry not naming a column is not proof that no reader
+wants it — a column could predate registration, or be maintained by something else. Check it holds
+nothing you need and run the `ALTER TABLE` the warning prints from Spark or Flink.
 
 The writer prints this same recipe when it refuses to start (section 5). A table renamed since
 registration needs nothing extra: the reload resolves the source table by its OID, so it copies the
@@ -335,6 +346,10 @@ on retry, but a replay that can never succeed stops the writer until somebody in
   identifier that makes a replayed *data* transaction a no-op — and it is written in the same
   atomic schema change as the column alteration itself. Do not edit or remove it: a lower value
   replays applied DDL, and a higher one skips DDL that was never applied.
+  It also covers `create` and `drop_table`, not only the column operations: a Paimon table is
+  identified by name, so a PostgreSQL table dropped and recreated under the same name resolves to
+  the same Paimon table, and a `drop_table` whose LSN is at or below what the table records is
+  refused as stale rather than purging a table it was never about.
   **It carries no cluster or timeline identity**, which matters in exactly one situation: point a
   warehouse at a *different* PostgreSQL server, or at one restored by PITR or re-`initdb`'d, and
   its LSNs start again from a lower point, so DDL below the recorded value is skipped as a replay
@@ -633,7 +648,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 230 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 235 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```

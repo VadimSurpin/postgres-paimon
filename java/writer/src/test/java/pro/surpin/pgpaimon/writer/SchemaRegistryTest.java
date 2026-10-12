@@ -248,19 +248,18 @@ class SchemaRegistryTest {
             {"v":1,"op":"add_col","col":{"id":5,"name":"note","type":"BIGINT"},"relid":"30001"}"""));
         assertEquals("BIGINT",
             reg.table(r).rowType().getField("note").type().asSQLString());
-        // Out of order, the add does not take effect: the name still belongs to the old column,
-        // so there is nothing to add. It is reported and the stored type left alone. (It used to
-        // throw. Throwing here is what wedged the writer on "ADD COLUMN num int" followed by
-        // "ALTER COLUMN num TYPE bigint": the replayed add sees BIGINT and cannot tell a
-        // superseded replay from a real conflict.)
+        // Out of order the add cannot take effect: the name still belongs to the old column, so
+        // there is nothing to add. What happens then depends on whether the table has a recorded
+        // DDL LSN. This one does -- its create recorded one -- so a replay was already filtered
+        // by the gate and reaching the conflict means genuine drift, which is loud. The stored
+        // type is left alone either way.
         long r2 = 30002L;
         handler.handle(msg(CREATE_FIXTURE.replace("19228", "30002").replace("cap_t", "reuse2_t")));
-        List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
+        assertTrue(reg.appliedDdlLsn(r2) != 0);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
             handler.handle(msg("""
                 {"v":1,"op":"add_col","col":{"id":5,"name":"note","type":"BIGINT"},"relid":"30002"}""")));
-        assertEquals(1, warn.size(), warn.toString());
-        assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
-                   warn.get(0).getMessage());
+        assertTrue(e.getMessage().contains("genuinely disagree"), e.getMessage());
         assertEquals("STRING", reg.table(r2).rowType().getField("note").type().asSQLString(),
                      "an out-of-order add must not change the stored type");
     }
@@ -485,12 +484,19 @@ class SchemaRegistryTest {
      */
 
     private static final long IDEM = 41000L;
+    /** Explicit ascending LSNs for the IDEM block, so a replay can reuse one exactly. */
+    private static final long IDEM_LSN = 0x50000L;
 
     private static String idem(String json) {
         return json.replace("RELID", String.valueOf(IDEM));
     }
 
-    /** Also the "create" case: a second create must not bump the schema version. */
+    /**
+     * Also the "create" case: a replayed create must not bump the schema version. A replay
+     * carries the SAME LSN the message had, so that is how it is spelled here; a create also
+     * records that LSN as the table's applied-DDL identifier, which is what lets a stale
+     * drop_table be recognised later.
+     */
     @Test @Order(40)
     void replayedCreateIsANoOp() throws Exception {
         String create = idem("""
@@ -499,21 +505,27 @@ class SchemaRegistryTest {
                                  {"id":2,"name":"keep","type":"STRING"},
                                  {"id":3,"name":"n","type":"INT"}],
              "options":{"changelog-producer":"input"}}""");
-        handler.handle(msg(create));
+        long createLsn = IDEM_LSN;
+        handler.handle(msg(create, createLsn));
         long ver = reg.table(IDEM).schema().id();
-        handler.handle(msg(create));
+        assertEquals(createLsn, reg.appliedDdlLsn(IDEM),
+                     "a create records its own LSN, atomically with the table's creation");
+
+        handler.handle(msg(create, createLsn));
         assertEquals(ver, reg.table(IDEM).schema().id());
+        assertEquals(createLsn, reg.appliedDdlLsn(IDEM));
     }
 
     @Test @Order(41)
     void replayedAddColumnIsANoOp() throws Exception {
         String add = idem("""
             {"v":1,"op":"add_col","relid":"RELID","col":{"id":4,"name":"extra","type":"BIGINT"}}""");
-        handler.handle(msg(add));
+        handler.handle(msg(add, IDEM_LSN + 0x100));
         long ver = reg.table(IDEM).schema().id();
         assertTrue(reg.table(IDEM).schema().fieldNames().contains("extra"));
 
-        assertDoesNotThrow(() -> handler.handle(msg(add)), "replayed add_col must not throw");
+        assertDoesNotThrow(() -> handler.handle(msg(add, IDEM_LSN + 0x100)),
+                           "replayed add_col must not throw");
         assertEquals(ver, reg.table(IDEM).schema().id(), "replay must not alter the schema");
         assertEquals(1, reg.table(IDEM).schema().fieldNames().stream()
                           .filter("extra"::equals).count());
@@ -533,12 +545,12 @@ class SchemaRegistryTest {
      */
     @Test @Order(42)
     void addColumnOnAnotherTypeIsToleratedOnlyWithoutARecordedLsn() throws Exception {
-        // a table whose columns came from the create message, so it has no recorded DDL LSN
-        handler.handle(msg("""
-            {"v":1,"op":"create","relid":41100,"schema":"public","table":"nolsn_t",
-             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
-                                 {"id":2,"name":"n","type":"BIGINT"}],
-             "options":{"changelog-producer":"input"}}"""));
+        // A table with no recorded DDL LSN: one whose DDL predates the identifier mechanism.
+        // The startup bootstrap replays registry rows rather than messages and so has no LSN to
+        // record, which is exactly how such a table arises after an upgrade.
+        reg.bootstrapTable(41100L, "public", "nolsn_t", List.of("id"),
+            List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
+                    new DdlMessage.Col(2, "n", "BIGINT")), "input", false);
         assertEquals(0L, reg.appliedDdlLsn(41100L));
         long before = reg.table(41100L).schema().id();
 
@@ -568,7 +580,7 @@ class SchemaRegistryTest {
         IllegalStateException e = assertThrows(IllegalStateException.class, () ->
             handler.handle(msg(idem("""
                 {"v":1,"op":"add_col","relid":"RELID",
-                 "col":{"id":4,"name":"extra","type":"STRING"}}"""))));
+                 "col":{"id":4,"name":"extra","type":"STRING"}}"""), IDEM_LSN + 0x180)));
         assertTrue(e.getMessage().contains("not a replay"), e.getMessage());
         assertTrue(e.getMessage().contains("genuinely disagree"), e.getMessage());
         assertTrue(e.getMessage().contains("re-register"), e.getMessage());
@@ -580,10 +592,9 @@ class SchemaRegistryTest {
     /** The same split for alter_col on a column Paimon does not have. */
     @Test @Order(42)
     void alterColumnOnAMissingColumnIsToleratedOnlyWithoutARecordedLsn() throws Exception {
-        handler.handle(msg("""
-            {"v":1,"op":"create","relid":41101,"schema":"public","table":"nolsn2_t",
-             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
-             "options":{"changelog-producer":"input"}}"""));
+        reg.bootstrapTable(41101L, "public", "nolsn2_t", List.of("id"),
+            List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")), "input", false);
+        assertEquals(0L, reg.appliedDdlLsn(41101L));
         List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
             handler.handle(msg("""
                 {"v":1,"op":"alter_col","relid":41101,"id":9,"name":"ghost","type":"INT"}""")));
@@ -605,11 +616,11 @@ class SchemaRegistryTest {
     void replayedRenameColumnIsANoOp() throws Exception {
         String rename = idem("""
             {"v":1,"op":"rename_col","relid":"RELID","id":4,"from":"extra","to":"renamed"}""");
-        handler.handle(msg(rename));
+        handler.handle(msg(rename, IDEM_LSN + 0x200));
         long ver = reg.table(IDEM).schema().id();
         assertTrue(reg.table(IDEM).schema().fieldNames().contains("renamed"));
 
-        assertDoesNotThrow(() -> handler.handle(msg(rename)),
+        assertDoesNotThrow(() -> handler.handle(msg(rename, IDEM_LSN + 0x200)),
                            "replayed rename_col must not throw");
         assertEquals(ver, reg.table(IDEM).schema().id());
         assertFalse(reg.table(IDEM).schema().fieldNames().contains("extra"));
@@ -619,11 +630,11 @@ class SchemaRegistryTest {
     void replayedAlterColumnIsANoOp() throws Exception {
         String alter = idem("""
             {"v":1,"op":"alter_col","relid":"RELID","id":3,"name":"n","type":"BIGINT"}""");
-        handler.handle(msg(alter));
+        handler.handle(msg(alter, IDEM_LSN + 0x300));
         long ver = reg.table(IDEM).schema().id();
         assertEquals("BIGINT", reg.table(IDEM).rowType().getField("n").type().asSQLString());
 
-        assertDoesNotThrow(() -> handler.handle(msg(alter)));
+        assertDoesNotThrow(() -> handler.handle(msg(alter, IDEM_LSN + 0x300)));
         assertEquals(ver, reg.table(IDEM).schema().id());
     }
 
@@ -631,11 +642,12 @@ class SchemaRegistryTest {
     void replayedDropColumnIsANoOp() throws Exception {
         String drop = idem("""
             {"v":1,"op":"drop_col","relid":"RELID","name":"renamed"}""");
-        handler.handle(msg(drop));
+        handler.handle(msg(drop, IDEM_LSN + 0x400));
         long ver = reg.table(IDEM).schema().id();
         assertFalse(reg.table(IDEM).schema().fieldNames().contains("renamed"));
 
-        assertDoesNotThrow(() -> handler.handle(msg(drop)), "replayed drop_col must not throw");
+        assertDoesNotThrow(() -> handler.handle(msg(drop, IDEM_LSN + 0x400)),
+                           "replayed drop_col must not throw");
         assertEquals(ver, reg.table(IDEM).schema().id());
     }
 
@@ -643,9 +655,10 @@ class SchemaRegistryTest {
     void replayedDropTableIsANoOp() throws Exception {
         String drop = idem("""
             {"v":1,"op":"drop_table","relid":"RELID","schema":"public","table":"idem_t"}""");
-        handler.handle(msg(drop));
+        handler.handle(msg(drop, IDEM_LSN + 0x500));
         assertFalse(reg.tracked(IDEM));
-        assertDoesNotThrow(() -> handler.handle(msg(drop)), "replayed drop_table must not throw");
+        assertDoesNotThrow(() -> handler.handle(msg(drop, IDEM_LSN + 0x500)),
+                           "replayed drop_table must not throw");
         assertThrows(Catalog.TableNotExistException.class,
             () -> catalog.getTable(Identifier.create(cfg.database(), "idem_t")));
     }
@@ -703,8 +716,9 @@ class SchemaRegistryTest {
         handler.handle(msg("""
             {"v":1,"op":"create","relid":"42000","schema":"public","table":"seq_t",
              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
-             "options":{"changelog-producer":"input"}}"""));
-        assertEquals(0L, reg.appliedDdlLsn(SEQ), "a fresh table has no applied DDL LSN");
+             "options":{"changelog-producer":"input"}}""", 0x8000L));
+        assertEquals(0x8000L, reg.appliedDdlLsn(SEQ),
+                     "a create records its own LSN, so every table has one from the start");
 
         handler.handle(msg("""
             {"v":1,"op":"add_col","relid":"42000","col":{"id":9,"name":"probe","type":"INT"}}""",
@@ -835,6 +849,127 @@ class SchemaRegistryTest {
         });
         assertEquals(List.of("id", "extra3", "_seq", "_op_seq"),
                      reg.table(42004L).schema().fieldNames());
+    }
+
+
+    /*
+     * drop_table and create inside the DDL commit identifier.
+     *
+     * A Paimon table is identified by NAME, so a PostgreSQL table dropped and recreated under
+     * the same name resolves to the same Paimon table. If a drop_table message replays after
+     * that recreation, applying it would purge the new table's rows and the replayed create
+     * would rebuild it empty. The gate: a create records its own LSN on the table it creates,
+     * and a drop whose LSN is at or below what the table records is stale and is refused.
+     */
+
+    @Test @Order(60)
+    void aDropWhoseTableWasCreatedAfterItIsRefusedAsStale() throws Exception {
+        // the original table, dropped at LSN A
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":43000,"schema":"public","table":"recycled",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}""", 0x60000L));
+        String dropA = """
+            {"v":1,"op":"drop_table","relid":43000,"schema":"public","table":"recycled"}""";
+        handler.handle(msg(dropA, 0x60100L));
+        assertFalse(reg.tracked(43000L));
+
+        // recreated under the SAME name at a LATER LSN, as a new relid
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":43001,"schema":"public","table":"recycled",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}""", 0x60200L));
+        assertEquals(0x60200L, reg.appliedDdlLsn(43001L));
+        long ver = reg.table(43001L).schema().id();
+
+        // now the stale drop replays. It cannot arrive under the OLD relid, which is untracked,
+        // so this is the case that matters: the recreated table reusing the dropped OID.
+        String dropReplay = """
+            {"v":1,"op":"drop_table","relid":43001,"schema":"public","table":"recycled"}""";
+        List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg(dropReplay, 0x60100L)));
+        assertEquals(1, warn.size(), warn.toString());
+        assertTrue(warn.get(0).getMessage().contains("STALE"), warn.get(0).getMessage());
+        assertTrue(warn.get(0).getMessage().contains("has NOT been applied"),
+                   warn.get(0).getMessage());
+        assertTrue(reg.tracked(43001L), "the relation must stay tracked");
+        assertDoesNotThrow(() -> catalog.getTable(
+            Identifier.create(cfg.database(), "recycled")), "the table must still be there");
+        assertEquals(ver, reg.table(43001L).schema().id());
+    }
+
+    /** And the gate must not make a real drop unreachable. */
+    @Test @Order(61)
+    void aGenuineDropStillDropsWithAnIdentifierRecorded() throws Exception {
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":43002,"schema":"public","table":"goner",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}""", 0x61000L));
+        assertEquals(0x61000L, reg.appliedDdlLsn(43002L));
+
+        // a drop ABOVE the recorded LSN is the ordinary case and must take effect
+        handler.handle(msg("""
+            {"v":1,"op":"drop_table","relid":43002,"schema":"public","table":"goner"}""",
+            0x61100L));
+        assertFalse(reg.tracked(43002L));
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create(cfg.database(), "goner")));
+    }
+
+    /** A table with no recorded identifier keeps the old behaviour: nothing to compare. */
+    @Test @Order(62)
+    void aDropOnATableWithNoRecordedLsnStillDrops() throws Exception {
+        reg.bootstrapTable(43003L, "public", "oldstyle", List.of("id"),
+            List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")), "input", false);
+        assertEquals(0L, reg.appliedDdlLsn(43003L));
+        // even a LOW drop LSN applies, because refusing on no evidence would make drops
+        // unreachable for every table that predates the identifier
+        handler.handle(msg("""
+            {"v":1,"op":"drop_table","relid":43003,"schema":"public","table":"oldstyle"}""", 1L));
+        assertFalse(reg.tracked(43003L));
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create(cfg.database(), "oldstyle")));
+    }
+
+    /**
+     * The orphan column left by a lost rename gets its own WARNING, not a clause in a combined
+     * line: it reads NULL for every row and every SELECT * downstream returns it.
+     */
+    @Test @Order(63)
+    void anOrphanColumnIsWarnedAboutOnItsOwn() throws Exception {
+        reg.bootstrapTable(43004L, "public", "orphan_t", List.of("id"),
+            List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
+                    new DdlMessage.Col(2, "before", "STRING")), "input", false);
+        // the registry has renamed it; Paimon still has the old name beside the new one
+        List<LogRecord> logs = captureWarnings(SchemaRegistry.class, () ->
+            reg.bootstrapTable(43004L, "public", "orphan_t", List.of("id"),
+                List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
+                        new DdlMessage.Col(2, "after", "STRING")), "input", true));
+        List<String> orphan = logs.stream().map(LogRecord::getMessage)
+            .filter(m -> m.contains("'before'")).toList();
+        assertEquals(1, orphan.size(), logs.toString());
+        String m = orphan.get(0);
+        assertTrue(m.contains("NULL for every row"), m);
+        assertTrue(m.contains("SELECT *"), m);
+        assertTrue(m.contains("DROP COLUMN `before`"), m);
+        assertTrue(m.contains("not maintained") || m.contains("NOT maintained"), m);
+    }
+
+    /**
+     * The seam the "refuse before touching the warehouse" ordering rests on: register() must
+     * establish enough for the startup decision to be taken -- the relid is tracked, and its
+     * committed offsets can be asked for -- while creating nothing.
+     */
+    @Test @Order(64)
+    void registerEstablishesTheMappingWithoutTouchingTheWarehouse() throws Exception {
+        reg.register(44000L, "never_created");
+        assertTrue(reg.tracked(44000L), "the decision needs the mapping");
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create(cfg.database(), "never_created")),
+            "and must not have created anything");
+        assertFalse(new OffsetStore(reg, cfg).hasCommitted(44000L),
+                    "nothing is committed to a table that does not exist, and asking must not"
+                    + " throw -- startup asks before creating");
     }
 
 }
