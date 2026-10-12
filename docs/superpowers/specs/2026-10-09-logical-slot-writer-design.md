@@ -602,18 +602,31 @@ The replay is faithful, so a replay that can never succeed repeats for ever. Thr
 defects landed in that blind spot: non-idempotent DDL replay, two ALTERs Paimon refuses after
 PostgreSQL has committed them, and a value Paimon cannot represent.
 
-The first two are closed, and closed in the only place they can be — by making the operation
-replay-safe (`SchemaRegistry`, every DDL op is now a no-op when already applied) or by refusing it
-before it reaches WAL (`paimon_slot`'s guardrails on a key-column type change and on
-nullable → NOT NULL). That is the general rule this section should be read with: **anything the
-write path cannot retry must be impossible to enqueue.**
+The first two are closed, and closed in the only place they can be — by giving the operation a
+commit identifier so a replay is skipped, or by refusing it before it reaches WAL (`paimon_slot`'s
+guardrails on a key-column type change and on nullable → NOT NULL). That is the general rule this
+section should be read with: **anything the write path cannot retry must be impossible to
+enqueue.**
 
-The third cannot be closed that way. `INSERT INTO v VALUES (2, 'infinity', 2.5)` into a `timestamp`
-column is accepted by every guardrail — the column *type* maps, only that one *value* does not —
-and Paimon has no representation for it. Reject-never-clamp is still right; what was never
-considered is that the rejection is unbounded, so one ordinary INSERT stops replication for the
-whole database, permanently, and still does after the row is deleted, because the WAL record is in
-the slot. The same holds for `numeric` beyond `DECIMAL(38, 18)` and for BC dates.
+On the first of those: *"every DDL op is a no-op when already applied"* was claimed here and was
+**false**. Per-op state inspection makes a single repeated op safe and cannot make a *sequence*
+safe — `ADD COLUMN num int` then `ALTER COLUMN num TYPE bigint` leaves a replayed `add_col` looking
+at a BIGINT column, indistinguishable from a genuine conflict, and `ADD COLUMN x` then
+`RENAME x TO y` leaves a replayed `add_col` re-creating a spurious `x` for the replayed rename to
+collide with. What closes it is the mechanism data already had: each DDL message carries its own
+WAL LSN, the LSN of the last applied one is recorded in the Paimon table's schema options in the
+same `alterTable` call as the column change, and a message at or below it is skipped. The claim
+that holds is the invariant, not the per-op one: **replaying any suffix of an already-applied DDL
+sequence converges to the same schema and never fails.**
+
+The third cannot be closed that way. `INSERT INTO v VALUES (2, 'NaN')` into a `numeric` column is
+accepted by every guardrail — the column *type* maps, only that one *value* does not — and Paimon
+has no representation for it. Reject-never-clamp is still right; what was never considered is that
+the rejection is unbounded, so one ordinary INSERT stops replication for the whole database,
+permanently, and still does after the row is deleted, because the WAL record is in the slot. The
+same holds for a `numeric` beyond `DECIMAL(38, 18)`. (Dates and timestamps left this class: a
+`timestamp 'infinity'` is encoded as the extreme finite value, and BC and large years parse, so no
+temporal value is refused any more. `numeric` is the remaining case, and one is enough.)
 
 **v1 ships without a quarantine, deliberately.** The failure is made diagnosable instead: the error
 names the table, the column, the value, the change LSN and its commit LSN, states that the record is

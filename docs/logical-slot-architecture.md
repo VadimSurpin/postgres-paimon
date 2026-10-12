@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 194 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 211 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -191,16 +191,30 @@ from the reload.
 A **DDL** statement in that window is a different matter: its message is lost with the slot, so the
 Paimon schema would be left permanently behind the registry, and the writer would discard the new
 column's value from every row with nothing but a warning. The startup bootstrap therefore
-reconciles: a `create` for a table Paimon already has adds the columns the registry declares and
-Paimon lacks, one WARNING per column —
+reconciles, **when it finds no slot**: it adds the columns the registry declares and Paimon lacks,
+one WARNING per column —
 
 ```
-WARNING: create for existing table Identifier{database='default', object='d4'}: column 'extra' STRING was missing from its Paimon schema and has been added (a DDL message for it never reached this writer; rows written before now hold NULL there)
+WARNING: create for existing table Identifier{database='default', object='d4'}: column 'extra' STRING was missing from its Paimon schema and has been added (the slot is absent, so its DDL message is lost, not pending; rows written before now hold NULL there)
 ```
 
-Only that one direction is reconciled. A column present in both with a different type, a different
-primary key, or a column Paimon has that the registry does not, stays a warning and nothing more:
-neither side can be shown to be right, and guessing would be worse than saying so.
+**Only when the slot is absent**, because that is the only way a message can have been lost. With
+the slot still there the same difference means the opposite — at startup the registry is always
+ahead of the stream by everything unconsumed, so the column is *pending*, not lost, and the
+writer says so and leaves it to the message:
+
+```
+WARNING: create for existing table Identifier{database='default', object='r'} differs from its Paimon schema: column 'memo' is missing from Paimon; its DDL message is still in the slot and will apply it
+```
+
+(Reconciling there would fabricate the column and the pending `rename_col` would then collide with
+it, which is what an ordinary `RENAME COLUMN` performed while the writer was stopped used to do.)
+
+Only that one direction is reconciled, and only then. A column present in both with a different
+type, a different primary key, or a column Paimon has that the registry does not, stays a warning
+and nothing more: neither side can be shown to be right, and guessing would be worse than saying
+so. A lost **rename** therefore leaves the pre-rename column behind as a reported orphan full of
+nulls alongside the correctly reloaded new one; drop it by hand if it bothers you.
 
 The writer prints this same recipe when it refuses to start (section 5). A table renamed since
 registration needs nothing extra: the reload resolves the source table by its OID, so it copies the
@@ -254,6 +268,11 @@ succeed is a permanent stop. Watch for `SEVERE: fatal:` and alert on the writer 
 
 ### Other operational notes
 
+* Each replicated Paimon table carries a `pgpaimon.applied-ddl-lsn` option: the WAL LSN of the
+  last DDL message applied to it. It is the writer's DDL commit identifier — the counterpart of the
+  commit identifier that makes a replayed *data* transaction a no-op — and it is written in the same
+  atomic schema change as the column alteration itself. Do not edit or remove it: a lower value
+  replays applied DDL, and a higher one skips DDL that was never applied.
 * The writer is one process per slot. Multi-writer and HA are non-goals.
 * The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
@@ -523,7 +542,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 194 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 211 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```

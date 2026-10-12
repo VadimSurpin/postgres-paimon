@@ -111,8 +111,7 @@ start_writer() {
   echo ">> starting writer (log: $RUN/writer.log)"
   # The launch is a generated script so a suite can restart the writer with the identical
   # environment (PaimonAdvancedTest T16 kills it mid-load): it appends to the log and rewrites
-  # writer.pid. flush interval 500ms (default 1000): halves the smoke test's wait without making
-  # tiny commits. _xid is optional and off by default (spec section 6); PaimonFeatureTest T4
+  # writer.pid. _xid is optional and off by default (spec section 6); PaimonFeatureTest T4
   # asserts it is in the schema. PGPAIMON_COMMIT_USER is left to its default
   # (paimon-writer-<slot>): it must be stable across restarts.
   cat >"$LAUNCHER" <<LAUNCH
