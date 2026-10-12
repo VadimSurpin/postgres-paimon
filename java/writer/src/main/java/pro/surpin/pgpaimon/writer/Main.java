@@ -124,6 +124,45 @@ public final class Main {
     /** What step 5 has to do, decided from the slot and the registry alone. */
     enum BackfillAction { NONE, CREATE_SLOT_AND_BACKFILL, RECREATE_SLOT_AND_BACKFILL }
 
+    /** What one {@code paimon.table_registry} row means for startup. */
+    enum RowRole {
+        /** Load it from the slot's exported snapshot. */
+        DUE,
+        /** It holds data we wrote whose stream position is the lost slot: refuse. */
+        STRANDED,
+        /** Nothing to do: the stream covers it. */
+        STREAMING
+    }
+
+    /**
+     * The three-line truth table that decides it. Two flags, and they mean different things:
+     * {@code backfillDue} is "the table held rows at add_table() that an initial load must copy",
+     * {@code hasCommitted} is "this writer has committed something for it to Paimon".
+     *
+     * <p>The last line is the one that matters and the one that was wrong twice. A table that is
+     * not due and has never been written is a table <em>registered while empty</em>.
+     * <ul>
+     *   <li>Slot present: the stream covers it. Its {@code create} message travelled through the
+     *       slot and every row it has ever had arrives as DML.</li>
+     *   <li>Slot absent: this is the first start, so <strong>load it</strong>. Treating it as
+     *       merely "not stranded" and skipping it lost data silently: rows inserted between
+     *       {@code add_table()} and the first start are in neither the snapshot's past nor the new
+     *       slot's future, so they never reached Paimon and never would — on the documented order
+     *       of operations ("register tables, then start the writer"), with no warning. Loading it
+     *       is right either way: still empty, the load is a no-op; grown, the load is exactly what
+     *       the documentation promises.</li>
+     * </ul>
+     */
+    static RowRole classify(boolean backfillDue, boolean hasCommitted, boolean slotExists) {
+        if (backfillDue) {
+            return RowRole.DUE;
+        }
+        if (hasCommitted) {
+            return RowRole.STRANDED;
+        }
+        return slotExists ? RowRole.STREAMING : RowRole.DUE;
+    }
+
     /**
      * The slot and the due tables determine what is safe.
      * <ul>
@@ -189,12 +228,10 @@ public final class Main {
         List<RegistryRow> due = new ArrayList<>();
         List<String> stranded = new ArrayList<>();
         for (RegistryRow r : rows) {
-            if (r.backfillDue()) {
-                due.add(r);
-            } else if (offsets.hasCommitted(r.relid())) {
-                // Not awaiting a load AND already carrying data we wrote: only such a table has
-                // a stream position to lose. A table registered empty has neither.
-                stranded.add(r.schema() + "." + r.table());
+            switch (classify(r.backfillDue(), offsets.hasCommitted(r.relid()), slotExists)) {
+                case DUE -> due.add(r);
+                case STRANDED -> stranded.add(r.schema() + "." + r.table());
+                case STREAMING -> { }
             }
         }
         BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(), stranded,

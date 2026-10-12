@@ -120,6 +120,31 @@ class BackfillerTest {
     }
 
     /**
+     * The whole of the startup classification, all eight combinations. The last two lines are the
+     * ones that were wrong: a table registered while empty is not due and has never been written,
+     * and with the slot ABSENT it must be LOADED, not skipped. Skipping it silently dropped every
+     * row inserted between add_table() and the writer's first start -- on the documented order of
+     * operations, with no warning and no recovery.
+     */
+    @Test
+    void startupClassificationOfOneRegistryRow() {
+        // due: load it, whatever else is true
+        assertEquals(Main.RowRole.DUE,       Main.classify(true,  false, false));
+        assertEquals(Main.RowRole.DUE,       Main.classify(true,  false, true));
+        assertEquals(Main.RowRole.DUE,       Main.classify(true,  true,  false),
+                     "re-bootstrap: due although Paimon holds our data, so it is reloaded");
+        assertEquals(Main.RowRole.DUE,       Main.classify(true,  true,  true));
+        // not due but written by us: its stream position was the slot
+        assertEquals(Main.RowRole.STRANDED,  Main.classify(false, true,  false));
+        assertEquals(Main.RowRole.STRANDED,  Main.classify(false, true,  true));
+        // registered while empty, never written
+        assertEquals(Main.RowRole.STREAMING, Main.classify(false, false, true),
+                     "slot present: the create message came through it and DML follows");
+        assertEquals(Main.RowRole.DUE,       Main.classify(false, false, false),
+                     "slot absent: first start, so load it -- it may have gained rows since");
+    }
+
+    /**
      * The documented re-bootstrap (drop the slot, set backfill_due on every row) leaves the
      * warehouse full of data this writer committed, and must still be allowed: every table is
      * due, so none is stranded and the backfill truncates and reloads each one.
