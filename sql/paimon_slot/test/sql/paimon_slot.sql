@@ -368,4 +368,32 @@ SELECT paimon.peek_messages() - 'relid';
 DROP TABLE nm_plain, nm_big, nm_dec, nm_dec2, nm_decp, nm_ok1, nm_ok2;
 SELECT count(*) FROM paimon.peek_messages();
 
+-- same table name in two PostgreSQL schemas would share one Paimon table
+CREATE SCHEMA s2;
+CREATE TABLE public.dup_f (id int PRIMARY KEY);
+CREATE TABLE s2.dup_f (id int PRIMARY KEY);
+SELECT paimon.add_table('public.dup_f'::regclass);
+SELECT paimon.add_table('s2.dup_f'::regclass);           -- expect ERROR naming public
+-- reverse order
+SELECT paimon.remove_table('public.dup_f'::regclass);
+SELECT paimon.add_table('s2.dup_f'::regclass);
+SELECT paimon.add_table('public.dup_f'::regclass);       -- expect ERROR naming s2
+-- the check is against live registrations: remove, then the other is accepted
+SELECT paimon.remove_table('s2.dup_f'::regclass);
+SELECT paimon.add_table('public.dup_f'::regclass);
+SELECT paimon.remove_table('public.dup_f'::regclass);
+SELECT paimon.add_table('s2.dup_f'::regclass);
+-- re-registering the same table is fine
+SELECT paimon.remove_table('s2.dup_f'::regclass);
+SELECT paimon.add_table('s2.dup_f'::regclass);
+-- different names in different schemas are fine
+CREATE TABLE public.dup_g (id int PRIMARY KEY);
+SELECT paimon.add_table('public.dup_g'::regclass);
+SELECT schema_name, table_name FROM paimon.table_registry
+WHERE table_name IN ('dup_f', 'dup_g') ORDER BY table_name;
+SELECT count(*) FROM paimon.peek_messages();
+DROP TABLE public.dup_f, s2.dup_f, public.dup_g;
+DROP SCHEMA s2;
+SELECT count(*) FROM paimon.peek_messages();
+
 SELECT pg_drop_replication_slot('paimon_test');
