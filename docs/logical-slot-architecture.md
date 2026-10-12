@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 235 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 238 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -75,7 +75,6 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_JDBC_URL` | required | database to replicate (one writer per database) |
 | `PGPAIMON_WAREHOUSE` | required | Paimon warehouse: a local path, `hdfs://host:port/wh`, or `s3://bucket/wh` |
 | `PGPAIMON_USER`, `PGPAIMON_PASSWORD` | `postgres`, empty | needs the REPLICATION attribute (or superuser) |
-| `PGPAIMON_DATABASE` | `default` | Paimon database name the tables are created in |
 | `PGPAIMON_SLOT`, `PGPAIMON_PUBLICATION` | `paimon`, `paimon_pub` | |
 | `PGPAIMON_COMMIT_USER` | `paimon-writer-<slot>` | **must stay stable across restarts**: replay deduplication is scoped to it |
 | `PGPAIMON_SEQ_FIELD`, `PGPAIMON_OP_SEQ_FIELD` | `_seq`, `_op_seq` | mandatory metadata columns (sequencing) |
@@ -107,6 +106,37 @@ slot. Two orders work:
 
 Registering a table that already holds rows once the slot exists is the one thing that does not
 work, and the reason is not arbitrary; it is explained there.
+
+### Warehouse layout: one Paimon database per PostgreSQL schema
+
+A replicated table lands at
+
+```
+<warehouse>/<postgres schema>.db/<table>
+```
+
+so `public.orders` is `<warehouse>/public.db/orders` and `billing.orders` is
+`<warehouse>/billing.db/orders`. The Paimon database is the PostgreSQL schema; the writer creates
+it on demand. This is why two same-named tables in different schemas can both be replicated — with
+the schema dropped from the identity they resolved to one Paimon table and interleaved into it,
+two tables' rows merging on a shared primary key.
+
+**There is no Paimon database setting.** The schema names the database, so there is nothing left
+for one to name; `PGPAIMON_DATABASE` was removed rather than left parsed and ignored.
+
+**Two consequences worth knowing.**
+
+* **This differs from the TAM architecture**, which puts every table in `default.db`. A reader
+  pointed at a warehouse from the other architecture needs a different path.
+* **A warehouse written by an earlier build of this branch is not readable by this one**, because
+  its tables are under `default.db`. Nothing is released, so there is no migration: start from a
+  fresh warehouse, or move each `default.db/<table>` directory to `<schema>.db/<table>` yourself
+  and fix the catalog's database directories. Re-bootstrapping into a new warehouse is the
+  supported route.
+
+An emptied database directory is left in place when its last table is dropped. That is harmless —
+Paimon re-uses it, and `createDatabase` is idempotent — and removing it would be presumptuous while
+the PostgreSQL schema still exists.
 
 ### Remote warehouses (there is no "offload")
 
@@ -648,7 +678,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 235 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 238 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```

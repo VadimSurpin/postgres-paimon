@@ -146,7 +146,7 @@ class PaimonSinkTest {
 
     @Test @Order(5)
     void dataFilesLandInBucketZero() throws Exception {
-        try (Stream<java.nio.file.Path> s = Files.walk(wh.resolve("default.db/s"))) {
+        try (Stream<java.nio.file.Path> s = Files.walk(wh.resolve("public.db/s"))) {
             assertTrue(s.anyMatch(p -> p.getFileName().toString().equals("bucket-0")),
                        "files must sit under bucket-0/, as main's writer lays them out");
         }
@@ -230,7 +230,7 @@ class PaimonSinkTest {
      */
     private static Map<String, Long> changelogKinds(String table) throws Exception {
         Map<String, Long> kinds = new HashMap<>();
-        for (RawRecord r : RawRead.read(catalog, cfg.database(), table)) {
+        for (RawRecord r : RawRead.read(catalog, "public", table)) {
             kinds.merge(r.rowKind(), 1L, Long::sum);
         }
         return kinds;

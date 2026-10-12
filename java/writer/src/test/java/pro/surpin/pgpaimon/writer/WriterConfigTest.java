@@ -27,7 +27,23 @@ class WriterConfigTest {
         assertEquals("_op_seq", c.opSeqField());
         assertNull(c.xidField(), "_xid is optional and off by default");
         assertEquals("paimon-writer-paimon", c.commitUser());
-        assertEquals("default", c.database());
+    }
+
+    /**
+     * There is no Paimon database setting. The Paimon database of a table is its PostgreSQL
+     * schema, so a configured one would have nothing to name, and PGPAIMON_DATABASE was removed
+     * rather than left parsed and ignored. Setting it must therefore change nothing -- and must
+     * not be mistaken for working.
+     */
+    @Test
+    void thereIsNoPaimonDatabaseSetting() {
+        Map<String, String> e = minimal();
+        e.put("PGPAIMON_DATABASE", "whatever");
+        assertDoesNotThrow(() -> WriterConfig.fromEnv(e));
+        for (java.lang.reflect.RecordComponent rc : WriterConfig.class.getRecordComponents()) {
+            assertNotEquals("database", rc.getName(),
+                            "a database setting would have nothing to name");
+        }
     }
 
     @Test

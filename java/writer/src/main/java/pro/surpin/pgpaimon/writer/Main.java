@@ -61,7 +61,7 @@ public final class Main {
         //     reconciled columns first and throw afterwards, so a failed start had already
         //     bumped schema versions in the warehouse.
         for (RegistryRow r : rows) {
-            registry.register(r.relid(), r.table());
+            registry.register(r.relid(), r.schema(), r.table());
         }
 
         // 3b. decide what startup will do, which is where a refusal belongs.

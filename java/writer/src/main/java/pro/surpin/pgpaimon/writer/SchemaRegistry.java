@@ -73,8 +73,24 @@ public final class SchemaRegistry {
      * is false. So the mapping is established here, the decision is taken, and only then does
      * {@link #bootstrapTable} create and reconcile.
      */
-    public void register(long relid, String table) {
-        identifiers.put(relid, Identifier.create(config.database(), table));
+    public void register(long relid, String schema, String table) {
+        identifiers.put(relid, identifierOf(schema, table));
+    }
+
+    /**
+     * The Paimon identity of a PostgreSQL table: its <strong>PostgreSQL schema</strong> as the
+     * Paimon database, and its name as the Paimon table. On disk that is
+     * {@code <warehouse>/<schema>.db/<table>}.
+     *
+     * <p>This used to be a single configured database for everything, which meant the PostgreSQL
+     * schema was dropped from the identity entirely: {@code public.f} and {@code s2.f} both
+     * resolved to one Paimon table and interleaved into it, two tables' rows merging on a shared
+     * primary key. Carrying the schema is what makes the identity faithful; it also gives each
+     * table its own {@code pgpaimon.applied-ddl-lsn}, where same-named tables previously shared
+     * one.
+     */
+    private static Identifier identifierOf(String schema, String table) {
+        return Identifier.create(schema, table);
     }
 
     /** As above with an explicit changelog-producer (taken from the message's options). */
@@ -130,10 +146,11 @@ public final class SchemaRegistry {
             b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
         }
 
-        Identifier id = Identifier.create(config.database(), table);
+        Identifier id = identifierOf(schema, table);
         Table existing = null;
         try {
-            catalog.createDatabase(config.database(), true);
+            // One Paimon database per PostgreSQL schema, created on demand. Idempotent.
+            catalog.createDatabase(schema, true);
             Schema wanted = b.build();
             try {
                 existing = catalog.getTable(id);

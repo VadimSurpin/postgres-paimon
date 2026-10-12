@@ -24,12 +24,15 @@ final class RawRead {
 
     private RawRead() {}
 
-    /** Reads from the warehouse path, database {@code default}. */
-    static List<RawRecord> read(String warehouse, String table) throws Exception {
+    /**
+     * Reads from the warehouse path. The Paimon database is the table's PostgreSQL schema, so it
+     * has to be named: there is no single database to default to any more.
+     */
+    static List<RawRecord> read(String warehouse, String database, String table) throws Exception {
         Options o = new Options();
         o.set("warehouse", warehouse);
         try (Catalog c = CatalogFactory.createCatalog(CatalogContext.create(o))) {
-            return read(c, "default", table);
+            return read(c, database, table);
         }
     }
 

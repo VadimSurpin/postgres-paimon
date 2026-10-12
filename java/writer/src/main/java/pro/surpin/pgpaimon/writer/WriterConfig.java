@@ -6,6 +6,11 @@ import java.util.*;
 /**
  * The writer's whole configuration, read from the environment once.
  *
+ * <p>There is deliberately no Paimon database setting either. The Paimon database of a table is
+ * its PostgreSQL schema, so a configured one would have nothing to name; a
+ * {@code PGPAIMON_DATABASE} that is parsed and then ignored is the failure mode this branch has
+ * already had to fix twice.
+ *
  * <p>There is deliberately no flush interval and no flush size for the streaming path: a batch is
  * one committed PostgreSQL transaction or nothing ({@link TxnBatcher}), so a timer or a record
  * count could only split a transaction, which would break atomicity and let the slot advance past
@@ -13,7 +18,7 @@ import java.util.*;
  * only, where each chunk is a commit of its own.
  */
 public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
-                           String password, String warehouse, String database,
+                           String password, String warehouse,
                            String slotName, String publicationName,
                            String messagePrefix, String commitUser,
                            String seqField, String opSeqField, String xidField,
@@ -40,7 +45,6 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             getOrDefault(env, "PGPAIMON_USER", "postgres"),
             getOrDefault(env, "PGPAIMON_PASSWORD", ""),
             wh,
-            getOrDefault(env, "PGPAIMON_DATABASE", "default"),
             getOrDefault(env, "PGPAIMON_SLOT", "paimon"),
             getOrDefault(env, "PGPAIMON_PUBLICATION", "paimon_pub"),
             getOrDefault(env, "PGPAIMON_MESSAGE_PREFIX", "paimon"),

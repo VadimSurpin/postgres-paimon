@@ -205,17 +205,17 @@ class BackfillerTest {
 
             // Every record is +I and every _seq is the consistent point: a streaming
             // change always carries a higher LSN, so it wins with no coordination.
-            List<RawRecord> raw = RawRead.read(wh, "bf_t");
+            List<RawRecord> raw = RawRead.read(wh, "public", "bf_t");
             assertEquals(1000, raw.size());
             assertTrue(raw.stream().allMatch(r -> r.rowKind().equals("+I")),
                        "every backfilled record must be RowKind.INSERT");
             assertTrue(raw.stream().allMatch(r -> r.seq() == plan.consistentPoint()),
                        "every backfilled _seq must equal the consistent point");
             assertTrue(java.nio.file.Files.isDirectory(
-                java.nio.file.Path.of(wh, "default.db", "bf_t")),
+                java.nio.file.Path.of(wh, "public.db", "bf_t")),
                 "the Paimon table keeps its original name");
             assertFalse(java.nio.file.Files.exists(
-                java.nio.file.Path.of(wh, "default.db", "bf_renamed")));
+                java.nio.file.Path.of(wh, "public.db", "bf_renamed")));
             assertEquals(plan.consistentPoint(),
                 new OffsetStore(reg, cfg).highestCommittedLsn(List.of(relid)));
         } finally {

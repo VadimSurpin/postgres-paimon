@@ -142,8 +142,8 @@ class SchemaRegistryTest {
              "schema":"public","table":"orders"}"""));
         // Catalog.tableExists does not exist in Paimon 1.4.1; getTable must now fail.
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create(cfg.database(), "orders")));
-        assertFalse(java.nio.file.Files.exists(warehouse.resolve(cfg.database() + ".db").resolve("orders")),
+            () -> catalog.getTable(Identifier.create("public", "orders")));
+        assertFalse(java.nio.file.Files.exists(warehouse.resolve("public.db").resolve("orders")),
             "the table directory must be purged from the warehouse");
         assertFalse(reg.tracked(RELID));
     }
@@ -660,7 +660,7 @@ class SchemaRegistryTest {
         assertDoesNotThrow(() -> handler.handle(msg(drop, IDEM_LSN + 0x500)),
                            "replayed drop_table must not throw");
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create(cfg.database(), "idem_t")));
+            () -> catalog.getTable(Identifier.create("public", "idem_t")));
     }
 
     /*
@@ -894,7 +894,7 @@ class SchemaRegistryTest {
                    warn.get(0).getMessage());
         assertTrue(reg.tracked(43001L), "the relation must stay tracked");
         assertDoesNotThrow(() -> catalog.getTable(
-            Identifier.create(cfg.database(), "recycled")), "the table must still be there");
+            Identifier.create("public", "recycled")), "the table must still be there");
         assertEquals(ver, reg.table(43001L).schema().id());
     }
 
@@ -913,7 +913,7 @@ class SchemaRegistryTest {
             0x61100L));
         assertFalse(reg.tracked(43002L));
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create(cfg.database(), "goner")));
+            () -> catalog.getTable(Identifier.create("public", "goner")));
     }
 
     /** A table with no recorded identifier keeps the old behaviour: nothing to compare. */
@@ -928,7 +928,7 @@ class SchemaRegistryTest {
             {"v":1,"op":"drop_table","relid":43003,"schema":"public","table":"oldstyle"}""", 1L));
         assertFalse(reg.tracked(43003L));
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create(cfg.database(), "oldstyle")));
+            () -> catalog.getTable(Identifier.create("public", "oldstyle")));
     }
 
     /**
@@ -962,14 +962,62 @@ class SchemaRegistryTest {
      */
     @Test @Order(64)
     void registerEstablishesTheMappingWithoutTouchingTheWarehouse() throws Exception {
-        reg.register(44000L, "never_created");
+        reg.register(44000L, "public", "never_created");
         assertTrue(reg.tracked(44000L), "the decision needs the mapping");
         assertThrows(Catalog.TableNotExistException.class,
-            () -> catalog.getTable(Identifier.create(cfg.database(), "never_created")),
+            () -> catalog.getTable(Identifier.create("public", "never_created")),
             "and must not have created anything");
         assertFalse(new OffsetStore(reg, cfg).hasCommitted(44000L),
                     "nothing is committed to a table that does not exist, and asking must not"
                     + " throw -- startup asks before creating");
+    }
+
+    /*
+     * The PostgreSQL schema is part of the Paimon identity: <warehouse>/<schema>.db/<table>.
+     *
+     * Before this, Identifier.create(<one configured database>, table) dropped the schema, so
+     * public.f and s2.f resolved to ONE Paimon table and interleaved into it -- two tables' rows
+     * merging on a shared primary key, which a SQL guardrail had to refuse outright.
+     */
+
+    @Test @Order(70)
+    void sameNamedTablesInDifferentSchemasAreSeparatePaimonTables() throws Exception {
+        String create = """
+            {"v":1,"op":"create","relid":RELID,"schema":"NSP","table":"f",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                 {"id":2,"name":"v","type":"STRING"}],
+             "options":{"changelog-producer":"input"}}""";
+        handler.handle(msg(create.replace("RELID", "45000").replace("NSP", "public")));
+        handler.handle(msg(create.replace("RELID", "45001").replace("NSP", "s2")));
+
+        assertNotEquals(reg.table(45000L).location(), reg.table(45001L).location(),
+                        "two tables, not one");
+        assertTrue(java.nio.file.Files.isDirectory(warehouse.resolve("public.db").resolve("f")));
+        assertTrue(java.nio.file.Files.isDirectory(warehouse.resolve("s2.db").resolve("f")));
+        assertEquals(List.of("f"), catalog.listTables("s2"));
+        assertTrue(catalog.listDatabases().containsAll(List.of("public", "s2")));
+
+        // each carries its OWN applied-DDL identifier, where they previously shared one
+        handler.handle(msg("""
+            {"v":1,"op":"add_col","relid":45001,"col":{"id":3,"name":"only_s2","type":"INT"}}""",
+            0x70000L));
+        assertEquals(0x70000L, reg.appliedDdlLsn(45001L));
+        assertNotEquals(reg.appliedDdlLsn(45000L), reg.appliedDdlLsn(45001L));
+        assertTrue(reg.table(45001L).schema().fieldNames().contains("only_s2"));
+        assertFalse(reg.table(45000L).schema().fieldNames().contains("only_s2"),
+                    "the other schema's table must be untouched");
+    }
+
+    @Test @Order(71)
+    void dropTableRemovesOnlyTheSchemaItNames() throws Exception {
+        handler.handle(msg("""
+            {"v":1,"op":"drop_table","relid":45001,"schema":"s2","table":"f"}""", 0x70100L));
+        assertFalse(reg.tracked(45001L));
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create("s2", "f")));
+        assertDoesNotThrow(() -> catalog.getTable(Identifier.create("public", "f")),
+                           "the same-named table in the other schema must survive");
+        assertTrue(reg.tracked(45000L));
     }
 
 }
