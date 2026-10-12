@@ -14,6 +14,7 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.StreamTableScan;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -30,6 +31,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * harness set PGPAIMON_HARNESS=1 and the variables are missing, so it can never skip silently there.
  */
 class SlotHarnessSmokeIT {
+
+    /**
+     * The PostgreSQL schema these suites create their tables in, and therefore the
+     * Paimon database they land in: the writer maps one to the other, so the warehouse
+     * layout is <warehouse>/<schema>.db/<table>.
+     */
+    static final String PG_SCHEMA = "public";
 
     static final long TIMEOUT_MS = 60_000;
 
@@ -96,8 +104,72 @@ class SlotHarnessSmokeIT {
         }
     }
 
+    /**
+     * Two same-named tables in different PostgreSQL schemas stay separate, end to end.
+     *
+     * The Paimon database is the PostgreSQL schema, so public.twin and billing.twin are
+     * <warehouse>/public.db/twin and <warehouse>/billing.db/twin. Before that, the identity was
+     * (one configured database, table name): both resolved to ONE Paimon table and their rows
+     * merged on the shared primary key, which is why registering the second was refused outright.
+     */
+    @Test
+    void sameNamedTablesInDifferentSchemasDoNotInterleave() throws Exception {
+        String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
+        String wh = System.getenv("PGPAIMON_IT_WAREHOUSE");
+        if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
+            assertNotNull(jdbc, "harness did not export PGPAIMON_IT_JDBC_URL");
+            assertNotNull(wh, "harness did not export PGPAIMON_IT_WAREHOUSE");
+        }
+        assumeTrue(jdbc != null && wh != null,
+                   "no live stack: run test/slot-acceptance/run_acceptance.sh");
+
+        try (Connection c = DriverManager.getConnection(jdbc); Statement st = c.createStatement()) {
+            st.execute("INSERT INTO public.twin  VALUES (2, 'public-two')");
+            st.execute("INSERT INTO billing.twin VALUES (2, 'billing-two')");
+            st.execute("UPDATE billing.twin SET who = 'billing-one-b' WHERE id = 1");
+        }
+        Map<Integer, String> wantPublic  = Map.of(1, "public-one",    2, "public-two");
+        Map<Integer, String> wantBilling = Map.of(1, "billing-one-b", 2, "billing-two");
+
+        Options o = new Options();
+        o.set("warehouse", wh);
+        try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+            Map<Integer, String> gotPublic = Map.of(), gotBilling = Map.of();
+            long deadline = System.currentTimeMillis() + TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    gotPublic  = twin(catalog, "public");
+                    gotBilling = twin(catalog, "billing");
+                } catch (Exception notYet) {
+                    gotPublic = Map.of();
+                    gotBilling = Map.of();
+                }
+                if (gotPublic.equals(wantPublic) && gotBilling.equals(wantBilling)) break;
+                Thread.sleep(250);
+            }
+            assertEquals(wantPublic, gotPublic, "public.twin");
+            assertEquals(wantBilling, gotBilling, "billing.twin");
+        }
+        // and on disk they are two directories, not one
+        assertTrue(new File(wh + "/public.db/twin").isDirectory(), wh + "/public.db/twin");
+        assertTrue(new File(wh + "/billing.db/twin").isDirectory(), wh + "/billing.db/twin");
+    }
+
+    private static Map<Integer, String> twin(Catalog catalog, String schema) throws Exception {
+        Table t = catalog.getTable(Identifier.create(schema, "twin"));
+        List<String> names = t.rowType().getFieldNames();
+        int id = names.indexOf("id"), who = names.indexOf("who");
+        ReadBuilder rb = t.newReadBuilder();
+        Map<Integer, String> out = new TreeMap<>();
+        try (RecordReader<org.apache.paimon.data.InternalRow> r =
+                 rb.newRead().createReader(rb.newScan().plan())) {
+            r.forEachRemaining(row -> out.put(row.getInt(id), row.getString(who).toString()));
+        }
+        return out;
+    }
+
     private static Map<Integer, String> mergedContents(Catalog catalog) throws Exception {
-        Table t = catalog.getTable(Identifier.create("default", "harness_smoke"));
+        Table t = catalog.getTable(Identifier.create(PG_SCHEMA, "harness_smoke"));
         List<String> names = t.rowType().getFieldNames();
         int id = names.indexOf("id"), label = names.indexOf("label"), amt = names.indexOf("amt");
         ReadBuilder rb = t.newReadBuilder();
@@ -112,12 +184,12 @@ class SlotHarnessSmokeIT {
 
     /** "id:kind" for every changelog record, via a streaming scan of $audit_log (as RawRead does). */
     private static Set<String> changelogKinds(Catalog catalog) throws Exception {
-        Table al = catalog.getTable(Identifier.create("default", "harness_smoke$audit_log"))
+        Table al = catalog.getTable(Identifier.create(PG_SCHEMA, "harness_smoke$audit_log"))
             .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
         int idIdx = al.rowType().getFieldNames().indexOf("id");
         StreamTableScan scan = al.newReadBuilder().newStreamScan();
         scan.plan();                                    // the first plan() is always empty
-        Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", "harness_smoke")))
+        Long latest = ((FileStoreTable) catalog.getTable(Identifier.create(PG_SCHEMA, "harness_smoke")))
             .snapshotManager().latestSnapshotId();
         List<Split> splits = new ArrayList<>();
         for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {

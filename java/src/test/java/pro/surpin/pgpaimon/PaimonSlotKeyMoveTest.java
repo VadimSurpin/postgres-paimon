@@ -47,6 +47,13 @@ import org.junit.jupiter.api.Test;
  */
 public class PaimonSlotKeyMoveTest {
 
+    /**
+     * The PostgreSQL schema these suites create their tables in, and therefore the
+     * Paimon database they land in: the writer maps one to the other, so the warehouse
+     * layout is <warehouse>/<schema>.db/<table>.
+     */
+    static final String PG_SCHEMA = "public";
+
     static final int N = 200;
 
     static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
@@ -206,7 +213,7 @@ public class PaimonSlotKeyMoveTest {
     /** Merged read: the table's own options are left intact (merge-engine, sequence.field). */
     static Map<Integer, String> readMerged(String tbl) throws Exception {
         FileStoreTable table = FileStoreTableFactory.create(
-            fileIO, new Path(warehouse + "/default.db/" + tbl));
+            fileIO, new Path(warehouse + "/" + PG_SCHEMA + ".db/" + tbl));
         ReadBuilder rb = table.newReadBuilder();
         Map<Integer, String> out = new TreeMap<>();
         try (RecordReader<InternalRow> reader =
@@ -256,12 +263,12 @@ public class PaimonSlotKeyMoveTest {
         o.set("warehouse", warehouse);
         List<Rec> out = new ArrayList<>();
         try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
-            Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+            Table al = catalog.getTable(Identifier.create(PG_SCHEMA, tbl + "$audit_log"))
                 .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
             int idIdx = al.rowType().getFieldNames().indexOf("id");
             StreamTableScan scan = al.newReadBuilder().newStreamScan();
             scan.plan();
-            Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+            Long latest = ((FileStoreTable) catalog.getTable(Identifier.create(PG_SCHEMA, tbl)))
                 .snapshotManager().latestSnapshotId();
             List<Split> splits = new ArrayList<>();
             for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {

@@ -55,6 +55,13 @@ import java.util.*;
  */
 public class PaimonDdlTest {
 
+    /**
+     * The PostgreSQL schema these suites create their tables in, and therefore the
+     * Paimon database they land in: the writer maps one to the other, so the warehouse
+     * layout is <warehouse>/<schema>.db/<table>.
+     */
+    static final String PG_SCHEMA = "public";
+
     static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
     static final String DEFAULT_JDBC =
         env("PGPAIMON_IT_JDBC_URL", "jdbc:postgresql://localhost:5434/testdb?user=ubuntu&password=");
@@ -694,11 +701,11 @@ public class PaimonDdlTest {
                 /* Row kinds come from the $audit_log system table over a streaming scan: Paimon
                  * stores the kind as the reserved _VALUE_KIND, so a batch read (merged, or with
                  * a faked _row_kind column) cannot report it.  Column 0 is the kind as a string. */
-                Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+                Table al = catalog.getTable(Identifier.create(PG_SCHEMA, tbl + "$audit_log"))
                     .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
                 StreamTableScan scan = al.newReadBuilder().newStreamScan();
                 scan.plan();                          // the first plan() is always empty: discard
-                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create(PG_SCHEMA, tbl)))
                     .snapshotManager().latestSnapshotId();
                 List<Split> splits = new ArrayList<>();
                 for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {
@@ -745,8 +752,14 @@ public class PaimonDdlTest {
     }
 
     /** Paimon's filesystem catalog nests tables under <database>.db/. */
+    /** The warehouse path of a table: <warehouse>/<postgres schema>.db/<table>. */
+    static String tableDir(String schema, String tbl) {
+        return warehouse + "/" + schema + ".db/" + tbl;
+    }
+
+    /** These suites create every table in PG_SCHEMA. */
     static String tableDir(String tbl) {
-        return warehouse + "/default.db/" + tbl;
+        return tableDir(PG_SCHEMA, tbl);
     }
 
     static boolean gucNoteLogged = false;

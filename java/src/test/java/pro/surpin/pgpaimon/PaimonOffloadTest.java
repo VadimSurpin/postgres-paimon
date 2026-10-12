@@ -58,6 +58,13 @@ import org.junit.jupiter.api.Test;
  */
 public class PaimonOffloadTest {
 
+    /**
+     * The PostgreSQL schema these suites create their tables in, and therefore the
+     * Paimon database they land in: the writer maps one to the other, so the warehouse
+     * layout is <warehouse>/<schema>.db/<table>.
+     */
+    static final String PG_SCHEMA = "public";
+
     static String envOr(String key, String def) {
         String v = System.getenv(key);
         return v != null && !v.isEmpty() ? v : def;
@@ -374,11 +381,11 @@ public class PaimonOffloadTest {
             Options o = new Options();
             catalogOpts.forEach(o::set);
             try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
-                Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+                Table al = catalog.getTable(Identifier.create(PG_SCHEMA, tbl + "$audit_log"))
                     .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
                 StreamTableScan scan = al.newReadBuilder().newStreamScan();
                 scan.plan();                          // the first plan() is always empty: discard
-                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create(PG_SCHEMA, tbl)))
                     .snapshotManager().latestSnapshotId();
                 List<Split> splits = new ArrayList<>();
                 for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {

@@ -49,6 +49,13 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class PaimonAdvancedTest {
 
+    /**
+     * The PostgreSQL schema these suites create their tables in, and therefore the
+     * Paimon database they land in: the writer maps one to the other, so the warehouse
+     * layout is <warehouse>/<schema>.db/<table>.
+     */
+    static final String PG_SCHEMA = "public";
+
     static final String DEFAULT_WAREHOUSE = env("PGPAIMON_IT_WAREHOUSE", "/tmp/paimon-warehouse");
     static final String DEFAULT_JDBC =
         env("PGPAIMON_IT_JDBC_URL", "jdbc:postgresql://localhost:5442/paimon_acc?user=postgres");
@@ -564,8 +571,14 @@ public class PaimonAdvancedTest {
     }
 
     /** Paimon's filesystem catalog nests tables under <database>.db/. */
+    /** The warehouse path of a table: <warehouse>/<postgres schema>.db/<table>. */
+    static String tableDir(String schema, String tbl) {
+        return warehouse + "/" + schema + ".db/" + tbl;
+    }
+
+    /** These suites create every table in PG_SCHEMA. */
     static String tableDir(String tbl) {
-        return warehouse + "/default.db/" + tbl;
+        return tableDir(PG_SCHEMA, tbl);
     }
 
     static void cleanup(String tbl) {
@@ -630,12 +643,12 @@ public class PaimonAdvancedTest {
             Options o = new Options();
             o.set("warehouse", warehouse);
             try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
-                Table al = catalog.getTable(Identifier.create("default", tbl + "$audit_log"))
+                Table al = catalog.getTable(Identifier.create(PG_SCHEMA, tbl + "$audit_log"))
                     .copy(Map.of("scan.mode", "from-snapshot", "scan.snapshot-id", "1"));
                 int idIdx = al.rowType().getFieldNames().indexOf("id");
                 StreamTableScan scan = al.newReadBuilder().newStreamScan();
                 scan.plan();                          // the first plan() is always empty: discard
-                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create("default", tbl)))
+                Long latest = ((FileStoreTable) catalog.getTable(Identifier.create(PG_SCHEMA, tbl)))
                     .snapshotManager().latestSnapshotId();
                 List<Split> splits = new ArrayList<>();
                 for (long i = 0; i <= (latest == null ? 0 : latest) + 1; i++) {

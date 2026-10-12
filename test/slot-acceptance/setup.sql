@@ -10,3 +10,14 @@ CREATE TABLE harness_smoke (
 );
 INSERT INTO harness_smoke VALUES (1, 'one', 1.50), (2, 'two', 2.25);
 SELECT paimon.add_table('harness_smoke'::regclass);
+
+-- Two same-named tables in DIFFERENT PostgreSQL schemas. Each must land in its own Paimon
+-- database (<warehouse>/<schema>.db/twin) and never interleave with the other; with the schema
+-- dropped from the Paimon identity they resolved to one table and merged on the shared key.
+CREATE SCHEMA billing;
+CREATE TABLE public.twin  (id int PRIMARY KEY, who text);
+CREATE TABLE billing.twin (id int PRIMARY KEY, who text);
+INSERT INTO public.twin  VALUES (1, 'public-one');
+INSERT INTO billing.twin VALUES (1, 'billing-one');
+SELECT paimon.add_table('public.twin'::regclass);
+SELECT paimon.add_table('billing.twin'::regclass);
