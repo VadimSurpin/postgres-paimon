@@ -58,8 +58,17 @@ class PaimonSinkTest {
         sink.close();
     }
 
+    /**
+     * A DDL message with a fresh, ascending LSN, as the stream delivers them. The LSN is the DDL
+     * commit identifier, so reusing one would make the registry treat the next message as a
+     * replay and skip it.
+     */
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_LSN =
+        new java.util.concurrent.atomic.AtomicLong(0x1000);
+
     private static PgEvent.Message msg(String json) {
-        return new PgEvent.Message(true, 1L, "paimon", json.getBytes(StandardCharsets.UTF_8));
+        return new PgEvent.Message(true, NEXT_LSN.addAndGet(0x10), "paimon",
+                                   json.getBytes(StandardCharsets.UTF_8));
     }
 
     private static SinkRecord rec(RowKind k, String id, String v, long seq, int op) {

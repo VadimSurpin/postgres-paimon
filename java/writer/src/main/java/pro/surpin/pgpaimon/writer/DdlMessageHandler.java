@@ -37,7 +37,8 @@ public final class DdlMessageHandler {
         }
         switch (op) {
             case "create" -> registry.createTable(d.relid(), d.schema(), d.table(),
-                need(d.pk(), "pk", op), need(d.cols(), "cols", op), d.changelogProducer());
+                need(d.pk(), "pk", op), need(d.cols(), "cols", op), d.changelogProducer(),
+                m.lsn());
             case "add_col", "drop_col", "rename_col", "alter_col", "drop_table" -> {
                 if (!registry.tracked(d.relid())) {
                     LOG.warning("ignoring " + op + " for unregistered relation " + d.relid());
@@ -56,7 +57,7 @@ public final class DdlMessageHandler {
                         need(d.from(), "from", op), need(d.to(), "to", op), m.lsn());
                     case "alter_col" -> registry.alterColumn(d.relid(),
                         need(d.name(), "name", op), need(d.type(), "type", op), m.lsn());
-                    default -> registry.dropTable(d.relid(), d.schema(), d.table());
+                    default -> registry.dropTable(d.relid(), d.schema(), d.table(), m.lsn());
                 }
             }
             default -> throw new IllegalStateException("unknown DDL op '" + op + "'");

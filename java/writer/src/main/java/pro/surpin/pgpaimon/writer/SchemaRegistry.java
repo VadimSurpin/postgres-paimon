@@ -63,10 +63,30 @@ public final class SchemaRegistry {
         createTable(relid, schema, table, pk, cols, "input");
     }
 
+    /**
+     * Records the relid to Paimon identity mapping and NOTHING else: no catalog call, no
+     * warehouse write.
+     *
+     * <p>Startup needs the mapping before it can decide whether to refuse to start -- the
+     * decision reads each table's committed offsets -- and it must be able to refuse without
+     * having touched the warehouse first, or "the writer refused to start, so nothing happened"
+     * is false. So the mapping is established here, the decision is taken, and only then does
+     * {@link #bootstrapTable} create and reconcile.
+     */
+    public void register(long relid, String table) {
+        identifiers.put(relid, Identifier.create(config.database(), table));
+    }
+
     /** As above with an explicit changelog-producer (taken from the message's options). */
     public void createTable(long relid, String schema, String table, List<String> pk,
                             List<DdlMessage.Col> cols, String changelogProducer) {
-        create(relid, schema, table, pk, cols, changelogProducer, false);
+        createTable(relid, schema, table, pk, cols, changelogProducer, 0);
+    }
+
+    /** As above, recording {@code ddlLsn} as the table's applied-DDL identifier. */
+    public void createTable(long relid, String schema, String table, List<String> pk,
+                            List<DdlMessage.Col> cols, String changelogProducer, long ddlLsn) {
+        create(relid, schema, table, pk, cols, changelogProducer, false, ddlLsn);
     }
 
     /**
@@ -83,12 +103,14 @@ public final class SchemaRegistry {
     public void bootstrapTable(long relid, String schema, String table, List<String> pk,
                                List<DdlMessage.Col> cols, String changelogProducer,
                                boolean reconcileLostDdl) {
-        create(relid, schema, table, pk, cols, changelogProducer, reconcileLostDdl);
+        // No LSN: the bootstrap replays a registry row, not a message, so it has none to record
+        // and must not disturb whatever the table already carries.
+        create(relid, schema, table, pk, cols, changelogProducer, reconcileLostDdl, 0);
     }
 
     private void create(long relid, String schema, String table, List<String> pk,
                         List<DdlMessage.Col> cols, String changelogProducer,
-                        boolean reconcileLostDdl) {
+                        boolean reconcileLostDdl, long ddlLsn) {
         Schema.Builder b = Schema.newBuilder();
         for (DdlMessage.Col c : cols) {
             b.column(c.name(), parseType(c.type()));
@@ -103,6 +125,10 @@ public final class SchemaRegistry {
         b.option("changelog-producer", changelogProducer == null ? "input" : changelogProducer);
         b.option("sequence.field", config.seqField() + "," + config.opSeqField());
         b.option("ignore-update-before", "false");
+        if (ddlLsn != 0) {
+            // On the table's own creation, so a create and its identifier are one atomic write.
+            b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
+        }
 
         Identifier id = Identifier.create(config.database(), table);
         Table existing = null;
@@ -121,6 +147,14 @@ public final class SchemaRegistry {
         identifiers.put(relid, id);
         forget0(relid);
         if (existing != null) {
+            // Deliberately NOT carrying the identifier forward onto a table that already
+            // existed. The option is written only on the table's own creation, which is the case
+            // the drop gate needs: a drop purges the Paimon table, so the create that follows it
+            // is a genuine creation and records the newer LSN. Writing it here instead would make
+            // a create ALTER an existing table -- an options-only schema version bump -- and
+            // "a create never alters an existing table" is worth more than carrying the
+            // identifier forward for a table that was never dropped. Leaving the older LSN in
+            // place also fails safe: the gate is then less likely to skip, not more.
             reconcileOrWarn(relid, id, existing, pk, cols, reconcileLostDdl);
         }
     }
@@ -177,7 +211,19 @@ public final class SchemaRegistry {
             have.remove(config.xidField());
         }
         for (String extra : have.keySet()) {
-            diffs.add("column '" + extra + "' exists in Paimon but not in the create message");
+            // Its own WARNING, not a clause in a list. This column is NULL for every row, and
+            // every SELECT * downstream returns it; the commonest way to get one is a rename
+            // whose DDL message was lost, where the pre-rename column survives beside the
+            // correctly reloaded new one. Nothing here can safely drop it -- the registry not
+            // naming it is not proof that no reader wants it -- so say exactly what it is.
+            LOG.warning("table " + id + " has a column '" + extra + "' that"
+                + " paimon.table_registry does not: it is NOT maintained, reads NULL for every"
+                + " row, and any SELECT * will return it. The usual cause is a rename whose DDL"
+                + " message was lost, leaving the pre-rename column beside the new one. It is"
+                + " not dropped automatically, because the registry not naming it is not proof"
+                + " that no reader wants it. Check it holds nothing you need, then remove it"
+                + " from a compute engine: ALTER TABLE `" + id.getDatabaseName() + "`.`"
+                + id.getObjectName() + "` DROP COLUMN `" + extra + "`");
         }
         for (DdlMessage.Col c : missing) {
             if (!reconcileLostDdl) {
@@ -402,9 +448,45 @@ public final class SchemaRegistry {
 
     /** Purges the warehouse data. Untracked relids are ignored. */
     public void dropTable(long relid, String schema, String table) {
+        dropTable(relid, schema, table, 0);
+    }
+
+    /**
+     * Purges the warehouse data. Untracked relids are ignored.
+     *
+     * <p>Gated on the applied-DDL identifier like the column ops, for one reason: a Paimon table
+     * is identified by NAME, so a table dropped and recreated under the same name resolves to the
+     * same Paimon table. If the recreated table already records an identifier at or above this
+     * drop's LSN, the table standing here now was created AFTER the drop was emitted, so the drop
+     * is stale and applying it would purge the new table's rows and then have the replayed create
+     * rebuild it empty.
+     *
+     * <p>Today that is reachable only if PostgreSQL reuses the dropped table's OID, because a
+     * drop deletes its {@code paimon.table_registry} row in the same transaction as the message,
+     * so after any restart the old relid is untracked and {@link DdlMessageHandler} refuses the
+     * message before it arrives here (measured: "ignoring drop_table for unregistered relation").
+     * Narrow, but the consequence is a whole table's data, and the gate is two comparisons.
+     *
+     * <p>A table with no recorded identifier keeps the old behaviour: there is nothing to
+     * compare, and refusing on that basis would make a drop unreachable.
+     */
+    public void dropTable(long relid, String schema, String table, long ddlLsn) {
         Identifier id = identifiers.get(relid);
         if (id == null) {
             return;
+        }
+        if (ddlLsn != 0) {
+            long applied = appliedDdlLsn(relid);
+            if (applied != 0 && Long.compareUnsigned(applied, ddlLsn) >= 0) {
+                LOG.warning("drop_table for " + id + " at "
+                    + SlotConsumer.formatLsn(ddlLsn) + " (" + Long.toUnsignedString(ddlLsn)
+                    + ") is STALE and has NOT been applied: the table standing there records an"
+                    + " applied-DDL LSN of " + SlotConsumer.formatLsn(applied) + " ("
+                    + Long.toUnsignedString(applied) + "), at or above the drop, so it was"
+                    + " created after this drop was emitted. Applying it would purge a table the"
+                    + " drop was never about. Nothing is dropped and the relation stays tracked");
+                return;
+            }
         }
         try {
             catalog.dropTable(id, true);
