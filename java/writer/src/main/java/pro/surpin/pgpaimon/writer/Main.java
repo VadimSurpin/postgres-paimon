@@ -276,6 +276,21 @@ public final class Main {
                 ps.setString(1, config.slotName());
                 ps.execute();
             }
+            // The slot is gone NOW, so anything that was still in it is LOST, not pending --
+            // and the bootstrap above ran while it existed, so it declined to reconcile any
+            // missing column and deferred to a DDL message that this drop has just destroyed.
+            // Re-running it with the slot genuinely absent is what keeps that deferral honest.
+            // Without this the Paimon schema stayed permanently behind the registry while
+            // PostgreSQL held the column's value, exit 0, two misleading warnings: whole-branch
+            // finding 4, reopened on this one path.
+            //
+            // Before the load, deliberately: the reloaded rows must carry the added column.
+            LOG.info("re-running the registry bootstrap now the slot is gone: a DDL message that"
+                + " was pending in it is lost, so a column missing from Paimon is reconciled");
+            for (RegistryRow r : rows) {
+                registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
+                                        r.changelogProducer(), true);
+            }
         }
         try (Backfiller backfiller = new Backfiller(config, registry, sink)) {
             Backfiller.BackfillPlan plan = backfiller.createSlotAndExportSnapshot();

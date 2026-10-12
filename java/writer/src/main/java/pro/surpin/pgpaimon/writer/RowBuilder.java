@@ -65,9 +65,18 @@ public final class RowBuilder {
             }
         }
         if (!ignored.isEmpty()) {
+            // Deliberately not "likely a replay". It is likely a replay, and on a replay the
+            // values are genuinely unwanted -- but the other cause of this warning is a Paimon
+            // schema left behind the registry, where the same line reports permanent, silent
+            // loss of a column's values. Saying which it is is impossible here, so say both.
             LOG.warning("table " + (tableName == null ? "(unnamed)" : tableName)
-                + ": ignoring PostgreSQL column(s) " + ignored
-                + " with no counterpart in the Paimon schema (dropped; likely a replay)");
+                + ": DISCARDING the values of PostgreSQL column(s) " + ignored
+                + ", which have no counterpart in the Paimon schema. Expected if their drop_col"
+                + " came earlier in the stream, or on a replay of changes from before it -- the"
+                + " values are unwanted then. But if the Paimon schema is simply BEHIND (a DDL"
+                + " message lost with a dropped slot), this line is permanent data loss, one per"
+                + " row: compare the Paimon schema with paimon.table_registry and re-register"
+                + " the table if they disagree");
         }
     }
 
