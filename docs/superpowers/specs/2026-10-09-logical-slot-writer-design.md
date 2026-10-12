@@ -624,9 +624,26 @@ accepted by every guardrail — the column *type* maps, only that one *value* do
 has no representation for it. Reject-never-clamp is still right; what was never considered is that
 the rejection is unbounded, so one ordinary INSERT stops replication for the whole database,
 permanently, and still does after the row is deleted, because the WAL record is in the slot. The
-same holds for a `numeric` beyond `DECIMAL(38, 18)`. (Dates and timestamps left this class: a
-`timestamp 'infinity'` is encoded as the extreme finite value, and BC and large years parse, so no
-temporal value is refused any more. `numeric` is the remaining case, and one is enough.)
+same holds for a `numeric` beyond `DECIMAL(38, 18)`.
+
+**Amendment.** An earlier version of this paragraph said "no temporal value is refused any more",
+on the strength of `infinity` being encoded as an extreme finite value rather than rejected. That
+was wrong twice over. Paimon's `Timestamp.toMicros()` is
+`multiplyExact(millisecond, 1000) + nanoOfMillisecond / 1000` — the multiply is checked and the add
+is not — and Parquet's writer calls it per row, so the largest instant the writer can store is
+`294247-01-10 04:00:54.775807`, about thirty years *below* PostgreSQL's own maximum. A range of
+legal PostgreSQL timestamps therefore cannot be stored at all, and the first encoding target was
+itself inside the overflow window, so it failed in `prepareCommit` where neither poison arm catches
+it — an undiagnosed permanent stop, strictly worse than the diagnosed one it replaced. The bound is
+now computed, checked in `TextDecoder`, and surfaced as `UnrepresentableValueException`, which
+makes an out-of-range timestamp both diagnosable and skippable. Dates are unaffected: PostgreSQL's
+whole date range fits Paimon's int.
+
+The lesson generalises past this one value: **a round-trip through an in-memory object is not
+evidence that a value can be stored.** The mapping was verified by `fromLocalDateTime` followed by
+`toLocalDateTime`, which never calls the arithmetic the writer depends on. Nothing in the unit or
+acceptance suites wrote a decoded `infinity` to disk, so nothing noticed. The test that now covers
+it writes a row to a Paimon file and reads it back.
 
 **The failure is made diagnosable, and given one narrow escape.** The error names the table, the
 column, the value, the change LSN and its commit LSN, and states that the record is in the slot so

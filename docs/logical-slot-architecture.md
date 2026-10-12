@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 224 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 230 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -245,9 +245,18 @@ the same message). The slot only advances past a transaction after that transact
 has returned, so the record is replayed on every start, for ever, and no later DML can remove it
 from the slot.
 
-The same applies to any value PostgreSQL stores happily that Paimon cannot represent: `numeric`
-beyond `DECIMAL(38, 18)`. (Dates and timestamps are not in this class: `infinity` is encoded as
-the extreme finite values and BC and large years parse, so the writer never refuses a temporal value.)
+The same applies to any value PostgreSQL stores happily that Paimon cannot represent. Two classes
+of value reach it:
+
+* **`numeric` NaN**, and a `numeric` whose digits do not fit the target `DECIMAL(p, s)`.
+* **A `timestamp` above `294247-01-10 04:00:54.775807`.** That is the largest instant Paimon can
+  write: `Timestamp.toMicros()` is `multiplyExact(millisecond, 1000) + nanoOfMillisecond / 1000`
+  and Parquet's writer calls it for every row, so one microsecond later the arithmetic either
+  throws or silently wraps. PostgreSQL's own maximum, `294276-12-31 23:59:59.999999`, is about
+  thirty years higher, so **a range of perfectly legal PostgreSQL timestamps cannot be stored**
+  and is refused here. Dates are not affected: PostgreSQL's whole date range fits Paimon's int,
+  with about 6700 years to spare. `infinity`, `-infinity`, BC years and years above 9999 are all
+  handled and never refused — but the maximum is a real bound, not a formality.
 
 **No guardrail can prevent this one.** `add_table()` refuses column *types* it cannot map, and
 refuses a `numeric` without explicit precision or above 38 digits, but a `numeric(10,2)` column is
@@ -321,10 +330,16 @@ on retry, but a replay that can never succeed stops the writer until somebody in
 ### Other operational notes
 
 * Each replicated Paimon table carries a `pgpaimon.applied-ddl-lsn` option: the WAL LSN of the
-  last DDL message applied to it. It is the writer's DDL commit identifier — the counterpart of the
-  commit identifier that makes a replayed *data* transaction a no-op — and it is written in the same
+  last DDL message applied to it, in decimal (the writer logs it both as decimal and as
+  `X/XXXXXXXX`). It is the writer's DDL commit identifier — the counterpart of the commit
+  identifier that makes a replayed *data* transaction a no-op — and it is written in the same
   atomic schema change as the column alteration itself. Do not edit or remove it: a lower value
   replays applied DDL, and a higher one skips DDL that was never applied.
+  **It carries no cluster or timeline identity**, which matters in exactly one situation: point a
+  warehouse at a *different* PostgreSQL server, or at one restored by PITR or re-`initdb`'d, and
+  its LSNs start again from a lower point, so DDL below the recorded value is skipped as a replay
+  it is not. Nothing detects this. A warehouse belongs to one cluster's timeline; re-bootstrap into
+  a fresh warehouse rather than reusing one across a restore.
 * The writer is one process per slot. Multi-writer and HA are non-goals.
 * The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
@@ -513,6 +528,30 @@ every reader. Consequence to be aware of: the PostgreSQL name and the Paimon nam
 re-bootstrap handles it — the initial load resolves the source table by its OID, not by the
 registered name — so no renaming back is needed.
 
+### `infinity` is stored as the extreme value, which is lossy
+
+`timestamp`/`timestamptz`/`date` `infinity` and `-infinity` have no Paimon counterpart. They are
+**encoded as the extreme values**, not refused and not nulled:
+
+| PostgreSQL | stored in Paimon |
+|---|---|
+| `date 'infinity'` | `5874897-12-31` (PostgreSQL's own maximum date) |
+| `date '-infinity'` | `4714-11-24 BC` (PostgreSQL's own minimum date) |
+| `timestamp 'infinity'` | `294247-01-10 04:00:54.775807` (the largest instant Paimon can write) |
+| `timestamp '-infinity'` | `4714-11-24 00:00:00 BC` (PostgreSQL's own minimum) |
+
+**Why encode rather than refuse.** `infinity` almost always means an open-ended interval —
+`valid_to = 'infinity'` — and a query like `valid_to > now()` has to keep matching after
+replication. An order-preserving sentinel does that; a NULL or a refusal does not. The ordering
+holds over everything a Paimon table can contain, because every value above the positive target is
+refused rather than written and nothing below `4714-11-24 BC` exists in PostgreSQL at all.
+
+**What it costs, and this is the part to know.** The encoding is **not lossless**. A row that
+genuinely holds one of those four values becomes indistinguishable from `infinity` once it is in
+Paimon, where PostgreSQL keeps them distinct. If you store real dates at PostgreSQL's extremes —
+unusual, but it happens in generated or sentinel data — do not also rely on `infinity`, or add a
+companion boolean column. Nothing detects the collision.
+
 ### Metadata columns differ from the TAM architecture
 
 * `meta_field_tid` has **no counterpart**. The physical `(block << 16) | offset` of a tuple is not
@@ -594,7 +633,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 224 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 230 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
