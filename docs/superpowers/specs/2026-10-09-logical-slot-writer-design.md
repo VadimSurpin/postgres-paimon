@@ -628,14 +628,38 @@ same holds for a `numeric` beyond `DECIMAL(38, 18)`. (Dates and timestamps left 
 `timestamp 'infinity'` is encoded as the extreme finite value, and BC and large years parse, so no
 temporal value is refused any more. `numeric` is the remaining case, and one is enough.)
 
-**v1 ships without a quarantine, deliberately.** The failure is made diagnosable instead: the error
-names the table, the column, the value, the change LSN and its commit LSN, states that the record is
-in the slot so deleting the row will not help, and gives the one recourse that exists
-(re-bootstrap, which loses Paimon-side changelog history). A mechanism that records such a record as
-unapplied and advances past it is a design decision in its own right — a skip is silent data loss
-unless it is durable and surfaced, which is the same decision as what a dead-letter table looks
-like — and is left to a follow-up spec. The hazard is written up for operators in
-`docs/logical-slot-architecture.md`, "A record the writer can never apply".
+**The failure is made diagnosable, and given one narrow escape.** The error names the table, the
+column, the value, the change LSN and its commit LSN, and states that the record is in the slot so
+deleting the row will not help.
+
+`PGPAIMON_SKIP_LSN` then lets an operator who has read that error and inspected the row advance
+past **exactly one** record. It is set to the offending record's change LSN; the rest of that
+record's transaction commits normally, so the loss is one row rather than everything committed
+alongside it; and the record's complete raw text values are logged at WARNING with the table, the
+column and both LSNs, so the row can be reinserted by hand. The loss is recoverable, not merely
+survivable.
+
+The constraints are the design, because the obvious failure mode of such a thing is to decay into
+an "ignore errors" switch:
+
+- one LSN and never a range, so a mistyped digit cannot discard arbitrary data;
+- one record, not the transaction;
+- only a `TextDecoder.UnrepresentableValueException` — a dedicated type thrown solely for a value
+  PostgreSQL holds and Paimon has no representation for. A commit failure, a schema error, an arity
+  mismatch, or a value that does not *parse* as its Paimon type at the very same LSN all stay
+  fatal. That last distinction matters: a parse failure is systematic (a drifted column type, a
+  session setting) and would mis-handle every row of the column, so skipping one row of it would
+  hide the cause;
+- the raw values logged in full, which is what makes it an audit trail rather than a hole;
+- a configured LSN at or below the resume position is announced as unable to fire, so a stale
+  setting is visible — but never refused, since refusing would turn a leftover variable into an
+  outage.
+
+**What v1 still does not have is a quarantine.** Nothing records the skipped record durably for a
+reader to find — the log line is the whole audit trail — and nothing automates the decision. A
+dead-letter table is a design decision in its own right and is left to a follow-up spec. The hazard
+and the exact operator sequence are written up in `docs/logical-slot-architecture.md`, "A record the
+writer can never apply".
 
 ### Registry bootstrap on startup
 

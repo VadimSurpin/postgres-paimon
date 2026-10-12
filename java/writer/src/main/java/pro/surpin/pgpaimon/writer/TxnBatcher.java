@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.logging.Logger;
 
 /**
  * Assembles complete transactions: a batch is one committed PostgreSQL transaction or nothing.
@@ -30,6 +31,17 @@ import java.util.Set;
  */
 public final class TxnBatcher {
 
+    private static final Logger LOG = Logger.getLogger(TxnBatcher.class.getName());
+
+    /**
+     * Builds the Paimon row for one record, purely to find out whether its values can be
+     * represented. Only ever called for the single configured skip LSN, so it adds nothing to
+     * the normal path -- one {@code long} comparison per event.
+     */
+    public interface RowCheck {
+        void check(SinkRecord record, RelationMeta meta);
+    }
+
     public interface Flusher {
         /**
          * @param commitLsn becomes Paimon's commitIdentifier
@@ -41,17 +53,32 @@ public final class TxnBatcher {
     private final ToastResolver resolver;
     private final SchemaRegistry registry;   // null means every relation is tracked
     private final Flusher flusher;
+    private final long skipLsn;              // 0 = no escape configured
+    private final RowCheck rowCheck;         // null = cannot check, so never skip
 
     private List<SinkRecord> open;
     private long xid;
     private int opSeq;
     private final Set<Long> buffered = new HashSet<>();    // relids with records this txn
     private final Set<Long> truncated = new HashSet<>();   // relids truncated this txn
+    private final List<String> skipped = new ArrayList<>();  // audit lines for this txn
 
     public TxnBatcher(ToastResolver resolver, SchemaRegistry registry, Flusher flusher) {
+        this(resolver, registry, flusher, 0, null);
+    }
+
+    /**
+     * As above with the poison-record escape armed. {@code skipLsn} is one change LSN, the one
+     * the POISON RECORD error printed; {@code rowCheck} decides whether the record at that LSN
+     * really is unrepresentable.
+     */
+    public TxnBatcher(ToastResolver resolver, SchemaRegistry registry, Flusher flusher,
+                      long skipLsn, RowCheck rowCheck) {
         this.resolver = resolver;
         this.registry = registry;
         this.flusher = flusher;
+        this.skipLsn = skipLsn;
+        this.rowCheck = rowCheck;
     }
 
     public boolean hasOpenTransaction() {
@@ -63,6 +90,7 @@ public final class TxnBatcher {
         opSeq = 0;
         buffered.clear();
         truncated.clear();
+        skipped.clear();   // a transaction that never committed skipped nothing: it replays
     }
 
     /**
@@ -88,8 +116,21 @@ public final class TxnBatcher {
         if (event instanceof PgEvent.Commit c) {
             require();
             List<SinkRecord> batch = open;
+            List<String> audit = List.copyOf(skipped);
             discardOpenTransaction();   // the transaction is closed even if flush throws
             flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
+            // Only now: the record is really gone only once the rest of its transaction has
+            // been committed to Paimon. The commit LSN is not known before the Commit arrives,
+            // and the audit line is worthless without it.
+            for (String line : audit) {
+                LOG.warning("SKIPPED POISON RECORD (PGPAIMON_SKIP_LSN="
+                    + SlotConsumer.formatLsn(skipLsn) + "): " + line
+                    + ", in the transaction committed at " + SlotConsumer.formatLsn(c.commitLsn())
+                    + ". The rest of that transaction WAS applied. This row is now missing from"
+                    + " Paimon and nothing will replay it: reinsert it by hand from the values"
+                    + " above, with the offending column corrected. Unset PGPAIMON_SKIP_LSN"
+                    + " before the next restart.");
+            }
             return;
         }
         if (event instanceof PgEvent.Relation || event instanceof PgEvent.TypeMsg
@@ -125,13 +166,82 @@ public final class TxnBatcher {
                 throw ambiguous(relid, "change after TRUNCATE of the same table");
             }
             for (PartialRecord p : resolver.resolve(event, meta)) {
-                open.add(new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid));
+                SinkRecord record =
+                    new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid);
+                if (skipLsn != 0 && changeLsn == skipLsn && skip(record, meta)) {
+                    continue;   // see skip(): the transaction stays open, deliberately
+                }
+                open.add(record);
                 buffered.add(p.relid());
             }
         } catch (Throwable t) {
             discardOpenTransaction();
             throw t;
         }
+    }
+
+    /**
+     * The poison-record escape, and the one exemption from this class's "after any exception no
+     * transaction is open" invariant.
+     *
+     * <p>A value PostgreSQL stores and Paimon cannot (a {@code numeric} NaN, say) is in the slot,
+     * and the slot advances only after a successful Paimon commit, so it replays on every restart
+     * for ever. Without this, the only recovery is a re-bootstrap that discards all Paimon-side
+     * changelog history for every tracked table -- a brutal price for one bad value. So an
+     * operator who has read the POISON RECORD error and inspected the row may set
+     * {@code PGPAIMON_SKIP_LSN} to that record's change LSN and restart.
+     *
+     * <p>Why leaving the transaction open is safe here, when nothing else may: the invariant
+     * exists so that a throw part-way through cannot leave earlier records buffered for a later
+     * Commit to flush under the full transaction's LSNs, advancing the slot past records that
+     * were never written. Here nothing is thrown and nothing is lost unknowingly -- one record is
+     * dropped, deliberately, by explicit operator instruction, and logged in full. The rest of
+     * the transaction is applied, so the loss is one row rather than everything committed
+     * alongside it.
+     *
+     * <p>What keeps it from becoming an "ignore errors" switch, which is the whole design
+     * problem: it is one LSN and never a range; it fires only for
+     * {@link TextDecoder.UnrepresentableValueException} and nothing else, so a commit failure, a
+     * schema error, an arity mismatch or a parse failure at the very same LSN stays fatal; and
+     * the complete raw text of the dropped record is logged at WARNING so the row can be put
+     * back by hand.
+     *
+     * <p>An UPDATE decomposes to two records sharing one change LSN, so skipping the change to
+     * one row may drop both images of it. Each is logged.
+     */
+    private boolean skip(SinkRecord record, RelationMeta meta) {
+        if (rowCheck == null) {
+            return false;
+        }
+        try {
+            rowCheck.check(record, meta);
+            return false;       // it builds after all: nothing to skip
+        } catch (TextDecoder.UnrepresentableValueException e) {
+            String table = meta == null
+                ? "relation " + record.relid()
+                : meta.namespace() + "." + meta.relName() + " (relation " + record.relid() + ")";
+            skipped.add(table + " " + record.kind() + " at _seq "
+                + SlotConsumer.formatLsn(record.seq()) + ", xid " + record.xid()
+                + ": " + e.getMessage()
+                + "; the record's complete raw values, in relation column order "
+                + (meta == null ? "(unknown)" : meta.columnNames()) + ", were "
+                + raw(record.values()));
+            return true;
+        } catch (RuntimeException other) {
+            // Any other failure at this LSN is NOT what the escape is for. Leave the record in
+            // the batch so the sink raises it as it always would, fatally.
+            return false;
+        }
+    }
+
+    /** Raw text values, NULLs and empty strings distinguishable, nothing elided. */
+    private static String raw(List<String> values) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            String v = values.get(i);
+            sb.append(i == 0 ? "" : ", ").append(v == null ? "NULL" : "\"" + v + "\"");
+        }
+        return sb.append(']').toString();
     }
 
     private IllegalStateException ambiguous(long relid, String what) {

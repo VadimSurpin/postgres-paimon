@@ -384,8 +384,43 @@ class PaimonSinkTest {
             assertTrue(m.contains("already in"), m);             // the record is in the slot
             assertTrue(m.contains(cfg.slotName()), m);
             assertTrue(m.contains("does NOT help"), m);          // deleting the row will not do
-            assertTrue(m.contains("pg_drop_replication_slot"), m);   // the recourse that exists
             assertTrue(m.contains("NOT TRANSIENT"), m);
+            // both recoveries, the cheap one first, with the LSN already substituted in
+            assertTrue(m.contains("PGPAIMON_SKIP_LSN=1/9ABCDEF0"), m);
+            assertTrue(m.contains("pg_drop_replication_slot"), m);
+            assertTrue(m.indexOf("PGPAIMON_SKIP_LSN") < m.indexOf("pg_drop_replication_slot"),
+                       "the skip is the cheaper recovery and must be offered first");
+        }
+    }
+
+    /**
+     * A value that will not parse as its Paimon type at all is NOT a poison record and must not
+     * be offered the skip: the cause is systematic (a drifted column type, or a session setting
+     * such as bytea_output = 'escape'), so it would mis-handle every row of the column and
+     * skipping one would hide it.
+     */
+    @Test @Order(19)
+    void aMalformedValueIsNotOfferedTheSkip() throws Exception {
+        long relid = 16703L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16703,"schema":"public","table":"malformed",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"b","type":"BYTES"}],
+              "options":{"changelog-producer":"input"}}"""));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, new RelationMeta(relid, "public", "malformed",
+                List.of("id", "b"), List.of(true, false)));
+            // what bytea_output = 'escape' sends: octal escapes, not \x hex
+            SinkRecord bad = new SinkRecord(relid, RowKind.INSERT,
+                Arrays.asList("1", "\\000\\377"), 800L, 0, 0L);
+            IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> s.flush(List.of(bad), 800L, 810L));
+            String m = e.getMessage();
+            assertFalse(m.contains("POISON RECORD"), m);
+            assertFalse(m.contains("PGPAIMON_SKIP_LSN"), m);
+            assertTrue(m.contains("public.malformed"), m);
+            assertTrue(m.contains("systematic mismatch"), m);
+            assertTrue(m.contains("bytea_output"), m);
         }
     }
 

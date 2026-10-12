@@ -295,4 +295,171 @@ class TxnBatcherTest {
             () -> b.onEvent(new PgEvent.Commit(2200L, 2210L, 0L), 2210L, null));
         assertTrue(rec.batches.isEmpty(), "records of the first txn must not be flushed");
     }
+    /*
+     * The poison-record escape, PGPAIMON_SKIP_LSN. The point of these tests is not that it works
+     * but that it is NARROW: one LSN, one kind of failure, everything else still fatal. An
+     * "ignore errors" switch would pass the first test and fail the rest.
+     */
+
+    /** A RowCheck that refuses one value, as TextDecoder does for a numeric it cannot hold. */
+    private static TxnBatcher.RowCheck refuses(String badValue) {
+        return (record, meta) -> {
+            if (record.values().contains(badValue)) {
+                throw new TextDecoder.UnrepresentableValueException(
+                    "column 'v': cannot parse DECIMAL(10, 2) from \"" + badValue
+                    + "\": numeric NaN and Infinity have no Paimon representation");
+            }
+        };
+    }
+
+    private static List<java.util.logging.LogRecord> warningsFrom(Runnable r) {
+        List<java.util.logging.LogRecord> out = new ArrayList<>();
+        java.util.logging.Logger log =
+            java.util.logging.Logger.getLogger(TxnBatcher.class.getName());
+        java.util.logging.Handler h = new java.util.logging.Handler() {
+            public void publish(java.util.logging.LogRecord x) { out.add(x); }
+            public void flush() { }
+            public void close() { }
+        };
+        log.addHandler(h);
+        try { r.run(); } finally { log.removeHandler(h); }
+        return out;
+    }
+
+    @Test
+    void aMatchingSkipLsnDropsOneRecordAndTheTransactionStillCommits() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+
+        List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);   // poison
+                b.onEvent(new PgEvent.Insert(16412, row("3", "c")), 430L, META);
+                b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+            } catch (Exception e) {
+                throw new AssertionError("the skip must not throw", e);
+            }
+        });
+
+        assertEquals(1, rec.batches.size(), "the transaction must still commit");
+        List<SinkRecord> batch = rec.batches.get(0);
+        assertEquals(2, batch.size(), "exactly the poison record is gone");
+        assertEquals(List.of("1", "a"), batch.get(0).values());
+        assertEquals(List.of("3", "c"), batch.get(1).values(),
+                     "records after the skipped one are still there");
+        assertEquals(500L, rec.commitLsns.get(0));
+        assertFalse(b.hasOpenTransaction());
+
+        // the audit trail: table, column, both LSNs, and the complete raw values
+        assertEquals(1, logs.size(), logs.toString());
+        String m = logs.get(0).getMessage();
+        assertEquals(java.util.logging.Level.WARNING, logs.get(0).getLevel());
+        assertTrue(m.contains("SKIPPED POISON RECORD"), m);
+        assertTrue(m.contains("public.t"), m);                  // the table
+        assertTrue(m.contains("column 'v'"), m);                // the column
+        assertTrue(m.contains("0/000001A4"), m);                // the change LSN, 420
+        assertTrue(m.contains("0/000001F4"), m);                // the commit LSN, 500
+        assertTrue(m.contains("[\"2\", \"NaN\"]"), m);           // every raw value
+        assertTrue(m.contains("[id, v]"), m);                   // in which column order
+        assertTrue(m.contains("reinsert it by hand"), m);
+    }
+
+    @Test
+    void theAuditLineIsOnlyLoggedIfTheTransactionActuallyCommits() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+        List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+            b.discardOpenTransaction();
+        });
+        assertTrue(logs.isEmpty(), "a transaction that never committed skipped nothing");
+    }
+
+    @Test
+    void aNonMatchingSkipLsnLeavesTheFailureToTheSink() throws Exception {
+        Recorder rec = new Recorder();
+        // armed at 999, the poison record is at 420
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 999L, refuses("NaN"));
+        b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
+        b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+
+        assertEquals(1, rec.batches.size());
+        assertEquals(1, rec.batches.get(0).size(),
+                     "the record stays in the batch, so the sink fails on it as always");
+        assertEquals(List.of("2", "NaN"), rec.batches.get(0).get(0).values());
+    }
+
+    /**
+     * The test that proves the escape is not a blanket switch: a DIFFERENT failure at the very
+     * same LSN must not be skipped.
+     */
+    @Test
+    void anotherFailureAtTheMatchingLsnIsNotSkipped() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher.RowCheck somethingElse = (record, meta) -> {
+            throw new IllegalStateException("record has 2 values but the relation has 3 columns");
+        };
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, somethingElse);
+
+        List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "x")), 420L, META);
+                b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertEquals(1, rec.batches.get(0).size(),
+                     "an arity mismatch is not an unrepresentable value: the record stays");
+        assertTrue(logs.isEmpty(), "and nothing is reported as skipped");
+
+        // a plain IllegalArgumentException (a parse failure, not an unrepresentable value) too
+        Recorder rec2 = new Recorder();
+        TxnBatcher.RowCheck malformed = (record, meta) -> {
+            throw new IllegalArgumentException("not hex-format bytea (expected \\x prefix)");
+        };
+        TxnBatcher b2 = new TxnBatcher(new ToastResolver(), null, rec2, 420L, malformed);
+        b2.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+        b2.onEvent(new PgEvent.Insert(16412, row("2", "x")), 420L, META);
+        b2.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+        assertEquals(1, rec2.batches.get(0).size(),
+                     "a parse failure is systematic, not one bad value: never skipped");
+    }
+
+    @Test
+    void theNoTransactionOpenInvariantSurvivesTheSkipPath() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+        b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
+        assertTrue(b.hasOpenTransaction(), "the skip deliberately leaves the transaction open");
+
+        // but any other throw still closes it, exactly as before
+        assertThrows(IllegalStateException.class,
+            () -> b.onEvent(new PgEvent.Begin(600L, 0L, 4712L), 600L, null));
+        assertFalse(b.hasOpenTransaction());
+    }
+
+    @Test
+    void withNoSkipLsnConfiguredTheCheckIsNeverCalled() throws Exception {
+        Recorder rec = new Recorder();
+        boolean[] called = { false };
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 0L,
+            (record, meta) -> called[0] = true);
+        b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
+        b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+        assertFalse(called[0], "unarmed, the escape must cost nothing on the hot path");
+        assertEquals(1, rec.batches.get(0).size());
+    }
+
 }

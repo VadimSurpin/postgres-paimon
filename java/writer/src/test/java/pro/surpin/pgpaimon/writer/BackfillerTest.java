@@ -7,6 +7,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -246,4 +247,40 @@ class BackfillerTest {
             return rs.getLong(1);
         }
     }
+    /**
+     * A stale PGPAIMON_SKIP_LSN -- one left set after its skip already happened -- can never fire,
+     * and must say so rather than sit armed and forgotten. It is never a refusal to start:
+     * refusing would turn a leftover variable into an outage.
+     */
+    @Test
+    void aStaleSkipLsnIsAnnouncedButNeverRefused() {
+        assertTrue(mainWarnings(() -> Main.warnOnStaleSkipLsn(0x100L, 0x200L)).stream()
+                       .anyMatch(m -> m.contains("can never fire")),
+                   "below the resume position");
+        assertTrue(mainWarnings(() -> Main.warnOnStaleSkipLsn(0x200L, 0x200L)).stream()
+                       .anyMatch(m -> m.contains("can never fire")),
+                   "exactly at the resume position");
+        assertTrue(mainWarnings(() -> Main.warnOnStaleSkipLsn(0x300L, 0x200L)).stream()
+                       .anyMatch(m -> m.contains("is armed")),
+                   "ahead of the resume position: it can still fire");
+        assertTrue(mainWarnings(() -> Main.warnOnStaleSkipLsn(0x100L, 0L)).stream()
+                       .anyMatch(m -> m.contains("is armed")),
+                   "resume 0 means the slot's own position, so nothing is known to be behind us");
+        assertTrue(mainWarnings(() -> Main.warnOnStaleSkipLsn(0L, 0x200L)).isEmpty(),
+                   "unset says nothing at all");
+    }
+
+    private static List<String> mainWarnings(Runnable r) {
+        List<String> out = new ArrayList<>();
+        java.util.logging.Logger log = java.util.logging.Logger.getLogger(Main.class.getName());
+        java.util.logging.Handler h = new java.util.logging.Handler() {
+            public void publish(java.util.logging.LogRecord x) { out.add(x.getMessage()); }
+            public void flush() { }
+            public void close() { }
+        };
+        log.addHandler(h);
+        try { r.run(); } finally { log.removeHandler(h); }
+        return out;
+    }
+
 }

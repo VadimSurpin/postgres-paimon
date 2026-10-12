@@ -5,6 +5,7 @@ import org.apache.paimon.data.*;
 import org.apache.paimon.types.*;
 import org.junit.jupiter.api.Test;
 import java.time.LocalDate;
+import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class TextDecoderTest {
@@ -371,4 +372,65 @@ class TextDecoderTest {
         assertRejected(DataTypes.DATE(), "10000-02-30", "d");
         assertRejected(DataTypes.DATE(), "+10000-01-01", "d");
     }
+    /*
+     * The type is the contract PGPAIMON_SKIP_LSN is keyed on, so which failures are
+     * UnrepresentableValueException and which are not is as load-bearing as the messages.
+     */
+
+    @Test
+    void onlyAValuePaimonCannotHoldIsUnrepresentable() {
+        DataType dec = DataTypes.DECIMAL(10, 2);
+        // a well-formed PostgreSQL numeric with no Paimon counterpart: skippable
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+                     () -> TextDecoder.toPaimon("v", dec, "NaN"));
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+                     () -> TextDecoder.toPaimon("v", dec, "Infinity"));
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+                     () -> TextDecoder.toPaimon("v", dec, "-Infinity"));
+        // more integer digits than the column holds
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+                     () -> TextDecoder.toPaimon("v", dec, "123456789.00"));
+        // more decimal places than the column holds: digits would be lost, never rounded
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+                     () -> TextDecoder.toPaimon("v", dec, "1.005"));
+    }
+
+    @Test
+    void aParseFailureIsNotUnrepresentableAndSoIsNotSkippable() {
+        // Each of these means the text is not of this type at all -- a drifted schema, a session
+        // setting, a protocol fault -- which would mis-handle EVERY row of the column. Skipping
+        // one would hide the cause, so they must not be the skippable type.
+        record Case(DataType type, String text) {}
+        for (Case c : List.of(
+                new Case(DataTypes.DECIMAL(10, 2), "not-a-number"),
+                new Case(DataTypes.INT(), "abc"),
+                new Case(DataTypes.BIGINT(), ""),
+                new Case(DataTypes.BOOLEAN(), "maybe"),
+                new Case(DataTypes.BYTES(), "abc"),          // bytea_output = 'escape'
+                new Case(DataTypes.BYTES(), "\\xabc"),        // odd number of hex digits
+                new Case(DataTypes.DATE(), "the 5th"),
+                new Case(DataTypes.TIMESTAMP(), "yesterday"))) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> TextDecoder.toPaimon("v", c.type(), c.text()));
+            assertFalse(e instanceof TextDecoder.UnrepresentableValueException,
+                "a " + c.type() + " from \"" + c.text() + "\" is a parse failure, not an"
+                + " unrepresentable value: " + e.getMessage());
+        }
+        // and NULL for a NOT NULL column is a schema disagreement, not one bad value
+        IllegalArgumentException nul = assertThrows(IllegalArgumentException.class,
+            () -> TextDecoder.toPaimon("v", DataTypes.INT().notNull(), null));
+        assertFalse(nul instanceof TextDecoder.UnrepresentableValueException, nul.getMessage());
+    }
+
+    @Test
+    void theUnrepresentableMessageStillNamesTheColumnTheTypeAndTheValue() {
+        TextDecoder.UnrepresentableValueException e = assertThrows(
+            TextDecoder.UnrepresentableValueException.class,
+            () -> TextDecoder.toPaimon("amt", DataTypes.DECIMAL(10, 2), "NaN"));
+        assertTrue(e.getMessage().contains("column 'amt'"), e.getMessage());
+        assertTrue(e.getMessage().contains("DECIMAL(10, 2)"), e.getMessage());
+        assertTrue(e.getMessage().contains("\"NaN\""), e.getMessage());
+        assertTrue(e.getMessage().contains("no Paimon representation"), e.getMessage());
+    }
+
 }

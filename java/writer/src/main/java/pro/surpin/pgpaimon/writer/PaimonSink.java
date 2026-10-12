@@ -117,11 +117,22 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     org.apache.paimon.data.GenericRow row;
                     try {
                         row = rb.build(r);
-                    } catch (IllegalArgumentException bad) {
-                        // A VALUE the decoder cannot turn into this Paimon type. Only this is a
-                        // poison record; anything else from RowBuilder (an arity mismatch, say)
-                        // is a structural fault and is reported as one.
+                    } catch (TextDecoder.UnrepresentableValueException bad) {
+                        // The only poison record: a value PostgreSQL holds and Paimon cannot.
+                        // This is the one failure PGPAIMON_SKIP_LSN can step over.
                         throw undecodable(meta, r, commitLsn, fromTheSlot, bad);
+                    } catch (IllegalArgumentException malformed) {
+                        // The text did not parse as the Paimon type at all. Not a poison record
+                        // and NOT skippable: the cause is systematic -- a drifted column type, or
+                        // a session setting such as bytea_output = 'escape' -- so it would
+                        // mis-handle every row of that column, and skipping one would hide it.
+                        throw new IllegalStateException("cannot decode " + where(meta, r) + ": "
+                            + malformed.getMessage()
+                            + ". The text did not parse as this Paimon type at all, so this is"
+                            + " not one unrepresentable value but a systematic mismatch: compare"
+                            + " the Paimon column's type with the PostgreSQL column's, and check"
+                            + " the session settings the writer pins (TimeZone, client_encoding,"
+                            + " bytea_output). It will replay identically on restart.", malformed);
                     } catch (RuntimeException other) {
                         throw new IllegalStateException("cannot build a Paimon row for "
                             + where(meta, r) + ": " + other.getMessage()
@@ -207,12 +218,17 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
             + " successful Paimon commit, so every restart replays this same record and fails"
             + " identically. Deleting or correcting the row in PostgreSQL does NOT help -- the"
             + " offending WAL record stays in the slot. The only recourse today is the"
-            + " re-bootstrap procedure: stop the writer, SELECT"
+            + " two recoveries, in this order. (1) Inspect the row in PostgreSQL, then skip just"
+            + " this record: set PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(r.seq())
+            + " and restart. The rest of its transaction is applied, the record's full raw values"
+            + " are logged so you can reinsert the row by hand with the value corrected, and"
+            + " nothing else is skipped -- only this LSN, and only this kind of failure. Unset it"
+            + " afterwards. (2) Failing that, the re-bootstrap procedure: stop the writer, SELECT"
             + " pg_drop_replication_slot('" + config.slotName() + "'); UPDATE"
-            + " paimon.table_registry SET backfill_due = true; and start the writer again. That"
-            + " reloads every tracked table from a fresh snapshot and loses Paimon-side changelog"
-            + " history. See docs/logical-slot-architecture.md, 'A record the writer can never"
-            + " apply'.", cause);
+            + " paimon.table_registry SET backfill_due = true; and start the writer again, which"
+            + " reloads every tracked table from a fresh snapshot and loses all Paimon-side"
+            + " changelog history. See docs/logical-slot-architecture.md, 'A record the writer"
+            + " can never apply'.", cause);
     }
 
     /**

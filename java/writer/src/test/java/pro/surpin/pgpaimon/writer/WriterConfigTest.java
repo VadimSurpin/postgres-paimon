@@ -138,4 +138,37 @@ class WriterConfigTest {
         e3.put("PGPAIMON_FLUSH_MAX_RECORDS", "99999999999");
         assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(e3));
     }
+    @Test
+    void skipLsnIsUnsetByDefaultAndAcceptsBothSpellings() {
+        assertEquals(0L, WriterConfig.fromEnv(minimal()).skipLsn(), "unset means no escape");
+
+        Map<String, String> hex = minimal();
+        hex.put("PGPAIMON_SKIP_LSN", "0/19A6F590");   // the form the POISON RECORD error prints
+        assertEquals(0x19A6F590L, WriterConfig.fromEnv(hex).skipLsn());
+
+        Map<String, String> dec = minimal();
+        dec.put("PGPAIMON_SKIP_LSN", "430000016");
+        assertEquals(430000016L, WriterConfig.fromEnv(dec).skipLsn());
+
+        Map<String, String> high = minimal();
+        high.put("PGPAIMON_SKIP_LSN", "1/9ABCDEF0");
+        assertEquals(0x1_9ABCDEF0L, WriterConfig.fromEnv(high).skipLsn());
+    }
+
+    @Test
+    void anUnusableSkipLsnIsRefusedAtStartup() {
+        for (String bad : new String[] { "", " ", "0", "0/0", "nonsense", "1/", "/1",
+                                         "0/ZZZZ", "1-2", "0x10" }) {
+            Map<String, String> e = minimal();
+            e.put("PGPAIMON_SKIP_LSN", bad);
+            if (bad.isBlank()) {
+                assertEquals(0L, WriterConfig.fromEnv(e).skipLsn(), "blank means unset");
+                continue;
+            }
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> WriterConfig.fromEnv(e), "must refuse '" + bad + "'");
+            assertTrue(ex.getMessage().contains("PGPAIMON_SKIP_LSN"), ex.getMessage());
+        }
+    }
+
 }

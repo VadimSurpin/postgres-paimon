@@ -85,7 +85,36 @@ public final class TextDecoder {
     static final Timestamp TS_NEG_INFINITY = Timestamp.fromLocalDateTime(
         LocalDateTime.parse("-4712-01-01 00:00:00", TS));                                      // 4713-01-01 00:00:00 BC
 
+    /** What PostgreSQL's numeric accepts and prints for its non-finite values, lower-cased. */
+    private static final java.util.Set<String> NON_FINITE = java.util.Set.of(
+        "nan", "infinity", "-infinity", "+infinity", "inf", "-inf", "+inf");
+
     private TextDecoder() {
+    }
+
+    /**
+     * A value PostgreSQL stores happily that Paimon has no representation for at all: a
+     * {@code numeric} NaN or Infinity, or one whose digits cannot fit the target
+     * {@code DECIMAL(p, s)}. Nothing else throws this.
+     *
+     * <p>It exists so that the one escape hatch for a poison record ({@code PGPAIMON_SKIP_LSN})
+     * can be keyed on exactly this failure and nothing else. A plain
+     * {@link IllegalArgumentException} from here means the text did not parse as the Paimon type
+     * at all -- a malformed value, a drifted schema, or a session setting such as
+     * {@code bytea_output = 'escape'} -- and that is not skippable: it is a condition that would
+     * mis-handle every row of the column, not one bad value, and skipping it would hide the
+     * cause. Extending {@code IllegalArgumentException} keeps every existing caller working.
+     */
+    public static final class UnrepresentableValueException extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+
+        UnrepresentableValueException(String message) {
+            super(message);
+        }
+
+        UnrepresentableValueException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     public static Object toPaimon(DataType type, String text) {
@@ -104,9 +133,13 @@ public final class TextDecoder {
         try {
             return convert(type, text);
         } catch (RuntimeException e) {
-            throw new IllegalArgumentException(where(column)
-                + "cannot parse " + type + " from \"" + text + "\""
-                + (e.getMessage() == null ? "" : ": " + e.getMessage()), e);
+            String msg = where(column) + "cannot parse " + type + " from \"" + text + "\""
+                + (e.getMessage() == null ? "" : ": " + e.getMessage());
+            // The distinction has to survive the wrap: it is what the skip is keyed on.
+            if (e instanceof UnrepresentableValueException) {
+                throw new UnrepresentableValueException(msg, e);
+            }
+            throw new IllegalArgumentException(msg, e);
         }
     }
 
@@ -199,22 +232,41 @@ public final class TextDecoder {
         return year + body.substring(dash);
     }
 
+    /**
+     * The only source of {@link UnrepresentableValueException}: every failure here is a value
+     * PostgreSQL holds and Paimon cannot, never a parse failure.
+     */
     private static Decimal decimal(DecimalType t, String s) {
         BigDecimal v;
         try {
             v = new BigDecimal(s);      // NaN / Infinity throw NumberFormatException
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(
-                "numeric NaN and Infinity have no Paimon representation", e);
+            // Only the non-finite literals are unrepresentable. Any OTHER text that will not
+            // parse as a number is not a numeric at all -- a drifted column type, most likely --
+            // and must stay unskippable, or a mismatched column could be skipped a row at a
+            // time. PostgreSQL's numeric_out prints exactly these; the input spellings are
+            // accepted too, since nothing guarantees the value came from numeric_out.
+            if (NON_FINITE.contains(s.toLowerCase(java.util.Locale.ROOT))) {
+                throw new UnrepresentableValueException(
+                    "numeric NaN and Infinity have no Paimon representation", e);
+            }
+            throw new IllegalArgumentException("not a number", e);
         }
-        // Exact: throws ArithmeticException rather than rounding if digits would be lost.
-        v = v.setScale(t.getScale(), RoundingMode.UNNECESSARY);
+        try {
+            // Exact: throws ArithmeticException rather than rounding if digits would be lost.
+            v = v.setScale(t.getScale(), RoundingMode.UNNECESSARY);
+        } catch (ArithmeticException e) {
+            throw new UnrepresentableValueException("value has more than the " + t.getScale()
+                + " decimal places this column holds, so digits would be lost", e);
+        }
         if (v.precision() > t.getPrecision()) {
-            throw new IllegalArgumentException("value exceeds precision " + t.getPrecision());
+            throw new UnrepresentableValueException(
+                "value exceeds precision " + t.getPrecision());
         }
         Decimal d = Decimal.fromBigDecimal(v, t.getPrecision(), t.getScale());
         if (d == null) {
-            throw new IllegalArgumentException("value exceeds precision " + t.getPrecision());
+            throw new UnrepresentableValueException(
+                "value exceeds precision " + t.getPrecision());
         }
         return d;
     }

@@ -79,11 +79,15 @@ public final class Main {
                       new OffsetStore(registry, config));
         resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
+        warnOnStaleSkipLsn(config.skipLsn(), resume);
+
         // 6. the pipeline
         PgOutputDecoder decoder = new PgOutputDecoder();
         SlotConsumer[] consumerRef = new SlotConsumer[1];
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry,
-            confirmingFlusher(sink, lsn -> consumerRef[0].confirm(lsn)));
+            confirmingFlusher(sink, lsn -> consumerRef[0].confirm(lsn)),
+            config.skipLsn(),
+            (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record));
         DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix());
         SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle,
             new PipelineHandler.Target() {
@@ -120,6 +124,29 @@ public final class Main {
             exiting = true;
             System.exit(1);
         }
+    }
+
+    /**
+     * A {@code PGPAIMON_SKIP_LSN} at or below where the stream resumes can never fire: that
+     * record is behind us. Said out loud so a setting left behind after a successful skip is
+     * visible, rather than sitting armed and forgotten. Not a refusal to start -- the setting is
+     * harmless, and refusing would turn a stale variable into an outage.
+     */
+    static void warnOnStaleSkipLsn(long skipLsn, long resume) {
+        if (skipLsn == 0) {
+            return;
+        }
+        if (resume != 0 && Long.compareUnsigned(skipLsn, resume) <= 0) {
+            LOG.warning("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn)
+                + " is at or below the resume position " + SlotConsumer.formatLsn(resume)
+                + ", so it can never fire: that record is already behind the stream. If its skip"
+                + " has already happened, unset the variable; if it has not, the LSN is wrong.");
+            return;
+        }
+        LOG.warning("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn) + " is armed: the ONE"
+            + " record at that change LSN will be dropped, and logged in full, if and only if it"
+            + " fails because a value has no Paimon representation. Every other failure there,"
+            + " and every other LSN, stays fatal. Unset it once the skip has happened.");
     }
 
     /** What step 5 has to do, decided from the slot and the registry alone. */

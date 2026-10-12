@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 211 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 224 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -81,6 +81,7 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_SEQ_FIELD`, `PGPAIMON_OP_SEQ_FIELD` | `_seq`, `_op_seq` | mandatory metadata columns (sequencing) |
 | `PGPAIMON_XID_FIELD` | unset (**off**) | set to e.g. `_xid` to add the transaction id column |
 | `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per commit during the **initial load** only; it is not a streaming batch size (see below) |
+| `PGPAIMON_SKIP_LSN` | unset | emergency escape for a single poison record: the change LSN of the ONE record to drop. Read section 3, "A record the writer can never apply", before setting it |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 
 `_xid` is off by default because it is optional (spec section 6). The acceptance harness sets
@@ -248,23 +249,74 @@ The same applies to any value PostgreSQL stores happily that Paimon cannot repre
 beyond `DECIMAL(38, 18)`. (Dates and timestamps are not in this class: `infinity` is encoded as
 the extreme finite values and BC and large years parse, so the writer never refuses a temporal value.)
 
-**No guardrail can prevent this.** The extension refuses column *types* it cannot map, but a
-`numeric` column is mappable and can always be given the value `NaN`. The check can only
-happen on the write path, by which time PostgreSQL has committed and the record is in the slot.
+**No guardrail can prevent this one.** `add_table()` refuses column *types* it cannot map, and
+refuses a `numeric` without explicit precision or above 38 digits, but a `numeric(10,2)` column is
+perfectly mappable and can still be given the value `NaN`. The check can only happen on the write
+path, by which time PostgreSQL has committed and the record is in the slot.
 
-**Recourse today: the re-bootstrap procedure above, and nothing else.** It works (verified end to
-end) at the price it always costs: every tracked table is reloaded from a fresh snapshot and
-Paimon-side changelog history restarts. Before re-bootstrapping, correct the offending value in
-PostgreSQL, or the next write of that row will poison the slot again.
+#### Recovery: skip the one record, `PGPAIMON_SKIP_LSN`
 
-**What is missing.** There is no quarantine: no way to record the record as unapplied, advance past
-it and carry on, and no way to tell the writer to skip one LSN. That is a design decision, not an
-oversight to be patched in passing: a skip is a silent data loss unless it is recorded somewhere
-durable and surfaced, and deciding where that lives is the same decision as deciding what a
-dead-letter table looks like. Until then, the guarantee to read from spec section 8 is narrower
-than its table suggests: a failed Paimon commit is replayed on retry, but a replay that can never
-succeed is a permanent stop. Watch for `SEVERE: fatal:` and alert on the writer being down
-(section 3, first item) — that is the only protection there is.
+The error itself tells you the two recoveries and offers the cheap one first. It drops **one
+record** — not the transaction, which commits normally around it — and it logs the record's
+complete raw values so you can put the row back by hand. The loss is recoverable, not merely
+survivable.
+
+1. **Read the error.** It names the table, the column, the value, the change LSN and the commit
+   LSN, and prints the variable to set with the LSN already in it:
+
+   ```
+   ... POISON RECORD in public.v (INSERT at _seq 0/1C79B718), transaction committing at 0/1C79B830: column 'amt': cannot parse DECIMAL(10, 2) from "NaN" ... set PGPAIMON_SKIP_LSN=0/1C79B718 and restart ...
+   ```
+2. **Inspect the row in PostgreSQL** before you discard anything: `SELECT * FROM v WHERE id = 2;`.
+   Correct the value if you can. That does not unblock the slot — the old record is still in it —
+   but it stops the next write of that row poisoning the slot again.
+3. **Set the variable to that exact LSN and restart.** The writer announces it is armed, drops that
+   one record, and streams on:
+
+   ```bash
+   PGPAIMON_SKIP_LSN=0/1C79B718 java -jar java/writer/target/paimon-writer.jar
+   ```
+4. **Keep the audit line.** At WARNING, once the surrounding transaction has committed:
+
+   ```
+   WARNING: SKIPPED POISON RECORD (PGPAIMON_SKIP_LSN=0/1C79B718): public.v (relation 28531) INSERT at _seq 0/1C79B718, xid 5490: column 'amt': cannot parse DECIMAL(10, 2) from "NaN": numeric NaN and Infinity have no Paimon representation; the record's complete raw values, in relation column order [id, amt, note], were ["2", "NaN", "poison"], in the transaction committed at 0/1C79B830. The rest of that transaction WAS applied. ...
+   ```
+
+   Reinsert the row from those values with the offending column corrected. Nothing will replay it.
+5. **Unset it** and restart. Leaving it set is not dangerous — the startup line then reads
+   `is at or below the resume position ... so it can never fire` — but a forgotten escape hatch is
+   still a forgotten escape hatch.
+
+**What keeps this from being an "ignore errors" switch**, which is the only reason it is safe to
+offer at all:
+
+* **One LSN, never a range.** A range would let a single mistyped digit discard arbitrary committed
+  data, silently.
+* **One record, not the transaction.** Everything else committed alongside it is applied. (An
+  UPDATE decomposes to two records sharing one change LSN, so the change to that one *row* may be
+  two records; each is logged.)
+* **Only an unrepresentable value.** It fires solely for a value PostgreSQL holds and Paimon has no
+  representation for. A commit failure, a schema error, an arity mismatch, or a value that simply
+  does not *parse* as its Paimon type — a drifted column, or `bytea_output = 'escape'` — at the very
+  same LSN all stay fatal. Those are systematic faults that would mis-handle every row of a column,
+  and skipping one would hide the cause; the writer says so instead ("a systematic mismatch").
+* **The raw values are logged in full**, which is what makes the row recoverable.
+* It never applies to the initial load, which does not go through this path.
+
+Verified end to end: a three-row transaction with the poison record in the middle, skipped; the
+other two rows present, the record gone, streaming continued. A *wrong* skip LSN still exits 1 on
+the same record, and a stale one is announced rather than silently armed.
+
+**The remaining recourse** is the re-bootstrap procedure above, for anything the skip does not
+cover. It works, at the price it always costs: every tracked table is reloaded from a fresh snapshot
+and Paimon-side changelog history restarts.
+
+**What is still missing.** There is no quarantine: nothing records the skipped record durably for a
+reader to find (the log line is the whole audit trail), and nothing automates the decision — an
+operator must read the error and act. A dead-letter table is the next step and is not in v1. So
+keep reading spec section 8 with the correction it now carries: a failed Paimon commit is replayed
+on retry, but a replay that can never succeed stops the writer until somebody intervenes. Watch for
+`SEVERE: fatal:` and alert on the writer being down (section 3, first item).
 
 ### Other operational notes
 
@@ -542,7 +594,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 211 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 224 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```

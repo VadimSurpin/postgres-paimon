@@ -17,7 +17,7 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            String slotName, String publicationName,
                            String messagePrefix, String commitUser,
                            String seqField, String opSeqField, String xidField,
-                           int flushMaxRecords,
+                           int flushMaxRecords, long skipLsn,
                            Map<String, String> catalogOptions) {
 
     public static WriterConfig fromEnv(Map<String, String> env) {
@@ -49,6 +49,7 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             getOrDefault(env, "PGPAIMON_OP_SEQ_FIELD", "_op_seq"),
             get(env, "PGPAIMON_XID_FIELD"),
             (int) parseNumber(env, "PGPAIMON_FLUSH_MAX_RECORDS", "10000", Integer.MAX_VALUE),
+            parseLsn(env, "PGPAIMON_SKIP_LSN"),
             Map.copyOf(cat));
     }
 
@@ -61,6 +62,32 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
     private static String getOrDefault(Map<String, String> env, String key, String dflt) {
         String v = get(env, key);
         return v == null ? dflt : v;
+    }
+
+    /**
+     * One LSN, or 0 for unset: the change LSN of a single poison record to skip. Accepts the
+     * {@code X/XXXXXXXX} form the writer's own POISON RECORD error prints, and a plain decimal.
+     *
+     * <p>Deliberately one value and never a range: a range would let one mistyped digit discard
+     * arbitrary amounts of committed data, silently. See {@link TxnBatcher} for what it does.
+     */
+    private static long parseLsn(Map<String, String> env, String key) {
+        String v = get(env, key);
+        if (v == null) {
+            return 0;
+        }
+        v = v.trim();
+        try {
+            long lsn = v.indexOf('/') >= 0 ? SlotConsumer.parseLsn(v) : Long.parseUnsignedLong(v);
+            if (lsn == 0) {
+                throw new NumberFormatException("0 is not an LSN");
+            }
+            return lsn;
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException(key + " must be one LSN, either as the"
+                + " X/XXXXXXXX form the POISON RECORD error prints or as a decimal, got '"
+                + v + "'", e);
+        }
     }
 
     private static long parseNumber(Map<String, String> env, String key, String dflt, long max) {
