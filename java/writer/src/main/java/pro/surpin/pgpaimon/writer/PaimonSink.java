@@ -117,8 +117,17 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     org.apache.paimon.data.GenericRow row;
                     try {
                         row = rb.build(r);
-                    } catch (RuntimeException bad) {
+                    } catch (IllegalArgumentException bad) {
+                        // A VALUE the decoder cannot turn into this Paimon type. Only this is a
+                        // poison record; anything else from RowBuilder (an arity mismatch, say)
+                        // is a structural fault and is reported as one.
                         throw undecodable(meta, r, commitLsn, fromTheSlot, bad);
+                    } catch (RuntimeException other) {
+                        throw new IllegalStateException("cannot build a Paimon row for "
+                            + where(meta, r) + ": " + other.getMessage()
+                            + ". This is a structural mismatch between the record and the Paimon"
+                            + " schema, not a value Paimon cannot represent; it will replay"
+                            + " identically on restart.", other);
                     }
                     e.write().write(row, 0);
                 }
@@ -166,15 +175,29 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
      * <p>A record from the initial load is a different situation -- it came from a COPY, not from
      * the slot, and fixing the row does help -- so it is diagnosed differently.
      */
+    private static String where(RelationMeta meta, SinkRecord r) {
+        return meta.namespace() + "." + meta.relName()
+            + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+    }
+
     private IllegalStateException undecodable(RelationMeta meta, SinkRecord r, long commitLsn,
                                               boolean fromTheSlot, RuntimeException cause) {
-        String where = meta.namespace() + "." + meta.relName()
-            + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+        String where = where(meta, r);
         if (!fromTheSlot) {
+            // Two different causes land here and the remedy differs, so name both. The value may
+            // be one Paimon cannot represent; or the Paimon column's type may no longer match the
+            // PostgreSQL column's, in which case the row is perfectly good and correcting it
+            // cannot help -- which is what the old "correct or delete that row" advice sent
+            // operators to do.
             return new IllegalStateException("cannot load " + where + " during the initial"
-                + " backfill: " + cause.getMessage() + ". The value came from the table itself,"
-                + " not from the replication slot, so correcting or deleting that row and running"
-                + " the backfill again will fix it.", cause);
+                + " backfill: " + cause.getMessage()
+                + ". This value came from the table itself, not from the replication slot, so"
+                + " nothing is stuck in the slot. Two things cause it. Either the value is one"
+                + " Paimon cannot represent, and correcting that row and reloading fixes it; or"
+                + " the Paimon column's type no longer matches the PostgreSQL column's (schema"
+                + " drift: compare the type named above with the PostgreSQL column), and no edit"
+                + " to the row can help -- re-register the table instead"
+                + " (paimon.remove_table, delete the Paimon table, paimon.add_table).", cause);
         }
         return new IllegalStateException("POISON RECORD in " + where
             + ", transaction committing at " + SlotConsumer.formatLsn(commitLsn) + ": "

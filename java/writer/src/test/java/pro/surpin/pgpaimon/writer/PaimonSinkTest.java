@@ -405,9 +405,44 @@ class PaimonSinkTest {
                 Arrays.asList("2", "NaN"), 500L, 0, 0L);
             IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> s.flushApplied(List.of(bad), 500L, 500L));
-            assertFalse(e.getMessage().contains("POISON RECORD"), e.getMessage());
-            assertTrue(e.getMessage().contains("initial backfill"), e.getMessage());
-            assertTrue(e.getMessage().contains("will fix it"), e.getMessage());
+            String m = e.getMessage();
+            assertFalse(m.contains("POISON RECORD"), m);
+            assertTrue(m.contains("initial backfill"), m);
+            assertTrue(m.contains("nothing is stuck in the slot"), m);
+            // Both causes, because the remedy differs and only one of them is about the row.
+            assertTrue(m.contains("correcting that row and reloading fixes it"), m);
+            assertTrue(m.contains("schema drift"), m);
+            assertTrue(m.contains("re-register the table"), m);
+        }
+    }
+
+    /**
+     * Not every RuntimeException from RowBuilder is a poison record. An arity mismatch is a
+     * structural fault: the record and the Paimon schema disagree about how many columns there
+     * are, which is not a value Paimon cannot represent, and calling it a poison record would
+     * send the reader to the wrong page.
+     */
+    @Test @Order(18)
+    void aStructuralFailureIsNotCalledAPoisonRecord() throws Exception {
+        long relid = 16702L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16702,"schema":"public","table":"arity",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"}],
+              "options":{"changelog-producer":"input"}}"""));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, new RelationMeta(relid, "public", "arity",
+                List.of("id", "v"), List.of(true, false)));
+            // three values for a two-column relation
+            SinkRecord bad = new SinkRecord(relid, RowKind.INSERT,
+                Arrays.asList("1", "a", "surplus"), 700L, 0, 0L);
+            IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> s.flush(List.of(bad), 700L, 710L));
+            String m = e.getMessage();
+            assertFalse(m.contains("POISON RECORD"), m);
+            assertTrue(m.contains("public.arity"), m);
+            assertTrue(m.contains("structural mismatch"), m);
+            assertTrue(m.contains("3 values"), m);
         }
     }
 }
