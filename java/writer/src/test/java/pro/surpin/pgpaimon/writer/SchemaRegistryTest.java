@@ -416,7 +416,7 @@ class SchemaRegistryTest {
             reg.bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input",
                                false));
         assertEquals(1, pending.size(), pending.toString());
-        assertTrue(pending.get(0).getMessage().contains("still in the slot"),
+        assertTrue(pending.get(0).getMessage().contains("should still be in the stream"),
                    pending.get(0).getMessage());
         assertEquals(original, reg.table(40003L).schema().fieldNames(),
                      "with the slot present the column must NOT be fabricated");
@@ -520,29 +520,85 @@ class SchemaRegistryTest {
     }
 
     /**
-     * Same name, different type: reported, never thrown, and the stored type is left alone.
+     * Same name, different type, on a table with NO recorded DDL LSN: reported, never thrown,
+     * and the stored type left alone.
      *
-     * This test used to assert the opposite, and that assertion was wrong. An add_col whose
+     * This test used to assert a throw unconditionally, and that was wrong. An add_col whose
      * column exists with a different type is indistinguishable from a replayed add_col that a
-     * replayed alter_col has already superseded -- "ADD COLUMN num int; ALTER COLUMN num TYPE
-     * bigint" produces exactly this on replay -- so throwing turned an ordinary two-statement
-     * ALTER into a permanent stop. Leaving the stored type alone is also the right outcome in
-     * the replay case: it is the later, correct type.
+     * replayed alter_col has superseded -- "ADD COLUMN num int; ALTER COLUMN num TYPE bigint"
+     * produces exactly this on replay -- so throwing turned an ordinary two-statement ALTER into
+     * a permanent stop. Leaving the stored type alone is also right in the replay case: it is
+     * the later type. But the tolerance is only sound where a replay cannot be ruled out, which
+     * is why it is keyed on the absence of an identifier; see the next test.
      */
     @Test @Order(42)
-    void addColumnOnAColumnOfAnotherTypeIsReportedNotThrown() throws Exception {
-        long before = reg.table(IDEM).schema().id();
+    void addColumnOnAnotherTypeIsToleratedOnlyWithoutARecordedLsn() throws Exception {
+        // a table whose columns came from the create message, so it has no recorded DDL LSN
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":41100,"schema":"public","table":"nolsn_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                 {"id":2,"name":"n","type":"BIGINT"}],
+             "options":{"changelog-producer":"input"}}"""));
+        assertEquals(0L, reg.appliedDdlLsn(41100L));
+        long before = reg.table(41100L).schema().id();
+
         List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg("""
+                {"v":1,"op":"add_col","relid":41100,
+                 "col":{"id":2,"name":"n","type":"INT"}}""")));
+        assertEquals(1, warn.size(), warn.toString());
+        assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
+                   warn.get(0).getMessage());
+        assertTrue(warn.get(0).getMessage().contains("no recorded DDL LSN"),
+                   warn.get(0).getMessage());
+        assertEquals("BIGINT", reg.table(41100L).rowType().getField("n").type().asSQLString());
+        assertEquals(before, reg.table(41100L).schema().id());
+    }
+
+    /**
+     * The other half, and the signal the tolerance must not swallow: once a table HAS a recorded
+     * DDL LSN, a replay is filtered by the gate before any state is inspected, so reaching the
+     * tolerance means the Paimon schema and paimon.table_registry genuinely disagree. That has
+     * to be loud.
+     */
+    @Test @Order(42)
+    void withARecordedLsnTheSameConflictFailsLoudly() throws Exception {
+        assertTrue(reg.appliedDdlLsn(IDEM) != 0, "earlier ops recorded an LSN for this table");
+        long before = reg.table(IDEM).schema().id();
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
             handler.handle(msg(idem("""
                 {"v":1,"op":"add_col","relid":"RELID",
                  "col":{"id":4,"name":"extra","type":"STRING"}}"""))));
-        assertEquals(1, warn.size(), warn.toString());
-        assertTrue(warn.get(0).getMessage().contains("extra"), warn.get(0).getMessage());
-        assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
-                   warn.get(0).getMessage());
+        assertTrue(e.getMessage().contains("not a replay"), e.getMessage());
+        assertTrue(e.getMessage().contains("genuinely disagree"), e.getMessage());
+        assertTrue(e.getMessage().contains("re-register"), e.getMessage());
         assertEquals("BIGINT",
             reg.table(IDEM).rowType().getField("extra").type().asSQLString());
         assertEquals(before, reg.table(IDEM).schema().id());
+    }
+
+    /** The same split for alter_col on a column Paimon does not have. */
+    @Test @Order(42)
+    void alterColumnOnAMissingColumnIsToleratedOnlyWithoutARecordedLsn() throws Exception {
+        handler.handle(msg("""
+            {"v":1,"op":"create","relid":41101,"schema":"public","table":"nolsn2_t",
+             "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+             "options":{"changelog-producer":"input"}}"""));
+        List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () ->
+            handler.handle(msg("""
+                {"v":1,"op":"alter_col","relid":41101,"id":9,"name":"ghost","type":"INT"}""")));
+        assertEquals(1, warn.size(), warn.toString());
+        assertTrue(warn.get(0).getMessage().contains("no recorded DDL LSN"),
+                   warn.get(0).getMessage());
+
+        // with an identifier recorded, the same message is a genuine disagreement
+        handler.handle(msg("""
+            {"v":1,"op":"add_col","relid":41101,"col":{"id":2,"name":"real","type":"INT"}}"""));
+        assertTrue(reg.appliedDdlLsn(41101L) != 0);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () ->
+            handler.handle(msg("""
+                {"v":1,"op":"alter_col","relid":41101,"id":9,"name":"ghost","type":"INT"}""")));
+        assertTrue(e.getMessage().contains("genuinely disagree"), e.getMessage());
     }
 
     @Test @Order(43)

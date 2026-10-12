@@ -181,8 +181,14 @@ public final class SchemaRegistry {
         }
         for (DdlMessage.Col c : missing) {
             if (!reconcileLostDdl) {
-                diffs.add("column '" + c.name() + "' is missing from Paimon; its DDL message is"
-                    + " still in the slot and will apply it");
+                // Careful not to promise: the slot existing is why this is left alone, and the
+                // slot can be dropped moments later (the RECREATE_SLOT_AND_BACKFILL path), in
+                // which case Main re-runs this with reconciliation on.
+                diffs.add("column '" + c.name() + "' is missing from Paimon; the slot still"
+                    + " exists, so its DDL message should still be in the stream and is left to"
+                    + " that message rather than guessed at here. If the column is still missing"
+                    + " once the writer has caught up, the message was lost: re-register the"
+                    + " table");
                 continue;
             }
             DataType t = parseType(c.type());
@@ -232,13 +238,22 @@ public final class SchemaRegistry {
      * to collide with. The invariant the LSN gate gives by construction: replaying any suffix of
      * an already-applied DDL sequence converges to the same schema and never fails.
      *
-     * The state-based tolerances below remain as a second line for a table with no recorded LSN
-     * (one whose DDL was applied before this mechanism existed, or reconciled at bootstrap). They
-     * never throw: a column that already exists with a different type is logged and left alone,
-     * because in the replay case the stored type is the later, correct one.
+     * The state-based tolerances below remain as a second line, but ONLY for a table with no
+     * recorded LSN -- one whose DDL was applied before this mechanism existed. A table that has
+     * an identifier cannot reach them by replay, because the gate filters a replay first, so
+     * reaching them there means genuine drift and must still fail loudly. Keying the tolerance
+     * on {@code appliedDdlLsn(relid) == 0} is what keeps a tolerance needed for one case from
+     * silencing a real fault in the other.
      */
 
-    /** Schema option holding the WAL LSN of the last DDL message applied to this table. */
+    /**
+     * Schema option holding the WAL LSN of the last DDL message applied to this table.
+     *
+     * <p>Caveat worth knowing: the value carries no cluster or timeline identity. A warehouse
+     * pointed at a different server, or at one restored by PITR or re-{@code initdb}'d, can
+     * therefore meet DDL messages whose LSNs sit below the recorded value and skip them as
+     * replays. Nothing here detects that; the operations guide says so where operators look.
+     */
     static final String DDL_LSN_OPTION = "pgpaimon.applied-ddl-lsn";
 
     public void addColumn(long relid, DdlMessage.Col col, long ddlLsn) {
@@ -251,14 +266,18 @@ public final class SchemaRegistry {
             if (existing.type().equals(wanted)) {
                 LOG.info("add_col '" + col.name() + "' on " + identifiers.get(relid)
                     + " is already applied as " + wanted.asSQLString() + ": no-op");
-            } else {
-                // Not a throw, deliberately. A replayed add superseded by a replayed alter_col
-                // looks exactly like this, and the stored type is then the later, correct one.
-                LOG.warning("add_col '" + col.name() + "' on " + identifiers.get(relid)
-                    + ": the column already exists as " + existing.type().asSQLString()
-                    + " but the message declares " + wanted.asSQLString()
-                    + "; leaving the stored type alone");
+                return;
             }
+            // Not a throw when there is no recorded LSN: a replayed add superseded by a replayed
+            // alter_col looks exactly like this, and the stored type is then the later, correct
+            // one. But with an identifier recorded, a replay was already filtered by the gate,
+            // so getting here is genuine drift and must be loud.
+            String what = "add_col '" + col.name() + "' on " + identifiers.get(relid)
+                + ": the column already exists as " + existing.type().asSQLString()
+                + " but the message declares " + wanted.asSQLString();
+            requireNoRecordedLsn(relid, what);
+            LOG.warning(what + "; this table has no recorded DDL LSN, so a superseded replay"
+                + " cannot be ruled out: leaving the stored type alone");
             return;
         }
         alter(relid, SchemaChange.addColumn(col.name(), wanted), ddlLsn);
@@ -311,8 +330,11 @@ public final class SchemaRegistry {
         DataType wanted = parseType(type);
         DataField current = field(relid, name);
         if (current == null) {
-            LOG.warning("alter_col '" + name + "' on " + identifiers.get(relid)
-                + ": no such column in the Paimon schema; skipped (renamed or dropped since)");
+            String what = "alter_col '" + name + "' on " + identifiers.get(relid)
+                + ": no such column in the Paimon schema";
+            requireNoRecordedLsn(relid, what);
+            LOG.warning(what + "; this table has no recorded DDL LSN, so the column may have"
+                + " been renamed or dropped by a later message already applied: skipped");
             return;
         }
         if (current.type().equals(wanted)) {
@@ -333,12 +355,34 @@ public final class SchemaRegistry {
         }
         long applied = appliedDdlLsn(relid);
         if (applied != 0 && Long.compareUnsigned(ddlLsn, applied) <= 0) {
+            // Both forms: the X/XXXXXXXX one to compare with pg_replication_slots and the
+            // writer's own messages, the decimal one because that is what the schema option
+            // holds and what an operator reading it back will see.
             LOG.info(what + " on " + identifiers.get(relid) + " at "
-                + SlotConsumer.formatLsn(ddlLsn) + " is at or below the last applied DDL LSN "
-                + SlotConsumer.formatLsn(applied) + ": replay, no-op");
+                + SlotConsumer.formatLsn(ddlLsn) + " (" + Long.toUnsignedString(ddlLsn)
+                + ") is at or below the last applied DDL LSN " + SlotConsumer.formatLsn(applied)
+                + " (" + Long.toUnsignedString(applied) + "): replay, no-op");
             return true;
         }
         return false;
+    }
+
+    /**
+     * Throws unless the table has no recorded DDL LSN. The state-based tolerances exist for a
+     * table that predates the identifier; a table that HAS one cannot reach them by replay,
+     * because {@link #replayed} filters first, so reaching them means the registry and the
+     * Paimon schema genuinely disagree and the writer must say so rather than carry on.
+     */
+    private void requireNoRecordedLsn(long relid, String what) {
+        long applied = appliedDdlLsn(relid);
+        if (applied != 0) {
+            throw new IllegalStateException(what + ". This is not a replay: the table's last"
+                + " applied DDL LSN is " + SlotConsumer.formatLsn(applied)
+                + " and this message is above it, so the Paimon schema and"
+                + " paimon.table_registry genuinely disagree. Compare them; re-register the"
+                + " table (paimon.remove_table, delete the Paimon table, paimon.add_table) if"
+                + " they do");
+        }
     }
 
     /** The recorded last-applied DDL LSN of a table, or 0 if it has none. */
