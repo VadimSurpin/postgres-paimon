@@ -695,3 +695,125 @@ tests, or whose every test is skipped, fails the harness; that is how `PaimonE2E
 Status of the remote warehouses: **T19 (HDFS) passes; T18 (S3) is not run** here, because it needs
 a MinIO server (`E2E_MINIO_BIN`). The harness says so in its verdict (`ALL SUITES PASSED -- except:
 T18 (S3) NOT RUN`); a skip is never counted as a pass.
+
+### TPC-C end to end: PostgreSQL and Paimon hold the same state
+
+A separate harness runs a real BenchBase TPC-C workload through the slot and then compares the two
+sides row by row. It is the only test here that exercises the streaming write path under a bulk
+load and an update-heavy OLTP mix at once.
+
+```bash
+./test/tpcc/run_tpcc.sh        # defaults: 1 warehouse, 60s execute at up to 25 tps
+```
+
+It needs a JDK 21 as well as the project's 17, because BenchBase targets 21; set `JAVA21_HOME` if
+it is not under `/usr/lib/jvm`. Everything else is configurable from the environment (see the
+header of the script). Runtime state goes to `/tmp/pgpaimon-tpcc`, never into the worktree, and the
+cluster is its own, on port 5443. In CI it is `.github/workflows/tpcc.yml`, **`workflow_dispatch`
+only**.
+
+**The order of the phases is the whole design.** BenchBase can create, load and execute
+separately, and it has to here:
+
+1. `--create=true --load=false --execute=false` — the stock TPC-C schema, empty.
+2. `test/tpcc/setup.sql` — `CREATE EXTENSION`, then `paimon.add_table()` on each of the eight
+   replicable tables **while they are still empty and before the slot exists**. The Paimon tables
+   come from the `create` messages this emits; nothing in the harness writes the warehouse.
+3. the writer starts, creates the slot, and backfills eight empty tables (nothing to copy).
+4. `--load=true` — about 540k rows for one warehouse, **through the slot**, not through the
+   backfill. That is deliberate: it is the only bulk-insert test of the streaming path.
+5. `--execute=true` — the stock mix (NewOrder 45, Payment 43, OrderStatus 4, Delivery 4,
+   StockLevel 4), which is where the updates and the `new_order` deletes come from.
+
+Then the harness waits until `confirmed_flush_lsn` has passed the WAL position reached when the
+workload stopped, stops the writer with SIGTERM, and runs the comparison.
+
+**BenchBase and its TPC-C schema are used exactly as they ship.** No surrogate key, no added
+column, no DDL edit, no patch: the workload stays recognisably TPC-C.
+
+**`history` is not replicated, and that is the primary-key requirement working as specified.**
+TPC-C's `history` table has no primary key — two foreign keys and nothing else — and `paimon_slot`
+requires one on every replicated table, because the write target is a Paimon primary-key table and
+without a key there is nothing to merge on. `add_table()` refuses such a table on purpose
+(`paimon_slot: history has no primary key`), so eight of the nine tables are registered and
+`history` reaches neither the publication nor the warehouse.
+
+This is a genuine, visible consequence of the design, not an oversight and not a workaround, so
+**do not "fix" it by giving `history` a key.** The harness treats the exclusion as a property to
+test rather than an assumption, in two places:
+
+* `setup.sql` asserts `history` is unregistered, unpublished and still key-less, and then calls
+  `paimon.add_table('history')` and requires it to fail with the primary-key error — so the refusal
+  is exercised, not merely relied upon;
+* the comparison asserts `history` is untracked, absent from `paimon_pub`, absent from the Paimon
+  catalog and absent from `<warehouse>/public.db/`, **while holding rows**. Payment inserts into
+  `history` throughout the run, so this is a live demonstration that a table never passed to
+  `add_table` stays genuinely untouched under a busy workload — the guarantee acceptance test T17
+  checks in miniature, here at TPC-C scale.
+
+What the exclusion costs is one table's breadth, not a class of behaviour: `history` is insert-only
+in TPC-C, and the eight replicated tables exercise inserts, composite-key updates and deletes far
+harder. Their keys are one to four columns wide (`order_line` is four), so composite keys are well
+covered.
+
+**What the comparison asserts** (`java/src/test/java/pro/surpin/pgpaimon/TpccCompare.java`, run as
+`java -cp java/target/paimon-reader-1.0.jar pro.surpin.pgpaimon.TpccCompare <warehouse> <jdbc-url>
+[schema]`):
+
+* the Paimon column list is exactly PostgreSQL's plus the writer's metadata columns, and the Paimon
+  primary key is PostgreSQL's primary key;
+* **every column of every row** of the eight replicated tables, not row counts. A row count agrees with PostgreSQL in exactly the
+  case this branch kept finding: a merged table that looks right while the changelog is wrong. Both
+  sides are canonicalised through the *Paimon* column type, so `numeric(12,2)` is compared as a
+  scale-2 decimal rather than as two string renderings; PostgreSQL is read ordered by primary key
+  so a reported difference is the same one on every run. The first ten differing rows of each table
+  are printed with both sides' values.
+* **the changelog, from `$audit_log` over a streaming scan** (a merged read reports `INSERT` for
+  every surviving row and physically cannot answer this): `-U` count equals `+U` count, so no
+  update lost its before-image; `+I` minus `-D` equals the surviving row count, since no TPC-C
+  transaction moves a primary key; and `-U > 0` on every table TPC-C updates. Whether Delivery ran
+  is read off PostgreSQL — the loader gives a carrier id only to orders below 2101, so a delivered
+  order above that is proof — and the `oorder` / `order_line` / `new_order` assertions are strict
+  only when it did.
+
+A difference fails the harness and the CI job. The job uploads the writer log, the comparison
+output and a warehouse listing whatever the outcome.
+
+**What sets the runtime is the transaction rate, not the row count.** The writer commits once per
+PostgreSQL transaction — a batch is one committed transaction or nothing — so a run leaves one
+Paimon snapshot per transaction, and both the drain and the `$audit_log` scan (one `plan()` per
+snapshot) are linear in that count. The comparison prints the snapshot count next to each table's
+row kinds so the cost is visible. The defaults, 60s at 25 tps, are about 1500 transactions: enough
+for every update and delete path TPC-C has, including roughly sixty Delivery transactions. Raising
+`TPCC_RATE` or `TPCC_TIME` costs time, not rigour; the load is ~540k rows either way.
+
+**Measured, and worth knowing before running this at scale.** One run at the defaults (1 warehouse,
+60s at 25 tps, 576,779 replicated rows) left **9,467 snapshots and 71,497 files** in a **1.8 GB**
+warehouse, of which only **465 MB is data**:
+
+| component | size | share |
+|---|---|---|
+| data (Parquet) | 465 MB | 25% |
+| `snapshot/` + `manifest/` | 217 MB | 12% |
+| `index/` (dynamic-bucket key index) | 1,160 MB | 63% |
+
+The snapshot count is the design working as specified — one Paimon commit per committed PostgreSQL
+transaction, which is what makes the atomicity guarantee hold — but the metadata it implies is not
+free. The dominant term is the **dynamic-bucket index**, not the snapshots: `order_line` alone holds
+1,006 MB of index against 88 MB of data, because Paimon rewrites a bucket's key-hash index whenever
+new keys arrive and `order_line` gains keys on nearly every commit. A table that is updated but
+never grown shows the opposite — `customer` has 1,377 snapshots and 1.8 MB of index.
+
+Two consequences for an operator:
+
+* **Nothing is reclaimed for the first hour.** Paimon's defaults are `snapshot.num-retained.min = 10`,
+  `num-retained.max = Integer.MAX_VALUE`, `snapshot.time-retained = 1h`. A short run never reaches
+  expiry and a sustained one accumulates an hour's worth first, so `snapshot.time-retained` and
+  `snapshot.num-retained.max` want deliberate values on a write-heavy table.
+* **Read planning scales with the snapshot count, not the data.** A streaming changelog scan must
+  `plan()` once per snapshot: the comparison took 120s to read 9,467 snapshots' changelogs. At 50 tps
+  the same workload left ~2,900 snapshots per table and the same comparison took about 12 minutes.
+
+The writer sets no `bucket` option, so every table gets dynamic bucketing. Exposing a per-table
+bucket count through `add_table()` would remove the dominant cost above; that is an open design
+question, not a defect, and nothing here changes it.
