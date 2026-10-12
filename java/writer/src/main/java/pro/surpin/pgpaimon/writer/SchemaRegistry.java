@@ -66,6 +66,29 @@ public final class SchemaRegistry {
     /** As above with an explicit changelog-producer (taken from the message's options). */
     public void createTable(long relid, String schema, String table, List<String> pk,
                             List<DdlMessage.Col> cols, String changelogProducer) {
+        create(relid, schema, table, pk, cols, changelogProducer, false);
+    }
+
+    /**
+     * The startup bootstrap's replay of one {@code paimon.table_registry} row.
+     *
+     * <p>{@code reconcileLostDdl} must be true <strong>only when the replication slot is absent</strong>.
+     * A DDL message can be lost only along with the slot; while the slot lives, a column the
+     * registry has and Paimon lacks is <em>pending</em> in the unconsumed stream, not lost — and
+     * at bootstrap the registry is always ahead of the stream by everything unconsumed. Treating
+     * that as loss fabricated the column as a new empty one and the still-pending
+     * {@code rename_col}/{@code add_col} then collided, wedging the writer on an ordinary
+     * {@code RENAME COLUMN} performed while it was stopped.
+     */
+    public void bootstrapTable(long relid, String schema, String table, List<String> pk,
+                               List<DdlMessage.Col> cols, String changelogProducer,
+                               boolean reconcileLostDdl) {
+        create(relid, schema, table, pk, cols, changelogProducer, reconcileLostDdl);
+    }
+
+    private void create(long relid, String schema, String table, List<String> pk,
+                        List<DdlMessage.Col> cols, String changelogProducer,
+                        boolean reconcileLostDdl) {
         Schema.Builder b = Schema.newBuilder();
         for (DdlMessage.Col c : cols) {
             b.column(c.name(), parseType(c.type()));
@@ -98,7 +121,7 @@ public final class SchemaRegistry {
         identifiers.put(relid, id);
         forget0(relid);
         if (existing != null) {
-            reconcileOrWarn(relid, id, existing, pk, cols);
+            reconcileOrWarn(relid, id, existing, pk, cols, reconcileLostDdl);
         }
     }
 
@@ -106,13 +129,18 @@ public final class SchemaRegistry {
      * A repeated create for an existing table (the restart bootstrap replays every registry row).
      *
      * <p>Columns the create message declares and Paimon lacks are <strong>applied</strong>, one
-     * {@code addColumn} each, with a WARNING naming the column. Warning alone was not enough: a
-     * DDL message lost while the writer was down (a dropped slot, the re-bootstrap procedure in
-     * the operations guide) leaves the Paimon schema permanently behind, and {@link RowBuilder}
-     * then discards that column's value from every row for ever, with nothing but two warnings to
-     * show for it. The registry is rebuilt from {@code paimon.table_registry}, which is updated in
-     * the same transaction as the DDL, so on this one difference the create message is the
-     * authority and Paimon is simply behind.
+     * {@code addColumn} each, with a WARNING naming the column — but <strong>only when
+     * {@code reconcileLostDdl}</strong>, which the caller sets only if the slot is absent. Warning
+     * alone was not enough: a DDL message lost with the slot (the re-bootstrap procedure in the
+     * operations guide drops it) leaves the Paimon schema permanently behind, and
+     * {@link RowBuilder} then discards that column's value from every row for ever, with nothing
+     * but two warnings to show for it. The registry is rebuilt from {@code paimon.table_registry},
+     * which is updated in the same transaction as the DDL, so on this one difference the create
+     * message is the authority and Paimon is simply behind.
+     *
+     * <p>With the slot present the same difference means the opposite: the DDL message is still in
+     * the stream, waiting. Reconciling then fabricates the column and the pending message collides
+     * with it, so it is only reported.
      *
      * <p>Everything else is a WARNING and nothing more, because there is no way to tell which side
      * is right: a column present in both with different types, a different primary key, a column
@@ -122,7 +150,7 @@ public final class SchemaRegistry {
      * a restart.
      */
     private void reconcileOrWarn(long relid, Identifier id, Table existing, List<String> pk,
-                                 List<DdlMessage.Col> cols) {
+                                 List<DdlMessage.Col> cols, boolean reconcileLostDdl) {
         List<String> diffs = new ArrayList<>();
         if (!existing.primaryKeys().equals(pk)) {
             diffs.add("primary key is " + existing.primaryKeys() + " in Paimon but " + pk
@@ -152,14 +180,19 @@ public final class SchemaRegistry {
             diffs.add("column '" + extra + "' exists in Paimon but not in the create message");
         }
         for (DdlMessage.Col c : missing) {
+            if (!reconcileLostDdl) {
+                diffs.add("column '" + c.name() + "' is missing from Paimon; its DDL message is"
+                    + " still in the slot and will apply it");
+                continue;
+            }
             DataType t = parseType(c.type());
             try {
                 catalog.alterTable(id, List.of(SchemaChange.addColumn(c.name(), t)), false);
                 forget0(relid);
                 LOG.warning("create for existing table " + id + ": column '" + c.name() + "' "
                     + t.asSQLString() + " was missing from its Paimon schema and has been added"
-                    + " (a DDL message for it never reached this writer; rows written before now"
-                    + " hold NULL there)");
+                    + " (the slot is absent, so its DDL message is lost, not pending; rows"
+                    + " written before now hold NULL there)");
             } catch (Exception e) {
                 diffs.add("column '" + c.name() + "' is missing from Paimon and could not be"
                     + " added: " + e);

@@ -380,58 +380,108 @@ class SchemaRegistryTest {
     }
 
     /**
-     * Finding 4 of the whole-branch review. A DDL message lost while the writer was down (the
-     * re-bootstrap procedure drops the slot, so anything still in it is gone) used to leave the
+     * Finding 4 of the whole-branch review, and its own regression.
+     *
+     * A DDL message lost with the slot (the re-bootstrap procedure drops it) used to leave the
      * Paimon schema permanently behind: the drift was warned about and RowBuilder then discarded
-     * the column's value from every row for ever. A create for an existing table now APPLIES the
-     * columns Paimon lacks. A conflicting difference stays a warning, because neither side can be
-     * shown to be right.
+     * the column's value from every row for ever. The bootstrap now APPLIES the columns Paimon
+     * lacks -- but only when the slot is ABSENT, which is the only situation in which a message
+     * can have been lost. With the slot present the same difference means the message is still
+     * in the stream, and fabricating the column made the pending rename_col/add_col collide,
+     * wedging the writer on an ordinary RENAME COLUMN done while it was stopped.
+     *
+     * A conflicting difference stays a warning either way, because neither side can be shown to
+     * be right.
      */
     @Test @Order(32)
-    void replayedCreateAppliesTheColumnsPaimonIsMissing() throws Exception {
+    void bootstrapAppliesTheMissingColumnsOnlyWhenTheSlotIsAbsent() throws Exception {
         String base = CREATE_FIXTURE.replace("19228", "40003").replace("cap_t", "recon_t");
         handler.handle(msg(base));
-        assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq"),
-                     reg.table(40003L).schema().fieldNames());
+        List<String> original = List.of("id", "qty", "price", "note", "_seq", "_op_seq");
+        assertEquals(original, reg.table(40003L).schema().fieldNames());
 
-        // the same table, now with a column the writer never saw a DDL message for
+        // The registry row now carries a column Paimon has not got. At bootstrap that always
+        // happens when a DDL message is still unconsumed, so it only means "lost" if the slot
+        // has gone.
+        List<DdlMessage.Col> drifted = List.of(
+            new DdlMessage.Col(1, "id", "INT NOT NULL"),
+            new DdlMessage.Col(2, "qty", "INT"),
+            new DdlMessage.Col(3, "price", "DECIMAL(10, 2)"),
+            new DdlMessage.Col(4, "note", "STRING"),
+            new DdlMessage.Col(5, "extra", "STRING"));
+
+        // slot PRESENT: reported, never applied -- the pending message will apply it
+        long ver = reg.table(40003L).schema().id();
+        List<LogRecord> pending = captureWarnings(SchemaRegistry.class, () ->
+            reg.bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input",
+                               false));
+        assertEquals(1, pending.size(), pending.toString());
+        assertTrue(pending.get(0).getMessage().contains("still in the slot"),
+                   pending.get(0).getMessage());
+        assertEquals(original, reg.table(40003L).schema().fieldNames(),
+                     "with the slot present the column must NOT be fabricated");
+        assertEquals(ver, reg.table(40003L).schema().id());
+
+        // slot ABSENT: the message is lost, so apply it
+        List<LogRecord> lost = captureWarnings(SchemaRegistry.class, () ->
+            reg.bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input",
+                               true));
+        assertEquals(1, lost.size(), lost.toString());
+        assertTrue(lost.get(0).getMessage().contains("'extra'"), lost.get(0).getMessage());
+        assertTrue(lost.get(0).getMessage().contains("has been added"), lost.get(0).getMessage());
+        assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq", "extra"),
+                     reg.table(40003L).schema().fieldNames(),
+                     "the missing column must be applied, not merely warned about");
+
+        // and a second bootstrap is then silent
+        assertTrue(captureWarnings(SchemaRegistry.class, () ->
+            reg.bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input",
+                               true)).isEmpty());
+
+        // a column present in both with a different type is NOT reconciled, slot or no slot
+        long ver2 = reg.table(40003L).schema().id();
+        List<DdlMessage.Col> conflicting = new ArrayList<>(drifted);
+        conflicting.set(2, new DdlMessage.Col(3, "price", "DECIMAL(12, 2)"));
+        List<LogRecord> conflict = captureWarnings(SchemaRegistry.class, () ->
+            reg.bootstrapTable(40003L, "public", "recon_t", List.of("id"), conflicting, "input",
+                               true));
+        assertEquals(1, conflict.size(), conflict.toString());
+        assertTrue(conflict.get(0).getMessage().contains("'price'"),
+                   conflict.get(0).getMessage());
+        assertEquals(ver2, reg.table(40003L).schema().id(),
+                     "a conflicting difference must not alter the table");
+    }
+
+    /** A streamed create message never reconciles: only the startup bootstrap can. */
+    @Test @Order(33)
+    void aStreamedCreateNeverReconciles() throws Exception {
+        String base = CREATE_FIXTURE.replace("19228", "40004").replace("cap_t", "nostream_t");
+        handler.handle(msg(base));
+        long ver = reg.table(40004L).schema().id();
         String drifted = base.replace(
             """
             {"id":4,"name":"note","type":"STRING"}""",
             """
             {"id":4,"name":"note","type":"STRING"},
                      {"id":5,"name":"extra","type":"STRING"}""");
-        List<LogRecord> logs = captureWarnings(SchemaRegistry.class,
-                                               () -> handler.handle(msg(drifted)));
-        assertEquals(1, logs.size(), logs.toString());
-        assertTrue(logs.get(0).getMessage().contains("'extra'"), logs.get(0).getMessage());
-        assertTrue(logs.get(0).getMessage().contains("has been added"), logs.get(0).getMessage());
-        assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq", "extra"),
-                     reg.table(40003L).schema().fieldNames(),
-                     "the missing column must be applied, not merely warned about");
-
-        // and a second replay of the same message is then silent
-        assertTrue(captureWarnings(SchemaRegistry.class,
-                                   () -> handler.handle(msg(drifted))).isEmpty());
-
-        // a column present in both with a different type is NOT reconciled
-        long ver = reg.table(40003L).schema().id();
-        List<LogRecord> conflict = captureWarnings(SchemaRegistry.class, () ->
-            handler.handle(msg(drifted.replace("DECIMAL(10, 2)", "DECIMAL(12, 2)"))));
-        assertEquals(1, conflict.size());
-        assertTrue(conflict.get(0).getMessage().contains("'price'"),
-                   conflict.get(0).getMessage());
-        assertEquals(ver, reg.table(40003L).schema().id(),
-                     "a conflicting difference must not alter the table");
+        captureWarnings(SchemaRegistry.class, () -> handler.handle(msg(drifted)));
+        assertEquals(ver, reg.table(40004L).schema().id());
+        assertFalse(reg.table(40004L).schema().fieldNames().contains("extra"));
     }
 
     /*
-     * Finding 2 of the whole-branch review. A DDL-only transaction produces no records, so
-     * filterAndCommit has nothing to filter and up to one status interval (10 s) of applied
-     * DDL replays after a hard kill. Every op must therefore be a no-op the second time:
-     * before this, add_col raised ColumnAlreadyExistException and drop_col/rename_col raised
-     * ColumnNotExistException, and because the slot only advances after a successful commit
-     * the writer could never get past it. One test per op; each applies it twice.
+     * Finding 2 of the whole-branch review, first layer: the state-based tolerances.
+     *
+     * A DDL-only transaction produces no records, so filterAndCommit has nothing to filter, and
+     * the resume position is the highest Paimon commit identifier, which such a transaction never
+     * moves -- so applied DDL replays. Before this, add_col raised ColumnAlreadyExistException and
+     * drop_col/rename_col raised ColumnNotExistException, and because the slot only advances after
+     * a successful commit the writer could never get past it.
+     *
+     * Each test below applies its op twice at DIFFERENT LSNs (msg() mints a fresh one), so the
+     * DDL_LSN_OPTION gate does not fire and what is exercised is the state inspection: the second
+     * line of defence, which is all a table with no recorded DDL LSN has. The gate itself, and
+     * replayed SEQUENCES (which state inspection cannot handle), are covered from @Order(49).
      */
 
     private static final long IDEM = 41000L;

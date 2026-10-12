@@ -56,8 +56,9 @@ public final class Main {
             rows = readRegistry(conn);
         }
         for (RegistryRow r : rows) {
-            registry.createTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
-                                 r.changelogProducer());
+            // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
+            registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
+                                    r.changelogProducer(), !slotExists);
         }
         LOG.info("registry rebuilt: " + rows.size() + " table(s), slot "
                  + (slotExists ? "exists" : "absent"));
