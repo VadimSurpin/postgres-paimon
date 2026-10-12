@@ -70,20 +70,60 @@ public final class TextDecoder {
         .withResolverStyle(ResolverStyle.STRICT);
 
     /*
-     * PostgreSQL's infinity / -infinity have no Paimon counterpart, so they are encoded as
-     * PostgreSQL's own finite extremes: the largest and smallest values the source can hold.
-     * This is an order-preserving encoding of a sentinel (infinity almost always means an
-     * open-ended interval, e.g. valid_to = 'infinity', and "valid_to > now()" must still
-     * match), not a fabricated date. It is NOT lossless: a row genuinely holding the maximum
-     * (or minimum) value becomes indistinguishable from infinity (-infinity), whereas in
-     * PostgreSQL they are distinct values.
+     * Temporal range, computed rather than assumed, and measured by TextDecoderTest.
+     *
+     * DATE is safe: Paimon stores a plain int of days since the epoch, and PostgreSQL's whole
+     * date range fits inside it. 5874897-12-31 is epoch day 2145042905 against an
+     * Integer.MAX_VALUE of 2147483647 -- about 6700 years of margin -- and 4714-11-24 BC is
+     * -2440588. The bounds below are still asserted, because a silent (int) truncation would be
+     * unfindable.
+     *
+     * TIMESTAMP is not safe. Paimon's Timestamp.toMicros() is
+     *     Math.multiplyExact(millisecond, 1000) + nanoOfMillisecond / 1000
+     * -- the multiply is checked, the ADD is not -- and Parquet's TimestampMicrosWriter calls it
+     * for every row. So the largest instant the writer can actually WRITE is Long.MAX_VALUE
+     * microseconds after the epoch:
+     *
+     *     294247-01-10 04:00:54.775807
+     *
+     * One microsecond later either throws ArithmeticException or, between the multiply and the
+     * add, silently WRAPS to a negative micros value; both are measured. PostgreSQL's own
+     * maximum, 294276-12-31 23:59:59.999999, is about thirty years ABOVE that, so a range of
+     * perfectly legal PostgreSQL timestamps cannot be stored in Paimon at all. They are refused
+     * here, as UnrepresentableValueException, which makes them diagnosable (the POISON RECORD
+     * message) and skippable (PGPAIMON_SKIP_LSN). Letting them through meant an
+     * ArithmeticException forty frames inside prepareCommit, which neither poison arm catches:
+     * the writer stopped permanently with no diagnosis at all.
+     *
+     * PostgreSQL's minimum, 4714-11-24 BC, is far inside the negative bound (the multiplyExact
+     * floor is about 290308 BC), so only the upper bound is reachable from a real server. Both
+     * are checked anyway: the cost is two comparisons.
+     */
+    static final int DATE_MIN = -2440588;                 // 4714-11-24 BC
+    static final int DATE_MAX = 2145042905;               // 5874897-12-31
+
+    /*
+     * The infinity sentinels. PostgreSQL's infinity / -infinity have no Paimon counterpart, so
+     * they are encoded as the extreme values the writer can represent: the dates are
+     * PostgreSQL's own extremes, and the positive timestamp is the largest WRITABLE instant
+     * above, not PostgreSQL's maximum, which cannot be written.
+     *
+     * The point of the encoding is order: infinity almost always means an open-ended interval
+     * (valid_to = 'infinity'), and "valid_to > now()" must still match. Because every value
+     * above TS_POS_INFINITY is refused rather than written, nothing that reaches Paimon can
+     * sort above it, and nothing below 4714-11-24 BC exists in PostgreSQL at all -- so the
+     * ordering holds over everything a Paimon table can contain.
+     *
+     * It is NOT lossless, and operators are told so (docs, section 5): a row genuinely holding
+     * one of these extremes becomes indistinguishable from infinity, where PostgreSQL keeps them
+     * distinct.
      */
     static final int DATE_POS_INFINITY = (int) LocalDate.parse("5874897-12-31", DATE_FMT).toEpochDay();
-    static final int DATE_NEG_INFINITY = (int) LocalDate.parse("-4712-01-01", DATE_FMT).toEpochDay(); // 4713-01-01 BC
+    static final int DATE_NEG_INFINITY = (int) LocalDate.parse("-4713-11-24", DATE_FMT).toEpochDay(); // 4714-11-24 BC
     static final Timestamp TS_POS_INFINITY = Timestamp.fromLocalDateTime(
-        LocalDateTime.parse("294276-12-31 23:59:59.999999", TS));
+        LocalDateTime.parse("294247-01-10 04:00:54.775807", TS));
     static final Timestamp TS_NEG_INFINITY = Timestamp.fromLocalDateTime(
-        LocalDateTime.parse("-4712-01-01 00:00:00", TS));                                      // 4713-01-01 00:00:00 BC
+        LocalDateTime.parse("-4713-11-24 00:00:00", TS));                                      // 4714-11-24 00:00:00 BC
 
     /** What PostgreSQL's numeric accepts and prints for its non-finite values, lower-cased. */
     private static final java.util.Set<String> NON_FINITE = java.util.Set.of(
@@ -180,7 +220,7 @@ public final class TextDecoder {
                 if (s.equals("-infinity")) {
                     return DATE_NEG_INFINITY;
                 }
-                return (int) LocalDate.parse(temporal(s), DATE_FMT).toEpochDay();
+                return date(LocalDate.parse(temporal(s), DATE_FMT));
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 if (s.equals("infinity")) {
                     return TS_POS_INFINITY;
@@ -188,7 +228,7 @@ public final class TextDecoder {
                 if (s.equals("-infinity")) {
                     return TS_NEG_INFINITY;
                 }
-                return Timestamp.fromLocalDateTime(LocalDateTime.parse(temporal(s), TS));
+                return timestamp(LocalDateTime.parse(temporal(s), TS));
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
                 if (s.equals("infinity")) {
                     return TS_POS_INFINITY;
@@ -196,13 +236,48 @@ public final class TextDecoder {
                 if (s.equals("-infinity")) {
                     return TS_NEG_INFINITY;
                 }
-                return Timestamp.fromLocalDateTime(
-                    OffsetDateTime.parse(temporal(s), TS_TZ)
+                return timestamp(OffsetDateTime.parse(temporal(s), TS_TZ)
                                   .withOffsetSameInstant(ZoneOffset.UTC)
                                   .toLocalDateTime());
             default:
                 throw new UnsupportedOperationException("no text decoding for " + type);
         }
+    }
+
+    /** Days since the epoch, refusing anything Paimon's int cannot hold. */
+    private static int date(LocalDate d) {
+        long epochDay = d.toEpochDay();
+        if (epochDay < DATE_MIN || epochDay > DATE_MAX) {
+            throw new UnrepresentableValueException("date " + d
+                + " is outside the range Paimon can store (epoch day " + epochDay
+                + ", limits " + DATE_MIN + " to " + DATE_MAX + ")");
+        }
+        return (int) epochDay;
+    }
+
+    /**
+     * A Paimon {@link Timestamp}, refusing any instant whose microseconds-since-epoch does not
+     * fit a {@code long}.
+     *
+     * <p>The check repeats {@code toMicros()}'s arithmetic with a <em>checked</em> add, because
+     * Paimon's own add is unchecked and so wraps silently rather than throwing. Doing it here
+     * rather than leaving it to the Parquet writer is the whole point: here it is one named
+     * exception that the POISON RECORD diagnosis and {@code PGPAIMON_SKIP_LSN} both understand;
+     * there it is an ArithmeticException deep inside {@code prepareCommit} that nothing catches.
+     */
+    private static Timestamp timestamp(LocalDateTime t) {
+        Timestamp ts = Timestamp.fromLocalDateTime(t);
+        try {
+            Math.addExact(Math.multiplyExact(ts.getMillisecond(), 1000L),
+                          ts.getNanoOfMillisecond() / 1000);
+        } catch (ArithmeticException e) {
+            throw new UnrepresentableValueException("timestamp " + t
+                + " is outside the range Paimon can store: its microseconds since the epoch do"
+                + " not fit a long, and Paimon's Timestamp.toMicros() either throws or wraps."
+                + " The largest storable value is 294247-01-10 04:00:54.775807"
+                + " (PostgreSQL itself goes about thirty years higher)", e);
+        }
+        return ts;
     }
 
     private static String temporal(String s) {

@@ -216,53 +216,141 @@ class TextDecoderTest {
         assertRejected(DataTypes.DECIMAL(10, 2), "-Infinity", "amt");
     }
 
-    // "infinity" / "-infinity" are what PostgreSQL 18 prints for these values.
+    /*
+     * "infinity" / "-infinity" are what PostgreSQL 18 prints for these values. Every bound below
+     * was measured, not chosen: PostgreSQL's own extremes come from the live server
+     * ('4714-11-23 BC'::date is "date out of range", so 4714-11-24 BC is the floor), and the
+     * writable timestamp maximum was computed from Paimon's toMicros() arithmetic.
+     */
+
+    /** The largest instant Paimon can WRITE: Long.MAX_VALUE micros after the epoch. */
     private static final Timestamp MAX_TS = Timestamp.fromLocalDateTime(
-        java.time.LocalDateTime.of(294276, 12, 31, 23, 59, 59, 999_999_000));
+        java.time.LocalDateTime.of(294247, 1, 10, 4, 0, 54, 775_807_000));
+    /** PostgreSQL's own minimum, 4714-11-24 BC, which is proleptic year -4713. */
     private static final Timestamp MIN_TS = Timestamp.fromLocalDateTime(
-        java.time.LocalDateTime.of(-4712, 1, 1, 0, 0));
+        java.time.LocalDateTime.of(-4713, 11, 24, 0, 0));
 
     @Test
-    void timestampInfinityMapsToTheExtremeTimestamps() {
+    void timestampInfinityMapsToTheExtremeWritableTimestamps() {
         for (DataType t : new DataType[] { DataTypes.TIMESTAMP(6),
                                            DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6) }) {
             assertEquals(MAX_TS, TextDecoder.toPaimon(t, "infinity"));
             assertEquals(MIN_TS, TextDecoder.toPaimon(t, "-infinity"));
-            assertEquals("+294276-12-31T23:59:59.999999",
+            assertEquals("+294247-01-10T04:00:54.775807",
                 ((Timestamp) TextDecoder.toPaimon(t, "infinity")).toLocalDateTime().toString());
-            assertEquals("-4712-01-01T00:00",
+            assertEquals("-4713-11-24T00:00",
                 ((Timestamp) TextDecoder.toPaimon(t, "-infinity")).toLocalDateTime().toString());
         }
     }
 
+    /**
+     * The bound itself, from Paimon's arithmetic: {@code toMicros()} is
+     * {@code multiplyExact(millisecond, 1000) + nanoOfMillisecond / 1000}, so the largest
+     * writable instant is Long.MAX_VALUE micros after the epoch. One microsecond later the
+     * unchecked add WRAPS -- it does not throw -- which is exactly why the earlier verification
+     * of this mapping passed while the writer could not store the value.
+     */
     @Test
-    void dateInfinityMapsToTheExtremeDates() {
-        assertEquals(2145042905, TextDecoder.toPaimon(DataTypes.DATE(), "infinity"));
-        assertEquals(-2440550, TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
-        assertEquals((int) LocalDate.of(-4712, 1, 1).toEpochDay(),
-                     TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
+    void theEncodedInfinityIsTheLargestInstantToMicrosCanReturn() {
+        assertEquals(Long.MAX_VALUE, MAX_TS.toMicros());
+        assertEquals("+294247-01-10T04:00:54.775807", MAX_TS.toLocalDateTime().toString());
+
+        Timestamp oneMicroMore = Timestamp.fromLocalDateTime(
+            MAX_TS.toLocalDateTime().plusNanos(1000));
+        long wrapped = oneMicroMore.toMicros();
+        assertTrue(wrapped < 0,
+            "one micro past the bound wraps silently rather than throwing, which is the trap:"
+            + " got " + wrapped);
+
+        // and a second past it throws outright, so both failure shapes are real
+        Timestamp oneSecondMore = Timestamp.fromLocalDateTime(
+            MAX_TS.toLocalDateTime().plusSeconds(1));
+        assertThrows(ArithmeticException.class, oneSecondMore::toMicros);
+    }
+
+    /**
+     * PostgreSQL's maximum is about thirty years ABOVE what Paimon can write, so those
+     * timestamps must be refused here -- as the skippable, diagnosable type -- rather than
+     * failing inside Parquet's writer where nothing catches them.
+     */
+    @Test
+    void aTimestampAbovePaimonsRangeIsRefusedAndNotPassedOn() {
+        for (DataType t : new DataType[] { DataTypes.TIMESTAMP(6),
+                                           DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6) }) {
+            for (String tooBig : new String[] { "294276-12-31 23:59:59.999999",  // PG's own max
+                                                "294247-01-10 04:00:54.775808",  // one micro over
+                                                "294247-01-10 04:00:55" }) {
+                String text = t.getTypeRoot() == DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE
+                    ? tooBig + "+00" : tooBig;
+                TextDecoder.UnrepresentableValueException e = assertThrows(
+                    TextDecoder.UnrepresentableValueException.class,
+                    () -> TextDecoder.toPaimon("ts", t, text),
+                    tooBig + " must be refused for " + t);
+                assertTrue(e.getMessage().contains("294247-01-10 04:00:54.775807"),
+                           e.getMessage());
+            }
+        }
+        // and the bound itself is accepted
+        assertEquals(MAX_TS,
+            TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "294247-01-10 04:00:54.775807"));
     }
 
     @Test
-    void infinitySortsOutsideEveryOrdinaryValue() {
-        Timestamp ordinary = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "2026-10-09 13:46:40");
+    void dateInfinityMapsToPostgresOwnExtremeDates() {
+        assertEquals(2145042905, TextDecoder.toPaimon(DataTypes.DATE(), "infinity"));
+        assertEquals(-2440588, TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
+        assertEquals((int) LocalDate.of(-4713, 11, 24).toEpochDay(),
+                     TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"));
+        // PostgreSQL's whole date range fits in Paimon's int, with room to spare
+        assertTrue(2145042905 < Integer.MAX_VALUE);
+    }
+
+    /**
+     * The invariant the encoding exists for, asserted against the TRUE extremes rather than
+     * against an arbitrary modern date. The previous version of this test compared only with
+     * 2026-10-09, so it passed with a -infinity constant 38 days above PostgreSQL's real
+     * minimum -- 38 legitimate dates sorted the wrong side of it.
+     */
+    @Test
+    void infinitySortsOutsideEveryValuePostgresCanHold() {
+        // dates: PostgreSQL's extremes are the encoding's targets, so use the adjacent values
+        int posD = (int) TextDecoder.toPaimon(DataTypes.DATE(), "infinity");
+        int negD = (int) TextDecoder.toPaimon(DataTypes.DATE(), "-infinity");
+        assertEquals(posD, (int) TextDecoder.toPaimon(DataTypes.DATE(), "5874897-12-31"),
+                     "the encoding IS the maximum, so they coincide: that is the lossiness");
+        assertEquals(negD, (int) TextDecoder.toPaimon(DataTypes.DATE(), "4714-11-24 BC"));
+        assertTrue(posD > (int) TextDecoder.toPaimon(DataTypes.DATE(), "5874897-12-30"));
+        assertTrue(negD < (int) TextDecoder.toPaimon(DataTypes.DATE(), "4714-11-25 BC"));
+        assertTrue(negD < (int) TextDecoder.toPaimon(DataTypes.DATE(), "4714-12-31 BC"),
+                   "4714-12-31 BC is earlier than the old constant and must still sort above"
+                   + " -infinity");
+        assertTrue(negD < (int) TextDecoder.toPaimon(DataTypes.DATE(), "4713-01-01 BC"));
+
+        // timestamps: everything above the positive target is refused, so nothing in Paimon can
+        // outrank it; below, PostgreSQL's own minimum is the target
         Timestamp pos = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "infinity");
         Timestamp neg = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "-infinity");
-        assertTrue(pos.compareTo(ordinary) > 0);
-        assertTrue(neg.compareTo(ordinary) < 0);
-        int d = (int) TextDecoder.toPaimon(DataTypes.DATE(), "2026-10-09");
-        assertTrue((int) TextDecoder.toPaimon(DataTypes.DATE(), "infinity") > d);
-        assertTrue((int) TextDecoder.toPaimon(DataTypes.DATE(), "-infinity") < d);
+        for (String v : new String[] { "2026-10-09 13:46:40", "294247-01-10 04:00:54.775806",
+                                       "4714-11-24 00:00:00.000001 BC", "4714-12-31 00:00:00 BC",
+                                       "4713-01-01 00:00:00 BC", "0001-01-01 00:00:00" }) {
+            Timestamp t = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), v);
+            assertTrue(pos.compareTo(t) > 0, v + " must sort below +infinity");
+            assertTrue(neg.compareTo(t) < 0, v + " must sort above -infinity");
+        }
+        assertEquals(neg, TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "4714-11-24 00:00:00 BC"),
+                     "the encoding IS the minimum, so they coincide: the lossiness again");
     }
 
     @Test
     void theFiniteExtremesParseAsThemselvesSoBothPathsAgree() {
-        assertEquals(MAX_TS, TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "294276-12-31 23:59:59.999999"));
-        assertEquals(MIN_TS, TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "4713-01-01 00:00:00 BC"));
+        assertEquals(MAX_TS,
+            TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "294247-01-10 04:00:54.775807"));
+        assertEquals(MIN_TS,
+            TextDecoder.toPaimon(DataTypes.TIMESTAMP(6), "4714-11-24 00:00:00 BC"));
         assertEquals(TextDecoder.toPaimon(DataTypes.DATE(), "infinity"),
                      TextDecoder.toPaimon(DataTypes.DATE(), "5874897-12-31"));
         assertEquals(TextDecoder.toPaimon(DataTypes.DATE(), "-infinity"),
-                     TextDecoder.toPaimon(DataTypes.DATE(), "4713-01-01 BC"));
+                     TextDecoder.toPaimon(DataTypes.DATE(), "4714-11-24 BC"));
     }
 
     // Strings below were produced by PostgreSQL 18 (::text), not composed by hand.
@@ -358,13 +446,22 @@ class TextDecoderTest {
     }
 
     @Test
-    void postgresMaximumTimestampsParse() {
-        assertEquals("+294276-12-31T23:59:59.999999", ((Timestamp) TextDecoder.toPaimon(
-            DataTypes.TIMESTAMP(6), "294276-12-31 23:59:59.999999")).toLocalDateTime().toString());
-        assertEquals("+294276-12-31T23:59:59.999999", tstz("294276-12-31 23:59:59.999999+00"));
-        // same instant rendered by a Kathmandu session lands in year 294277 local time
-        assertEquals("+294276-12-31T23:59:59", tstz("294277-01-01 05:44:59+05:45"));
+    void largeYearTimestampsParse() {
+        // Years above 9999, which ISO_LOCAL_DATE and a fixed "uuuu" both refuse, parse here --
+        // up to the range Paimon can store. PostgreSQL's own maximum parses as TEXT and is then
+        // refused as unstorable, which is a separate test; these are all inside the bound.
+        assertEquals("+294247-01-10T04:00:54.775806", ((Timestamp) TextDecoder.toPaimon(
+            DataTypes.TIMESTAMP(6), "294247-01-10 04:00:54.775806")).toLocalDateTime().toString());
+        assertEquals("+294247-01-10T04:00:54.775806",
+                     tstz("294247-01-10 04:00:54.775806+00"));
+        // a Kathmandu session renders the same instant in the following local day
+        assertEquals("+290000-06-14T23:59:59", tstz("290000-06-15 05:44:59+05:45"));
         assertEquals("+10000-01-01T00:00", tstz("10000-01-01 05:45:00+05:45"));
+        // and the offset arithmetic is what decides it: this one crosses the bound only in UTC
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+            () -> TextDecoder.toPaimon(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6),
+                                       "294247-01-10 09:45:55+05:45"),
+            "04:00:55 UTC is one second past the bound, however it was written");
     }
 
     @Test

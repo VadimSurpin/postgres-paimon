@@ -480,4 +480,99 @@ class PaimonSinkTest {
             assertTrue(m.contains("3 values"), m);
         }
     }
+    /**
+     * The encoded infinity must survive a WRITE to a Paimon file and a read back, not merely a
+     * round-trip through the Timestamp object.
+     *
+     * This is the test whose absence let a broken mapping through: "infinity" appeared in one
+     * test file that never wrote a row, so none of the unit tests and none of the 186 acceptance
+     * checks ever put a decoded infinity on disk. Parquet's TimestampMicrosWriter calls
+     * Timestamp.toMicros() per row, and the previous target was ~30 years inside that method's
+     * overflow window -- so every object-level assertion passed while the writer could not store
+     * the value, and the failure arrived forty frames deep in prepareCommit where neither poison
+     * arm catches it.
+     */
+    @Test @Order(20)
+    void theInfinityEncodingSurvivesAWriteAndReadBackThroughParquet() throws Exception {
+        long relid = 16704L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16704,"schema":"public","table":"inf",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"d","type":"DATE"},
+                                  {"id":3,"name":"ts","type":"TIMESTAMP"},
+                                  {"id":4,"name":"tstz",
+                                   "type":"TIMESTAMP WITH LOCAL TIME ZONE"}],
+              "options":{"changelog-producer":"input"}}"""));
+        RelationMeta meta = new RelationMeta(relid, "public", "inf",
+            List.of("id", "d", "ts", "tstz"), List.of(true, false, false, false));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, meta);
+            // exactly what PostgreSQL 18 prints for these values
+            s.flush(List.of(
+                new SinkRecord(relid, RowKind.INSERT,
+                    Arrays.asList("1", "infinity", "infinity", "infinity"), 900L, 0, 0L),
+                new SinkRecord(relid, RowKind.INSERT,
+                    Arrays.asList("2", "-infinity", "-infinity", "-infinity"), 900L, 1, 0L),
+                new SinkRecord(relid, RowKind.INSERT,
+                    Arrays.asList("3", "2026-10-09", "2026-10-09 13:46:40",
+                                  "2026-10-09 13:46:40+00"), 900L, 2, 0L)),
+                900L, 910L);
+        }
+
+        // read it back off disk, through the ordinary reader
+        FileStoreTable t = reg.table(relid);
+        Map<Integer, List<Object>> rows = new LinkedHashMap<>();
+        ReadBuilder rb = t.newReadBuilder();
+        try (RecordReader<InternalRow> r =
+                 rb.newRead().createReader(rb.newScan().plan().splits())) {
+            r.forEachRemaining(row -> rows.put(row.getInt(0), Arrays.asList(
+                row.getInt(1), row.getTimestamp(2, 6), row.getTimestamp(3, 6))));
+        }
+        assertEquals(3, rows.size(), "all three rows must be on disk");
+
+        // +infinity
+        assertEquals(2145042905, rows.get(1).get(0), "date +infinity = 5874897-12-31");
+        assertEquals("+294247-01-10T04:00:54.775807",
+                     ((org.apache.paimon.data.Timestamp) rows.get(1).get(1))
+                         .toLocalDateTime().toString());
+        assertEquals("+294247-01-10T04:00:54.775807",
+                     ((org.apache.paimon.data.Timestamp) rows.get(1).get(2))
+                         .toLocalDateTime().toString());
+        // -infinity: PostgreSQL's own minimum, 4714-11-24 BC
+        assertEquals(-2440588, rows.get(2).get(0));
+        assertEquals("-4713-11-24T00:00",
+                     ((org.apache.paimon.data.Timestamp) rows.get(2).get(1))
+                         .toLocalDateTime().toString());
+        // and the ordinary row, read back unchanged, sorting between them
+        assertTrue((int) rows.get(2).get(0) < (int) rows.get(3).get(0));
+        assertTrue((int) rows.get(3).get(0) < (int) rows.get(1).get(0));
+    }
+
+    /**
+     * And the other half: a timestamp Paimon cannot store is refused as a diagnosed POISON
+     * RECORD, not as an ArithmeticException from inside prepareCommit.
+     */
+    @Test @Order(21)
+    void aTimestampAbovePaimonsRangeIsADiagnosedPoisonRecord() throws Exception {
+        long relid = 16705L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16705,"schema":"public","table":"toobig",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"ts","type":"TIMESTAMP"}],
+              "options":{"changelog-producer":"input"}}"""));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, new RelationMeta(relid, "public", "toobig",
+                List.of("id", "ts"), List.of(true, false)));
+            SinkRecord bad = new SinkRecord(relid, RowKind.INSERT,
+                Arrays.asList("1", "294276-12-31 23:59:59.999999"), 0x1_9ABC_DEF0L, 0, 0L);
+            IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> s.flush(List.of(bad), 0x1_9ABC_DEF1L, 0x1_9ABC_DEF2L));
+            String m = e.getMessage();
+            assertTrue(m.contains("POISON RECORD"), m);
+            assertTrue(m.contains("public.toobig"), m);
+            assertTrue(m.contains("294276-12-31 23:59:59.999999"), m);   // the value
+            assertTrue(m.contains("PGPAIMON_SKIP_LSN=1/9ABCDEF0"), m);   // and it is skippable
+        }
+    }
+
 }
