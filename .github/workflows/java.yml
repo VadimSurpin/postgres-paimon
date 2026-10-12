@@ -10,10 +10,18 @@ on:
     branches: ["main", "master"]
     paths:
       - "java/**"
+      - "writer/**"
+      - "pom.xml"
+      - "config/java-google-style.xml"
+      - ".mvn/**"
       - ".github/workflows/java.yml"
   pull_request:
     paths:
       - "java/**"
+      - "writer/**"
+      - "pom.xml"
+      - "config/java-google-style.xml"
+      - ".mvn/**"
       - ".github/workflows/java.yml"
 
 jobs:
@@ -24,52 +32,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
-          java-version: "17"
+          java-version: "25"
           distribution: "temurin"
           cache: maven
 
-      - name: Run unit tests (PaimonSchemaIT)
-        working-directory: java
+      - name: Check formatting and run unit tests
         run: mvn -B test --no-transfer-progress
 
       - name: Build reader jar (PaimonRead)
-        working-directory: java
         run: mvn -B package --no-transfer-progress
 
       - name: Build feature-test jar
-        working-directory: java
-        run: mvn -B package -P feature-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P feature-test --no-transfer-progress
 
       - name: Build ddl-test jar
-        working-directory: java
-        run: mvn -B package -P ddl-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P ddl-test --no-transfer-progress
 
       - name: Build type-test jar
-        working-directory: java
-        run: mvn -B package -P type-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P type-test --no-transfer-progress
 
       - name: Build advanced-test jar
-        working-directory: java
-        run: mvn -B package -P advanced-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P advanced-test --no-transfer-progress
 
       - name: Build offload-test jar
-        working-directory: java
-        run: mvn -B package -P offload-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P offload-test --no-transfer-progress
 
       - name: Build e2e-test jar
-        working-directory: java
-        run: mvn -B package -P e2e-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P e2e-test --no-transfer-progress
 
       - name: Build compaction jar
-        working-directory: java
-        run: mvn -B package -P compaction --no-transfer-progress
+        run: mvn -B -pl java -am package -P compaction --no-transfer-progress
 
       - name: Upload jars
         uses: actions/upload-artifact@v4
         with:
           name: paimon-compatibility-jars
-          path: java/target/*.jar
+          path: |
+            java/target/*.jar
+            writer/target/*.jar
           retention-days: 7

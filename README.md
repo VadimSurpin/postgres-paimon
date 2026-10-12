@@ -33,7 +33,7 @@ The `feat/logical-slot-writer` branch carries two implementations of the same id
 and background worker in `extension/`, which is unchanged.
 
 The other is a pure-SQL extension (`sql/paimon_slot/`) that captures changes through a logical
-replication slot, plus an external Java writer (`java/writer/`) that writes them to Paimon. It needs
+replication slot, plus an external Java writer (`writer/`) that writes them to Paimon. It needs
 no C++ build, no `shared_preload_libraries` and no `USING paimon_heap`, but it needs
 `wal_level = logical` and introduces an operational hazard the TAM design does not have: a stopped
 writer makes the slot retain WAL until the disk fills. Setup, that hazard and how to monitor it, the
@@ -149,6 +149,8 @@ extension/          C++ PostgreSQL extension (TAM + bgworker)
   paimon_heap--1.0.sql  Extension SQL: CREATE ACCESS METHOD
   paimon_heap.control   Extension control file
 
+pom.xml             Maven parent: java + writer modules
+writer/             Spring Boot logical-slot writer
 java/               Paimon compatibility tools (not release artifacts — testing only)
   src/test/java/pro/surpin/pgpaimon/
     PaimonRead.java         CLI reader — print schema and row count
@@ -200,7 +202,7 @@ artifacts and are not required to run the extension.
 
 | Dependency | Version |
 |---|---|
-| JDK | 17+ |
+| JDK | 25 (Temurin LTS) |
 | Maven | 3.8+ |
 | Apache Paimon | 1.4.1 |
 | Apache Spark | 3.5 (compaction/e2e profiles) |
@@ -239,20 +241,35 @@ docker run --rm -v "$PWD":/src -w /src/extension postgres-paimon-build make
 These jars are for testing only — not required to run the extension.
 
 ```bash
-cd java
+# Run from the repository root
+sdk env install                  # Install the JDK pinned in .sdkmanrc
+sdk env                          # Select Temurin 25 for this shell
+mvn test                         # Tests in both modules
+mvn -pl writer -am package       # writer/target/paimon-writer.jar
 
 # Paimon reader (schema + row count)
-mvn package
+mvn -pl java -am package
 
 # Named profiles — integration and compatibility tests
-mvn package -P feature-test   # DML + schema evolution tests
-mvn package -P ddl-test        # DDL propagation tests
-mvn package -P type-test        # Type mapping tests
-mvn package -P offload-test     # S3/HDFS offload tests
-mvn package -P advanced-test    # Advanced concurrency tests
-mvn package -P e2e-test         # End-to-end (requires Spark)
-mvn package -P compaction       # Spark compaction job
+mvn -pl java -am package -P feature-test   # DML + schema evolution tests
+mvn -pl java -am package -P ddl-test        # DDL propagation tests
+mvn -pl java -am package -P type-test        # Type mapping tests
+mvn -pl java -am package -P offload-test     # S3/HDFS offload tests
+mvn -pl java -am package -P advanced-test    # Advanced concurrency tests
+mvn -pl java -am package -P e2e-test         # End-to-end (requires Spark)
+mvn -pl java -am package -P compaction       # Spark compaction job
 ```
+
+The writer uses Spring Boot and runs as a standalone replication process:
+
+```bash
+mvn -pl writer -am package
+java -jar writer/target/paimon-writer.jar
+```
+
+Its existing `PGPAIMON_*` environment variables remain supported. Spring properties
+such as `--pgpaimon.jdbc-url=...` and `--pgpaimon.warehouse=...` can also be passed
+on the command line or configured in `application.properties`.
 
 ---
 
@@ -373,7 +390,7 @@ After a few seconds (one `flush_secs` cycle), Parquet files appear under `/tmp/p
 
 ```bash
 # Inspect with the Paimon Java reader (compatibility test tool — optional)
-# Build first: cd java && mvn package
+# Build first: mvn -pl java -am package
 java -jar java/target/paimon-reader.jar /tmp/paimon-warehouse orders
 ```
 
@@ -383,7 +400,7 @@ java -jar java/target/paimon-reader.jar /tmp/paimon-warehouse orders
 
 These tools verify that files written by `paimon_heap` are readable by the upstream
 Paimon Java API.  They are **not release artifacts** — the extension itself requires no
-JVM at runtime.  Build them with `cd java && mvn package [-P <profile>]`.
+JVM at runtime.  Build them with `mvn -pl java -am package [-P <profile>]`.
 
 ### PaimonRead — schema and row count
 

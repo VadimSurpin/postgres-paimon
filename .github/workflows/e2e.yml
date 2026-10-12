@@ -6,11 +6,15 @@ on:
     paths:
       - "extension/**"
       - "java/**"
+      - "writer/**"
+      - "pom.xml"
       - ".github/workflows/e2e.yml"
   pull_request:
     paths:
       - "extension/**"
       - "java/**"
+      - "writer/**"
+      - "pom.xml"
       - ".github/workflows/e2e.yml"
 
 jobs:
@@ -205,16 +209,15 @@ jobs:
           sudo chmod +x /usr/local/bin/minio /usr/local/bin/mc
 
       # ── Build the offload-test jar ──────────────────────────────────────────
-      - name: Set up Java 17
+      - name: Set up Java 25
         uses: actions/setup-java@v4
         with:
-          java-version: "17"
+          java-version: "25"
           distribution: "temurin"
           cache: maven
 
       - name: Build offload-test jar
-        working-directory: java
-        run: mvn -B package -P offload-test --no-transfer-progress
+        run: mvn -B -pl java -am package -P offload-test --no-transfer-progress
 
       # ── Run E2E offload test (T18: MinIO S3, T19: HDFS) ────────────────────
       - name: Run E2E offload test

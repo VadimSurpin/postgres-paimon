@@ -19,7 +19,6 @@ cd extension
 make
 
 # Java tooling
-cd java
 mvn package
 ```
 
@@ -48,7 +47,7 @@ java -jar java/target/paimon-feature-test.jar /tmp/paimon-warehouse \
 ## Code style
 
 - C++: follow the surrounding code. `clang-format` with the LLVM style is a reasonable baseline.
-- Java: standard Java conventions, no framework required.
+- Java: standard Java conventions; the writer uses Spring Boot.
 - No new dependencies without a discussion in an issue first — the native dependency surface is already large.
 
 ## Submitting changes
@@ -57,3 +56,20 @@ java -jar java/target/paimon-feature-test.jar /tmp/paimon-warehouse \
 2. Keep commits focused; one logical change per commit.
 3. Update `README.md` if you add or change a GUC, supported DDL operation, or build step.
 4. All source files must carry the `SPDX-License-Identifier: Apache-2.0` header.
+
+## Java formatting
+
+Both Maven modules use Spotless with the Eclipse Google Java Style profile in
+`config/java-google-style.xml`. The project overrides declaration formatting:
+each parameter and the closing `)` occupy separate lines for constructors,
+methods, and records. From the repository root:
+
+```bash
+mvn spotless:apply   # Format Java sources and tests
+mvn spotless:check   # Check formatting without modifying files
+```
+
+Formatting is checked during `validate`, so `mvn test`, `mvn package`, and CI also
+check it. Run `mvn spotless:apply` before committing Java changes. `.editorconfig`
+sets two-space Java indentation; Spotless is the shared formatter for line wrapping
+and import ordering.

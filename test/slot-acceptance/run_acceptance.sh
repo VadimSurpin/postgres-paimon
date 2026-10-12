@@ -13,7 +13,7 @@ PGHOST=127.0.0.1
 PGUSER=postgres
 DB=paimon_acc
 WAREHOUSE="$RUN/warehouse"
-JAR="$REPO/java/writer/target/paimon-writer.jar"
+JAR="$REPO/writer/target/paimon-writer.jar"
 SLOT=paimon
 READY_TIMEOUT=${READY_TIMEOUT:-60}  # seconds, for both the cluster and the writer gates
 WRITER_PID=""
@@ -47,7 +47,7 @@ tail_log() { # file, lines
 psql_q() { psql -X -v ON_ERROR_STOP=1 -qAt -d "${DB_OVERRIDE:-$DB}" "$@"; }
 
 require_prereqs() {
-  [ -f "$JAR" ] || die "missing: java/writer/target/paimon-writer.jar (run: cd java/writer && mvn -q package)"
+  [ -f "$JAR" ] || die "missing: writer/target/paimon-writer.jar (run: mvn -q -pl writer -am package)"
   [ -x "$PGBIN/pg_ctl" ] || die "missing: $PGBIN/pg_ctl (PostgreSQL 18 server binaries)"
   [ -f "$HERE/setup.sql" ] || die "missing: test/slot-acceptance/setup.sql"
   command -v java >/dev/null || die "missing: java on PATH"
