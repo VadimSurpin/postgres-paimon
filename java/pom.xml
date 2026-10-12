@@ -4,16 +4,14 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>pro.surpin.pgpaimon</groupId>
-    <artifactId>paimon-reader</artifactId>
-    <version>2.0.0</version>
-    <packaging>jar</packaging>
+    <parent>
+        <groupId>pro.surpin.pgpaimon</groupId>
+        <artifactId>postgres-paimon</artifactId>
+        <version>2.0.0</version>
+    </parent>
 
-    <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
-        <paimon.version>1.4.1</paimon.version>
-    </properties>
+    <artifactId>paimon-reader</artifactId>
+    <packaging>jar</packaging>
 
     <dependencies>
         <!-- Embedded single-node HDFS for T19.  Declared FIRST on purpose: hadoop-client-api below

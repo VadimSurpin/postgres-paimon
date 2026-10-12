@@ -13,7 +13,7 @@ PGHOST=127.0.0.1
 PGUSER=postgres
 DB=paimon_acc
 WAREHOUSE="$RUN/warehouse"
-JAR="$REPO/java/writer/target/paimon-writer.jar"
+JAR="$REPO/writer/target/paimon-writer.jar"
 SLOT=paimon
 READY_TIMEOUT=${READY_TIMEOUT:-60}  # seconds, for both the cluster and the writer gates
 WRITER_PID=""
@@ -52,7 +52,7 @@ tail_log() { # file, lines
 psql_q() { psql -X -v ON_ERROR_STOP=1 -qAt -d "${DB_OVERRIDE:-$DB}" "$@"; }
 
 require_prereqs() {
-  [ -f "$JAR" ] || die "missing: java/writer/target/paimon-writer.jar (run: cd java/writer && mvn -q package)"
+  [ -f "$JAR" ] || die "missing: writer/target/paimon-writer.jar (run: mvn -q -pl writer -am package)"
   [ -x "$PGBIN/pg_ctl" ] || die "missing: $PGBIN/pg_ctl (PostgreSQL 18 server binaries)"
   [ -f "$HERE/setup.sql" ] || die "missing: test/slot-acceptance/setup.sql"
   command -v java >/dev/null || die "missing: java on PATH"
@@ -231,13 +231,13 @@ run_writer_its() {
   DB_OVERRIDE=postgres psql_q -c "CREATE DATABASE $itdb" >/dev/null
   DB_OVERRIDE=$itdb psql_q -c "CREATE EXTENSION paimon_slot" >/dev/null
   rm -rf "$RUN/it-warehouse"; mkdir -p "$RUN/it-warehouse"
-  local reports="$REPO/java/writer/target/surefire-reports" rc=0
+  local reports="$REPO/writer/target/surefire-reports" rc=0
   rm -f "$reports"/TEST-*BackfillerTest.xml
   echo ">> writer live ITs (BackfillerTest) against database $itdb"
   PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$itdb?user=$PGUSER" \
   PGPAIMON_IT_WAREHOUSE="$RUN/it-warehouse" \
   PGPAIMON_IT_SLOT=paimon_it_wr \
-    mvn -B -ntp -q -f "$REPO/java/writer/pom.xml" test -Dtest=BackfillerTest || rc=$?
+    mvn -B -ntp -q -f "$REPO/writer/pom.xml" test -Dtest=BackfillerTest || rc=$?
   local rpt sk n
   rpt="$(ls "$reports"/TEST-*BackfillerTest.xml 2>/dev/null | head -n1 || true)"
   n=0; sk=0

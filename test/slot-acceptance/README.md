@@ -2,7 +2,7 @@
 
     ./test/slot-acceptance/run_acceptance.sh [SuiteName ...]
 
-Prerequisite: `cd java/writer && mvn -q package` (builds `java/writer/target/paimon-writer.jar`).
+Prerequisite: `mvn -q -pl writer -am package` (builds `writer/target/paimon-writer.jar`).
 
 It starts, in order: a PostgreSQL 18 cluster on `127.0.0.1:5442` (TCP only, no unix socket),
 the `paimon_slot` extension loaded from the worktree (`make install-local` +

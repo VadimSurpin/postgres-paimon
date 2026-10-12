@@ -81,7 +81,7 @@ jobs:
       - name: Set up JDK 17 (writer, comparison)
         uses: actions/setup-java@v4
         with:
-          java-version: "17"
+          java-version: "25"
           distribution: "temurin"
           cache: maven
 
@@ -100,7 +100,7 @@ jobs:
 
       # ── the two jars under test ─────────────────────────────────────────────
       - name: Build the writer jar (runs its unit tests)
-        working-directory: java/writer
+        working-directory: writer
         run: mvn -B -ntp package
 
       - name: Build the reader jar (carries TpccCompare)

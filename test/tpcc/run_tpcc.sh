@@ -33,7 +33,7 @@ PGUSER=postgres
 DB=benchbase
 SLOT="${TPCC_SLOT:-paimon_tpcc}"
 WAREHOUSE="$RUN/warehouse"
-WRITER_JAR="$REPO/java/writer/target/paimon-writer.jar"
+WRITER_JAR="$REPO/writer/target/paimon-writer.jar"
 READER_JAR="$REPO/java/target/paimon-reader-2.0.0.jar"
 BENCHBASE_REF="${BENCHBASE_REF:-v2023}"
 WAREHOUSES="${TPCC_WAREHOUSES:-1}"
@@ -79,7 +79,7 @@ find_java21() {
 }
 
 require_prereqs() {
-  [ -f "$WRITER_JAR" ] || die "missing $WRITER_JAR (run: cd java/writer && mvn -q package)"
+  [ -f "$WRITER_JAR" ] || die "missing $WRITER_JAR (run: cd writer && mvn -q package)"
   [ -f "$READER_JAR" ] || die "missing $READER_JAR (run: mvn -f java/pom.xml -q package -DskipTests)"
   [ -x "$PGBIN/pg_ctl" ] || die "missing $PGBIN/pg_ctl (PostgreSQL 18 server binaries)"
   command -v java >/dev/null || die "missing java on PATH"

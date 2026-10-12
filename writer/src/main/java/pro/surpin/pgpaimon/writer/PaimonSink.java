@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: Apache-2.0
+package pro.surpin.pgpaimon.writer;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import lombok.extern.java.Log;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.sink.TableWriteImpl;
+import org.jetbrains.annotations.NotNull;
+import pro.surpin.pgpaimon.writer.dto.*;
+import pro.surpin.pgpaimon.writer.dto.RelationMeta;
+import pro.surpin.pgpaimon.writer.dto.SinkRecord;
+
+
+/**
+ * Commits decoded transactions to Paimon, once per touched table, with
+ * {@code commitIdentifier = commitLsn}. The caller decides what one commit holds: with
+ * {@link MiniBatcher} it is a batch of whole transactions and {@code commitLsn} is the commit LSN
+ * of the last one; this class neither knows nor cares.
+ *
+ * <p>
+ * Effectively-once rests on three measured facts (Task 1 spike 3, Paimon 1.4.1):
+ *
+ * <ul>
+ * <li>only {@link TableCommitImpl#filterAndCommit} consults the committed-identifier set; the plain
+ * {@code commit(identifier, messages)} would write a second snapshot with duplicate data and
+ * changelog on replay, so it is never called here;
+ * <li>that set is scoped to the commit user, so {@code config.commitUser()} must be stable across
+ * restarts (it is derived from the slot name, see {@link WriterConfig});</li>
+ * <li>the table has a fixed bucket count, so {@code write(row)} is used and Paimon hashes the
+ * primary key to choose the bucket. Dynamic-bucket mode -- no {@code bucket} option -- required
+ * {@code write(row, 0)} instead, since dynamic mode rejects the one-argument form, and paid for it
+ * with a key index: 1.2 GB of a 1.8 GB TPC-C warehouse.</li>
+ * </ul>
+ *
+ * <p>
+ * A table or writer fetched before a DDL message for that relation is stale. Each cached entry
+ * remembers the {@link FileStoreTable} instance it was built from; {@link SchemaRegistry} drops its
+ * own instance on every create/alter/forget, so a changed identity here means the schema changed
+ * and the entry is rebuilt. No explicit invalidation call is required, but
+ * {@link #invalidate(long)} exists for callers that want it.
+ *
+ * <p>
+ * An exception from {@link #flush} is fatal to the writer. TxnBatcher has already discarded the
+ * batch; the process must exit and resume from the last confirmed LSN.
+ */
+@Log
+public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
+
+  private record Entry(
+      @NotNull FileStoreTable table,
+      @NotNull TableWriteImpl<?> write,
+      @NotNull TableCommitImpl commit
+  ) implements AutoCloseable {
+
+    @Override
+    public void close() throws Exception {
+      Exception first = null;
+      try {
+        write.close();
+      } catch (Exception e) {
+        first = e;
+      }
+      try {
+        commit.close();
+      } catch (Exception e) {
+        if (first == null) {
+          first = e;
+        } else {
+          first.addSuppressed(e);
+        }
+      }
+      if (first != null) {
+        throw first;
+      }
+    }
+  }
+
+  private final SchemaRegistry registry;
+  private final WriterConfig config;
+  private final Map<Long, Entry> entries = new LinkedHashMap<>();
+  private final Map<Long, RelationMeta> relations = new LinkedHashMap<>();
+  private final CrashHook hook;
+
+  public PaimonSink(
+      SchemaRegistry registry,
+      WriterConfig config
+  ) {
+    this(registry, config, CrashHook.fromEnv(System.getenv()));
+  }
+
+  PaimonSink(
+      SchemaRegistry registry,
+      WriterConfig config,
+      CrashHook hook
+  ) {
+    this.registry = registry;
+    this.config = config;
+    this.hook = hook;
+  }
+
+  /** Supplies the PostgreSQL column order RowBuilder needs; replaces any earlier one. */
+  public void setRelation(
+      long relid,
+      @NotNull RelationMeta meta
+  ) {
+    relations.put(relid, meta);
+  }
+
+  @Override
+  public void flush(
+      @NotNull List<SinkRecord> records,
+      long commitLsn,
+      long endLsn
+  ) throws Exception {
+    flush0(records, commitLsn, endLsn, true);
+  }
+
+  /**
+   * As {@link #flush}, returning false if any table's commit was filtered as already committed. A
+   * replay may expect that; a caller minting fresh identifiers (the Backfiller) must treat it as an
+   * error. Records reaching this entry point come from the initial load, not from the slot, which
+   * changes only what an undecodable value is diagnosed as.
+   */
+  public boolean flushApplied(
+      @NotNull List<SinkRecord> records,
+      long commitLsn,
+      long endLsn
+  ) throws Exception {
+    return flush0(records, commitLsn, endLsn, false);
+  }
+
+  private boolean flush0(
+      @NotNull List<SinkRecord> records,
+      long commitLsn,
+      long endLsn,
+      boolean fromTheSlot
+  ) throws Exception {
+    boolean allApplied = true;
+    if (records.isEmpty()) {
+      return true; // a DDL-only transaction: nothing to commit, no empty snapshot
+    }
+    // One commit per Paimon table: a relation's main table and its history table are two
+    // tables with two identifier streams, committed one after the other and NOT atomically
+    // (spec 2026-10-14, rule 2). A crash between them leaves one ahead; the replay is then
+    // filtered per table (the commit-identifier filter here, rule 4 in MiniBatcher), so each
+    // ends up with every change exactly once.
+    Map<Long, List<SinkRecord>> byRelid = new LinkedHashMap<>();
+    for (SinkRecord r : records) {
+      byRelid.computeIfAbsent(r.relid(), k -> new java.util.ArrayList<>()).add(r);
+    }
+    // Archived history tables first. They are the only tables whose identifier does not count
+    // towards the resume position (only current tables do), so a crash after any later commit
+    // of this flush must never find an archive behind: it would not be replayed. Committed
+    // first, an archive is either complete or the flush's other tables are behind it too.
+    for (Map.Entry<Long, List<SinkRecord>> g : hook.order(archivesFirst(byRelid)).entrySet()) {
+      long relid = g.getKey();
+      RelationMeta meta = relations.get(HistoryKeys.relidOf(relid));
+      if (meta == null && !allTruncates(g.getValue())) {
+        throw new IllegalStateException(
+            "no RelationMeta for relation " + HistoryKeys.relidOf(relid));
+      }
+      Entry e = entry(relid);
+      try {
+        RelationMeta builtFor = null;
+        RowMaker rb = null;
+        for (SinkRecord r : g.getValue()) {
+          // Each record is built against the description it was decoded under: an
+          // ALTER inside the transaction leaves earlier records with fewer columns
+          // than the current relation. The registry caches by column list.
+          RelationMeta m = r.meta() != null ? r.meta() : meta;
+          if (m == null) {
+            // A T operation record carries no values, so no description is needed.
+            m = new RelationMeta(HistoryKeys.relidOf(relid), "?", "?", List.of(), List.of());
+          }
+          // ... and with the names a later RENAME/DROP COLUMN gave its columns since
+          // (SchemaRegistry.asOfNow): the main table's schema is already the later one.
+          m = registry.asOfNow(relid, m, r.seq());
+          if (rb == null || !m.equals(builtFor)) {
+            rb = registry.rowBuilder(relid, m);
+            builtFor = m;
+          }
+          org.apache.paimon.data.GenericRow row;
+          try {
+            row = rb.build(r);
+          } catch (TextDecoder.UnrepresentableValueException bad) {
+            // The only poison record: a value PostgreSQL holds and Paimon cannot.
+            // This is the one failure PGPAIMON_SKIP_LSN can step over.
+            throw undecodable(m, r, commitLsn, fromTheSlot, bad);
+          } catch (IllegalArgumentException malformed) {
+            // The text did not parse as the Paimon type at all. Not a poison record
+            // and NOT skippable: the cause is systematic -- a drifted column type, or
+            // a session setting such as bytea_output = 'escape' -- so it would
+            // mis-handle every row of that column, and skipping one would hide it.
+            throw new IllegalStateException(
+                "cannot decode " + where(m, r) + ": " + malformed.getMessage()
+                    + ". The text did not parse as this Paimon type at all, so this is"
+                    + " not one unrepresentable value but a systematic mismatch: compare"
+                    + " the Paimon column's type with the PostgreSQL column's, and check"
+                    + " the session settings the writer pins (TimeZone, client_encoding,"
+                    + " bytea_output). It will replay identically on restart.",
+                malformed);
+          } catch (RuntimeException other) {
+            throw new IllegalStateException(
+                "cannot build a Paimon row for " + where(m, r) + ": " + other.getMessage()
+                    + ". This is a structural mismatch between the record and the Paimon"
+                    + " schema, not a value Paimon cannot represent; it will replay"
+                    + " identically on restart.",
+                other);
+          }
+          e.write().write(row); // Paimon hashes the key into one of the buckets
+        }
+        List<CommitMessage> msgs = e.write().prepareCommit(false, commitLsn);
+        int applied = e.commit().filterAndCommit(Map.of(commitLsn, msgs));
+        if (applied < 1) {
+          allApplied = false;
+          log.info("commit identifier " + commitLsn + " for relation " + relid
+              + " was already committed; replay skipped (applied " + applied + " of 1)");
+          // The writer already holds this transaction's files in its LSM tree but the
+          // table never saw them; reusing it makes a later compaction delete files the
+          // table does not know ("File deletion conflicts detected"). Dropping the
+          // writer is what fixes that.
+          //
+          // Deliberately NOT calling commit.abort(msgs) to delete the orphan files:
+          // in Paimon 1.4.1 abort deletes each message's newFiles, changelog files and
+          // compactAfter without excluding files also in compactBefore. A compaction
+          // finishing inside prepareCommit as an upgrade in place (same file name,
+          // higher level) puts an already-committed file in compactAfter, and abort
+          // would delete committed data. Unproven, but bounded orphan waste beats a
+          // possible silent loss.
+          dropEntry(relid);
+        }
+        hook.afterCommit(e.table());
+      } catch (Exception | Error ex) {
+        dropEntry(relid); // never reuse a writer holding half-written buffers
+        throw ex;
+      }
+    }
+    return allApplied;
+  }
+
+  /**
+   * A value PostgreSQL stores happily that Paimon cannot represent -- {@code numeric 'NaN'} or a
+   * {@code numeric} outside {@code DECIMAL(38, 18)} -- is a <em>poison record</em>, not a transient
+   * failure, and the distinction is the whole point of this message. No guardrail can prevent one
+   * (a {@code numeric} column can always hold NaN), the slot only advances after a successful
+   * Paimon commit, and the offending WAL record is in the slot, so every restart replays it and
+   * fails identically. Deleting or correcting the row in PostgreSQL does not help. Spec section 8's
+   * "transaction replayed on retry" does not cover a replay that can never succeed; there is no
+   * quarantine mechanism, by decision, so the message has to carry everything an operator needs at
+   * three in the morning: the table, the column, the value, the LSN, and what the only recourse is.
+   *
+   * <p>
+   * A record from the initial load is a different situation -- it came from a COPY, not from the
+   * slot, and fixing the row does help -- so it is diagnosed differently.
+   */
+  private static @NotNull String where(
+      @NotNull RelationMeta meta,
+      @NotNull SinkRecord r
+  ) {
+    String table = meta.namespace() + "." + meta.relName();
+    if (r.op() != null) {
+      return table + (HistoryKeys.isHist(r.relid()) ? " history table" : " operation log") + " ("
+          + r.op().code() + " at _lsn " + SlotConsumer.formatLsn(r.seq()) + ")";
+    }
+    return table + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+  }
+
+  private static Map<Long, List<SinkRecord>> archivesFirst(
+      Map<Long, List<SinkRecord>> byKey
+  ) {
+    Map<Long, List<SinkRecord>> out = new LinkedHashMap<>();
+    byKey.forEach((
+        k,
+        v) -> {
+      if (HistoryKeys.isArchive(k)) {
+        out.put(k, v);
+      }
+    });
+    byKey.forEach((
+        k,
+        v) -> {
+      if (!HistoryKeys.isArchive(k)) {
+        out.put(k, v);
+      }
+    });
+    return out;
+  }
+
+  private static boolean allTruncates(
+      List<SinkRecord> records
+  ) {
+    for (SinkRecord r : records) {
+      if (r.op() == null || !"T".equals(r.op().code())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private @NotNull IllegalStateException undecodable(
+      @NotNull RelationMeta meta,
+      @NotNull SinkRecord r,
+      long commitLsn,
+      boolean fromTheSlot,
+      @NotNull RuntimeException cause
+  ) {
+    String where = where(meta, r);
+    if (!fromTheSlot) {
+      // Two different causes land here and the remedy differs, so name both. The value may
+      // be one Paimon cannot represent; or the Paimon column's type may no longer match the
+      // PostgreSQL column's, in which case the row is perfectly good and correcting it
+      // cannot help -- which is what the old "correct or delete that row" advice sent
+      // operators to do.
+      return new IllegalStateException(
+          "cannot load " + where + " during the initial" + " backfill: " + cause.getMessage()
+              + ". This value came from the table itself, not from the replication slot, so"
+              + " nothing is stuck in the slot. Two things cause it. Either the value is one"
+              + " Paimon cannot represent, and correcting that row and reloading fixes it; or"
+              + " the Paimon column's type no longer matches the PostgreSQL column's (schema"
+              + " drift: compare the type named above with the PostgreSQL column), and no edit"
+              + " to the row can help -- re-register the table instead"
+              + " (paimon.remove_table, delete the Paimon table, paimon.add_table).",
+          cause);
+    }
+    return new IllegalStateException(
+        "POISON RECORD in " + where + ", in the commit batch ending at "
+            + SlotConsumer.formatLsn(commitLsn) + ": " + cause.getMessage()
+            + ". THIS IS NOT TRANSIENT and will not clear by itself: the change is already in"
+            + " replication slot '" + config.slotName() + "', the slot advances only after a"
+            + " successful Paimon commit, so every restart replays this same record and fails"
+            + " identically. Deleting or correcting the row in PostgreSQL does NOT help -- the"
+            + " offending WAL record stays in the slot. The only recourse today is the"
+            + " two recoveries, in this order. (1) Inspect the row in PostgreSQL, then skip just"
+            + " this record: set PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(r.seq())
+            + " and restart. The rest of its transaction is applied, the record's full raw values"
+            + " are logged so you can reinsert the row by hand with the value corrected, and"
+            + " nothing else is skipped -- only this LSN, and only this kind of failure. Unset it"
+            + " afterwards. (2) Failing that, the re-bootstrap procedure: stop the writer, SELECT"
+            + " pg_drop_replication_slot('" + config.slotName() + "'); UPDATE"
+            + " paimon.table_registry SET backfill_due = true; and start the writer again, which"
+            + " reloads every tracked table from a fresh snapshot and loses all Paimon-side"
+            + " changelog history. See docs/logical-slot-architecture.md, 'A record the writer"
+            + " can never apply'.",
+        cause);
+  }
+
+  /**
+   * Empties the table with an empty overwrite commit under our own commitUser and {@code
+   * commitIdentifier = commitLsn}, through the same {@code filterAndCommit} path as data, so a
+   * replayed truncate is filtered and every snapshot this writer creates carries our user.
+   *
+   * <p>
+   * {@code TableCommitImpl.truncateTable()} is deliberately not used: it hard-codes the identifier
+   * {@code Long.MAX_VALUE}, which under our user would make filterAndCommit drop every later commit
+   * and OffsetStore report an impossible offset.
+   */
+  public boolean truncate(
+      long relid,
+      long commitLsn
+  ) throws Exception {
+    boolean applied = true;
+    // The cached writer holds pre-truncate LSM files the overwrite is about to delete; reusing
+    // it makes the next compaction fail with "File deletion conflicts detected".
+    dropEntry(relid);
+    // dynamic-partition-overwrite off: on a partitioned table (a history table) Paimon's
+    // default overwrites only the partitions the commit writes to, and an empty commit writes
+    // to none, so the "truncate" would remove nothing. Off, an empty overwrite of the whole
+    // table (no static partition) empties every partition.
+    FileStoreTable t = registry.table(relid).copy(Map.of("dynamic-partition-overwrite", "false"));
+    try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
+      applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of())) >= 1;
+      if (!applied) {
+        log.info("truncate of relation " + relid + " at " + commitLsn
+            + " was already committed; replay skipped");
+      }
+    } finally {
+      dropEntry(relid);
+    }
+    return applied;
+  }
+
+  /** Closes any cached writer/committer for the relation; the next flush rebuilds them. */
+  public void invalidate(
+      long relid
+  ) throws Exception {
+    dropEntry(relid);
+  }
+
+  @Override
+  public void close() throws Exception {
+    Exception first = null;
+    for (Entry e : entries.values()) {
+      try {
+        e.close();
+      } catch (Exception ex) {
+        if (first == null) {
+          first = ex;
+        } else {
+          first.addSuppressed(ex);
+        }
+      }
+    }
+    entries.clear();
+    if (first != null) {
+      throw first;
+    }
+  }
+
+  private @NotNull Entry entry(
+      long relid
+  ) throws Exception {
+    FileStoreTable t = registry.table(relid);
+    Entry e = entries.get(relid);
+    if (e != null && e.table() == t) {
+      return e;
+    }
+    if (e != null) {
+      dropEntry(relid); // schema changed under us
+    }
+    Entry fresh = new Entry(t, t.newWrite(config.commitUser()), t.newCommit(config.commitUser()));
+    entries.put(relid, fresh);
+    return fresh;
+  }
+
+  private void dropEntry(
+      long relid
+  ) throws Exception {
+    Entry e = entries.remove(relid);
+    if (e != null) {
+      e.close();
+    }
+  }
+}

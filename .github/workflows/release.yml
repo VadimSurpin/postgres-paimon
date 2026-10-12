@@ -36,27 +36,27 @@ jobs:
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version: $VERSION"; exit 1; }
           test -f "docs/releases/v${VERSION}.md" || { echo "missing docs/releases/v${VERSION}.md"; exit 1; }
-          grep -q "<version>${VERSION}</version>" java/writer/pom.xml \
-            || { echo "java/writer/pom.xml is not at ${VERSION}"; exit 1; }
+          grep -q "<version>${VERSION}</version>" writer/pom.xml \
+            || { echo "writer/pom.xml is not at ${VERSION}"; exit 1; }
           if gh release view "v${VERSION}" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "v${VERSION}" >/dev/null 2>&1; then
             echo "v${VERSION} already exists"; exit 1
           fi
 
       - uses: actions/setup-java@v4
         with:
-          java-version: "17"
+          java-version: "25"
           distribution: "temurin"
           cache: maven
 
       - name: Build the writer (runs its unit tests)
-        working-directory: java/writer
+        working-directory: writer
         run: mvn -B -ntp package
 
       - name: Assemble the assets
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp java/writer/target/paimon-writer.jar dist/
+          cp writer/target/paimon-writer.jar dist/
           tar -czf "dist/paimon_slot-${VERSION}.tar.gz" -C sql/paimon_slot \
             paimon_slot.control paimon_slot--1.0.sql
           (cd dist && sha256sum paimon-writer.jar "paimon_slot-${VERSION}.tar.gz" > SHA256SUMS)

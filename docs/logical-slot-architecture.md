@@ -19,7 +19,7 @@ the surrounding text.
 
 Two architectures live on this branch. They are alternatives, not layers; you use one.
 
-| | `extension/` (the one in the rest of the README) | `sql/paimon_slot/` + `java/writer/` (this page) |
+| | `extension/` (the one in the rest of the README) | `sql/paimon_slot/` + `writer/` (this page) |
 |---|---|---|
 | Capture | custom table access method, `USING paimon_heap` | logical replication slot, ordinary heap tables |
 | Write path | background worker inside PostgreSQL, shared-memory ring buffer | separate JVM process (`paimon-writer`) using Paimon's own Java API |
@@ -53,8 +53,8 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 394 unit tests).
-cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
+# 2. Build the writer (Spring Boot executable jar, about 199 MB; runs its 394 unit tests).
+mvn -pl writer -am -q package     # -> writer/target/paimon-writer.jar
 ```
 
 Install the extension. For a system install, run `make install` in `sql/paimon_slot` (standard PGXS; it copies the control file and SQL script into the server's `extension/` directory and needs write access to it). Without
@@ -90,7 +90,7 @@ Start the writer. It is configured entirely from the environment:
 PGPAIMON_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/mydb \
 PGPAIMON_USER=postgres PGPAIMON_PASSWORD=... \
 PGPAIMON_WAREHOUSE=/var/lib/paimon/warehouse \
-java -jar java/writer/target/paimon-writer.jar
+java -jar writer/target/paimon-writer.jar
 ```
 
 | Variable | Default | Meaning |
@@ -344,7 +344,7 @@ are no `s3_*` / `hdfs_*` settings in PostgreSQL.
   in-process MiniDFSCluster).
 * **S3**: set `PGPAIMON_WAREHOUSE=s3://bucket/wh` plus the three `PGPAIMON_S3_*` variables.
   **S3 is present but unverified in this environment.** `paimon-s3` is bundled in the writer jar
-  and its `FileIO` registration survives shading (pointing a catalog at `s3://nobucket/wh` yields a
+  and its `FileIO` registration is preserved in the nested dependency jars (pointing a catalog at `s3://nobucket/wh` yields a
   connection refusal, not "no FileIO for scheme s3"), but there is no MinIO binary here, so the S3
   acceptance test (T18) has never executed. It reports itself as skipped, never as passed. To run it:
 
@@ -795,7 +795,7 @@ survivable.
    one record, and streams on:
 
    ```bash
-   PGPAIMON_SKIP_LSN=0/1C79B718 java -jar java/writer/target/paimon-writer.jar
+   PGPAIMON_SKIP_LSN=0/1C79B718 java -jar writer/target/paimon-writer.jar
    ```
 4. **Keep the audit line.** At WARNING, once the surrounding transaction has committed:
 
@@ -905,7 +905,7 @@ the rows streamed meanwhile were built against the old schema.
   refuses to stream into a warehouse of another cluster, or from a server whose WAL is behind it
   (section 8, "The cluster a warehouse belongs to").
 * The writer is one process per slot. Multi-writer and HA are non-goals.
-* The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
+* The Spring Boot executable jar includes Paimon, Hadoop client and `paimon-s3`.
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
   (pgoutput `streaming` is off on purpose), so very large transactions need heap. **One transaction
   is bounded by `PGPAIMON_TXN_MAX_BYTES`** (default a quarter of the maximum heap): over it the writer
@@ -1442,7 +1442,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 394 unit tests (2 live ITs skipped), builds the shaded jar
+mvn -pl writer -am -q package                 # 394 unit tests (2 live ITs skipped), builds the Spring Boot executable jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```

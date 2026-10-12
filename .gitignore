@@ -1,5 +1,6 @@
 # Build artifacts — Java
-java/target/
+**/target/
+writer/dependency-reduced-pom.xml
 java/dependency-reduced-pom.xml
 java/org/
 

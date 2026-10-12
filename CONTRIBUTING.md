@@ -12,11 +12,11 @@ No Docker is needed for anything in this repository.
 ## Building
 
 ```bash
-# The writer: a shaded jar, built together with its unit tests.
-cd java/writer && mvn -q package           # -> java/writer/target/paimon-writer.jar
+# The writer: a Spring Boot executable jar, built together with its unit tests.
+mvn -pl writer -am -q package           # -> writer/target/paimon-writer.jar
 
 # The Java acceptance suites and the TPC-C comparison tool.
-cd java && mvn -q package
+mvn -pl java -am -q package
 ```
 
 ## Running the tests
@@ -25,7 +25,7 @@ Run all three layers before sending a change; they cover different failures.
 
 ```bash
 # 1. Writer unit tests.
-cd java/writer && mvn test
+mvn -pl writer -am test
 
 # 2. The SQL extension. install-local stages it under sql/paimon_slot/_install so that no
 #    system directory is written; the test cluster must set extension_control_path to it, and
@@ -57,7 +57,7 @@ section 7, for what each layer proves.
 
 ## Code style
 
-* Java: standard conventions, no framework required. Keep invariants in comments next to the code
+* Java: standard conventions; the writer uses Spring Boot. Keep invariants in comments next to the code
   that upholds them; several rules here (confirm the LSN only after the commit, never split a
   transaction, replay must be a no-op) are easy to break and hard to notice.
 * SQL: match the surrounding style. Guardrails raise with a message, a hint and a pointer to the
@@ -87,3 +87,20 @@ section 7, for what each layer proves.
    row in section 8, "Rules for developers and administrators", with its marker and its test. State the reason for a limitation, not only the rule: a rule without its reason gets
    "fixed" later.
 4. All source files must carry the `SPDX-License-Identifier: Apache-2.0` header.
+
+## Java formatting
+
+Both Maven modules use Spotless with the Eclipse Google Java Style profile in
+`config/java-google-style.xml`. The project overrides declaration formatting:
+each parameter and the closing `)` occupy separate lines for constructors,
+methods, and records. From the repository root:
+
+```bash
+mvn spotless:apply   # Format Java sources and tests
+mvn spotless:check   # Check formatting without modifying files
+```
+
+Formatting is checked during `validate`, so `mvn test`, `mvn package`, and CI also
+check it. Run `mvn spotless:apply` before committing Java changes. `.editorconfig`
+sets two-space Java indentation; Spotless is the shared formatter for line wrapping
+and import ordering.

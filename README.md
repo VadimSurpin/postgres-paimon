@@ -53,11 +53,11 @@ restarted independently of the database.
 
 ## Quick start
 
-Requirements: PostgreSQL 18 with `wal_level = logical`, a JDK 17 and Maven.
+Requirements: PostgreSQL 18 with `wal_level = logical`, JDK 25 and Maven.
 
 ```bash
-# 1. Build the writer (a shaded jar; runs its unit tests).
-cd java/writer && mvn -q package                 # -> java/writer/target/paimon-writer.jar
+# 1. Build the writer (a Spring Boot executable jar; runs its unit tests).
+mvn -pl writer -am -q package                 # -> writer/target/paimon-writer.jar
 
 # 2. Install the extension (standard PGXS) and enable it in your database.
 make -C sql/paimon_slot install                  # or install-local, see the guide
@@ -72,7 +72,7 @@ psql mydb -c "SELECT paimon.add_table('orders'::regclass)"
 PGPAIMON_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/mydb \
 PGPAIMON_USER=postgres PGPAIMON_PASSWORD=... \
 PGPAIMON_WAREHOUSE=/var/lib/paimon/warehouse \
-java -jar java/writer/target/paimon-writer.jar
+java -jar writer/target/paimon-writer.jar
 ```
 
 The full setup, every setting, the operational hazards (an abandoned slot retains WAL and fills the
@@ -120,7 +120,7 @@ Each is deliberate and explained, with its reason, in section 5 of the guide:
 ```
 sql/paimon_slot/        the SQL extension: registry, type mapping, add_table, event-trigger
                         guardrails and DDL messages, with a pg_regress suite
-java/writer/            paimon-writer: decoder, TOAST resolver, schema registry, batcher, sink,
+writer/                 paimon-writer: decoder, TOAST resolver, schema registry, batcher, sink,
                         slot consumer, backfill, with unit tests
 java/                   acceptance suites (JDBC) and the TPC-C comparison tool
 test/slot-acceptance/   one command that builds a throwaway PostgreSQL cluster, installs the
@@ -131,10 +131,14 @@ docs/                   the architecture and operations guide; design spec and p
                         docs/superpowers/
 ```
 
+The repository root is a Maven parent for the `java` compatibility tools and the Spring Boot
+`writer` module. The writer accepts the existing `PGPAIMON_*` variables and Spring properties
+such as `--pgpaimon.jdbc-url=...` and `--pgpaimon.warehouse=...`.
+
 ## Testing
 
 ```bash
-cd java/writer && mvn test                                         # writer unit tests
+mvn -pl writer -am test                                         # writer unit tests
 make -C sql/paimon_slot install-local && make -C sql/paimon_slot installcheck   # pg_regress
 ./test/slot-acceptance/run_acceptance.sh                           # all acceptance suites
 ./test/tpcc/run_tpcc.sh                                            # TPC-C, then compare
