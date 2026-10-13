@@ -1,13 +1,19 @@
 # Logical-slot architecture (`paimon_slot` + `paimon-writer`)
 
-Operations guide and limitations list for the logical-replication architecture on the
-`feat/logical-slot-writer` branch. The design and its measured justification are in
+Operations guide and limitations list for the logical-replication architecture. The design and its measured justification are in
 [`docs/superpowers/specs/2026-10-09-logical-slot-writer-design.md`](superpowers/specs/2026-10-09-logical-slot-writer-design.md).
 Where this page and the spec disagree, the spec was amended during implementation and is current;
 tell us about the disagreement.
 
 Every command and error string below was run against a real PostgreSQL 18 server and the built
 writer jar while this page was written. Error strings are quoted exactly.
+
+**A note on `legacy:`.** This architecture replaced an earlier C++ implementation (a table access
+method and a background worker, `paimon_heap`). Where the spec, the plan or a code comment explains a
+choice by pointing at that code, the path is written with a `legacy:` prefix, for example
+`legacy:extension/type_map_pg.h`. Those files are **not part of this repository**; they are cited as
+the provenance of a behaviour that was deliberately matched, and the claim they support is stated in
+the surrounding text.
 
 ## 1. What this is
 
@@ -742,10 +748,10 @@ companion boolean column. Nothing detects the collision.
   *does* drop the Paimon table (this fixes main's `gaps.md` item 3), and dropping a column drops it
   from the Paimon schema too (item 1).
 * Binary-mode pgoutput decoding is not implemented; text mode is exact for the supported types.
-* There is no integrated "offload" step (section 2). `PaimonE2ETest` (PostgreSQL to Paimon to Spark
-  compaction) is **deliberately not ported** to this architecture. It is not in the spec's acceptance
-  list, and naming it to the harness fails the run by design ("matched no tests"). That is a
-  deliberate exclusion, not a known bug.
+* There is no integrated "offload" step (section 2): the warehouse simply is `s3://` or `hdfs://`.
+  The old end-to-end suite for the C++ implementation (`PaimonE2ETest`, PostgreSQL to Paimon to Spark
+  compaction) was removed together with the implementation it tested and was never ported; it is not
+  in the spec's acceptance list.
 
 ## 6. Troubleshooting
 
@@ -804,7 +810,8 @@ suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDd
 `PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`, named
 explicitly in the script's `ALL_SUITES` and printed at the start of the run — which is **238
 checks**. Name a subset to run just those (plus the smoke suite). A named suite that matches no
-tests, or whose every test is skipped, fails the harness; that is how `PaimonE2ETest` fails.
+tests, or whose every test is skipped, fails the harness; naming a suite that does not exist, such
+as the removed `PaimonE2ETest`, fails it the same way.
 
 Status of the remote warehouses: **T19 (HDFS) passes; T18 (S3) is not run** here, because it needs
 a MinIO server (`E2E_MINIO_BIN`). The harness says so in its verdict (`ALL SUITES PASSED -- except:

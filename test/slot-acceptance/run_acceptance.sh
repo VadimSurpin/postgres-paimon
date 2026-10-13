@@ -29,8 +29,8 @@ NOT_RUN=""                          # checks a suite will skip: reported next to
 # script, and the per-suite report check below then proves each one actually ran.
 #
 # Keep in step with java/src/test/java/pro/surpin/pgpaimon/: a new suite missing from this list is
-# a visible omission here, not a silent gap in the run. PaimonE2ETest is deliberately absent --
-# it is not ported to this architecture and naming it fails the run, by design.
+# a visible omission here, not a silent gap in the run. (The old PaimonE2ETest was removed with the
+# C++ implementation it exercised; naming a suite that does not exist fails the run, by design.)
 ALL_SUITES=(SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
             PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest)
 LAUNCHER="$RUN/start_writer.sh"

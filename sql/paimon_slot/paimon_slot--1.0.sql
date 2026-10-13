@@ -15,7 +15,7 @@ CREATE TABLE paimon.table_registry (
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.table_registry', '');
 
--- Mirror of extension/type_map_pg.h.  Returns a Paimon type string.
+-- Mirror of legacy:extension/type_map_pg.h.  Returns a Paimon type string.
 CREATE FUNCTION paimon.pg_type_to_paimon(typid oid, typmod int, not_null boolean)
 RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE

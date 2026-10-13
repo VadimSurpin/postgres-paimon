@@ -14,9 +14,9 @@ name: TPC-C verification
 #
 # BenchBase is built UNMODIFIED: the TPC-C schema is exactly as it ships.
 #
-# No Docker: PostgreSQL 18 comes from PGDG and the extension is pure SQL, following the pattern in
-# bench.yml and e2e.yml. Unlike those, there is nothing to compile with PGXS here -- paimon_slot is
-# a control file and a SQL script -- so the heavy Arrow / AWS SDK / libhdfs3 steps are all absent.
+# No Docker: PostgreSQL 18 comes from PGDG and the extension is pure SQL. There is nothing to
+# compile with PGXS here -- paimon_slot is a control file and a SQL script -- so no Arrow, AWS SDK
+# or libhdfs3 build is needed.
 
 on:
   workflow_dispatch:

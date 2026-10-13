@@ -1,7 +1,7 @@
 \set SHOW_CONTEXT never
 CREATE EXTENSION paimon_slot;
 
--- type mapping, mirroring extension/type_map_pg.h
+-- type mapping, mirroring legacy:extension/type_map_pg.h
 SELECT paimon.pg_type_to_paimon('boolean'::regtype, -1, false)      AS b,
        paimon.pg_type_to_paimon('smallint'::regtype, -1, true)      AS i2,
        paimon.pg_type_to_paimon('integer'::regtype, -1, false)      AS i4,

@@ -52,15 +52,15 @@ Three suites change meaningfully and are expected to differ (see §9).
 Established in analysis before this design (recorded here so the plan does not relitigate it):
 
 **What the slot buys.** Durability becomes a property of WAL rather than of a custom
-rmgr — `extension/paimon_wal.cpp`, its recovery journal and its replay path all delete.
+rmgr — `legacy:extension/paimon_wal.cpp`, its recovery journal and its replay path all delete.
 Ring-buffer drop under load (`paimon_heap.dropped_msgs`) is replaced by backpressure as
 disk. LSN is a monotone, restart-safe sequence number, unlike main's
-`(xid << 32) | op_counter` in `extension/paimon_heap.cpp:370`, which is not monotone across
+`(xid << 32) | op_counter` in `legacy:extension/paimon_heap.cpp:370`, which is not monotone across
 XID wraparound. Initial backfill becomes possible at all — main's
 `ALTER TABLE ... SET ACCESS METHOD paimon_heap` rewrites through the inherited heapam
 `relation_copy_for_cluster` and emits nothing. No Arrow, Parquet, aws-sdk-cpp, libhdfs3 or
 krb5 in the postmaster address space. No TAM signature churn across major versions
-(`extension/paimon_heap.cpp:540-632` already carries three variants). Installable on managed
+(`legacy:extension/paimon_heap.cpp:540-632` already carries three variants). Installable on managed
 PostgreSQL.
 
 **What it costs.** Tracked tables must be switched to `REPLICA IDENTITY FULL`, which adds
@@ -106,7 +106,7 @@ because PostgreSQL DDL is transactional (§4).
 ```
 
 The writer is the only component that touches Arrow, Parquet, S3 or Hadoop.
-`docker/demo/postgres/Dockerfile`, which currently builds PostgreSQL against aws-sdk-cpp,
+`legacy:docker/demo/postgres/Dockerfile`, which built PostgreSQL against aws-sdk-cpp,
 libhdfs3 and Arrow, is replaced by the official `postgres:18` image plus `CREATE EXTENSION`.
 
 ---
@@ -161,10 +161,10 @@ then discarded.
 Blocked, matching main:
 
 - PK add, drop or change — detected by diffing the current PK column set against
-  `pk_cols`. Replaces main's `ProcessUtility` checks at `extension/paimon_ddl.cpp:197`
+  `pk_cols`. Replaces main's `ProcessUtility` checks at `legacy:extension/paimon_ddl.cpp:197`
   and `:237`.
 - `ADD COLUMN ... NOT NULL` without a default — new column with `attnotnull` and no
-  default. Replaces `extension/paimon_ddl.cpp:102`.
+  default. Replaces `legacy:extension/paimon_ddl.cpp:102`.
 - `ADD COLUMN ... DEFAULT` — any new column carrying a default, matching main's rejection
   (commits `abb792b`, `7529932`). Detected from `pg_attribute.atthasdef` on the new column
   at `ddl_command_end`, which is more reliable than main's parse-tree walk over
@@ -182,7 +182,7 @@ then `UPDATE` it, which streams as ordinary DML.
 ### Primary key is required
 
 `paimon.add_table()` raises if the table has no primary key. This is a deliberate scope
-reduction from main, which permits `pk_count = 0` (`extension/paimon_client.cpp:105`) and
+reduction from main, which permits `pk_count = 0` (`legacy:extension/paimon_client.cpp:105`) and
 produces an append-only Paimon table.
 
 PostgreSQL refuses `UPDATE` and `DELETE` on a published table that has no replica
@@ -207,9 +207,9 @@ Supporting PK-less tables means a second write path onto an append table with
 
 ### Type mapping
 
-Lifted from `extension/type_map_pg.h` so the two architectures agree on `numeric`
+Lifted from `legacy:extension/type_map_pg.h` so the two architectures agree on `numeric`
 precision/scale encoding, timestamp units, and UUID-as-string. Field IDs are `attnum`,
-preserving main's convention from `extension/paimon_event.h` — the thing a
+preserving main's convention from `legacy:extension/paimon_event.h` — the thing a
 Relation-message-only consumer cannot recover, and the reason DDL goes over logical
 messages rather than being inferred.
 
@@ -286,7 +286,7 @@ mode** and the writer calls `TableWrite.write(row)`, letting Paimon hash the pri
 choose the bucket.
 
 **Amendment (replacing ruling R1).** This originally wrote no `bucket` option, matching
-`extension/paimon_schema.cpp:219-223` for layout parity with main. That put every primary-key
+`legacy:extension/paimon_schema.cpp:219-223` for layout parity with main. That put every primary-key
 table in **dynamic bucket mode**, where `write(row)` throws —
 
 ```
@@ -346,7 +346,7 @@ Write rules, per decoded message:
 | `U` Update, key unchanged | `-U(old)`, `+U(new)`; each `u` column filled from `old` |
 | `U` Update, key changed | `-D(old)`, `+I(new)`; each `u` column filled from `old` |
 | `D` Delete | `-D(old)` |
-| `T` Truncate | empty overwrite commit, matching main's `PaimonTableWriter::truncate()` (`extension/paimon_table_writer.cpp:302`) |
+| `T` Truncate | empty overwrite commit, matching main's `PaimonTableWriter::truncate()` (`legacy:extension/paimon_table_writer.cpp:302`) |
 
 The presence of an old tuple is not evidence that the key changed. `heap_update` logs the
 old key when `bms_overlap(modified_attrs, id_attrs) || id_has_external`
@@ -455,7 +455,7 @@ Decoded message types: `B` Begin, `C` Commit, `R` Relation, `I` Insert, `U` Upda
 ### Metadata fields
 
 Main exposes three optional metadata columns via GUC
-(`extension/paimon_heap.cpp:110-127`). Their availability changes here:
+(`legacy:extension/paimon_heap.cpp:110-127`). Their availability changes here:
 
 | Main GUC | New architecture | Source |
 |---|---|---|
@@ -465,7 +465,7 @@ Main exposes three optional metadata columns via GUC
 | `_seq` | mandatory, as in main | per-change LSN; first `sequence.field` |
 
 `_seq` keeps its name and its role from main but changes its derivation. Main computes
-`((uint64_t)xid << 32) | op` (`extension/paimon_heap.cpp:370`), which is not monotone across
+`((uint64_t)xid << 32) | op` (`legacy:extension/paimon_heap.cpp:370`), which is not monotone across
 XID wraparound; the per-change LSN is monotone for the lifetime of the cluster.
 
 `meta_field_op` becomes mandatory because it is the tiebreaker that orders a `-U` before its
@@ -521,14 +521,14 @@ registry are loaded before streaming begins.
 The pair is lexicographically monotone over the whole stream: `_seq` is non-decreasing
 because LSNs are, and `_op_seq` increases strictly within a transaction. This mirrors
 main, whose `next_seq()` already uses a per-operation counter in its low 32 bits
-(`extension/paimon_heap.cpp:370`); the difference is that the high bits are an LSN rather
+(`legacy:extension/paimon_heap.cpp:370`); the difference is that the high bits are an LSN rather
 than an XID.
 
 ### Intra-transaction key collisions
 
 `TxnBatcher` does **not** collapse per key. Every change is written with its own `_seq`, so
 Paimon orders them without help, and intermediate row versions are preserved rather than
-discarded — matching main, which buffers every slot (`extension/paimon_heap.cpp:380`).
+discarded — matching main, which buffers every slot (`legacy:extension/paimon_heap.cpp:380`).
 
 One case makes the rule concrete:
 
@@ -655,7 +655,7 @@ need to agree, and the several transactions in a batch share one identifier but 
 `_seq` values, so ordering is unaffected.
 
 Confirming the LSN only after the Paimon commit returns is what makes crash recovery a
-property of the code rather than best-effort, and is why `extension/paimon_wal.cpp` has no
+property of the code rather than best-effort, and is why `legacy:extension/paimon_wal.cpp` has no
 counterpart here. pgjdbc advances its own flushed position on a keepalive, gated on
 `explicitlyFlushedLSN >= startOfLastMessageLSN`; with a batch sitting in the buffer across idle
 keepalives that gate was re-verified live (T16c) rather than assumed.
@@ -934,7 +934,7 @@ Each can invalidate part of the design, and each is cheap.
 Main's acceptance suite reads row kinds through `PaimonFeatureTest.readRows`, which rebuilds
 the stored schema with a `_row_kind` `TINYINT` field prepended at field id `-1`. That works on
 main only because main writes its own Parquet files and physically emits that column —
-`extension/paimon_parquet.cpp:50` prepends it and says so. Nothing in Paimon produces it.
+`legacy:extension/paimon_parquet.cpp:50` prepends it and says so. Nothing in Paimon produces it.
 
 Writing through Paimon's own `TableWrite` stores the row kind as `_VALUE_KIND`, so the
 technique cannot be carried over, and it fails in two ways that are easy to misread:

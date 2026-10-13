@@ -52,14 +52,14 @@ public final class SchemaRegistry {
      * <p>The {@code id} of each column (the PostgreSQL attnum) is advisory. Paimon assigns field
      * ids itself and {@code Schema.Builder.column} cannot set them. This is a deliberate
      * divergence from main, which writes attnum as the field id
-     * (extension/paimon_schema.cpp:131). Column names are the contract, which is why RowBuilder
+     * (legacy:extension/paimon_schema.cpp:131). Column names are the contract, which is why RowBuilder
      * maps by name.
      *
      * <p>The {@code bucket} option IS set, from the count the create message carries, which
      * {@code paimon.add_table()} resolved (its {@code buckets => N} argument, or
      * {@code paimon.default_buckets()}). That puts the table in fixed-bucket mode, where Paimon
      * hashes the primary key to pick the bucket and keeps no key index. Leaving it unset, as this
-     * did for layout parity with main (extension/paimon_schema.cpp:219-223), costs that index:
+     * did for layout parity with main (legacy:extension/paimon_schema.cpp:219-223), costs that index:
      * 1.2 GB of a 1.8 GB warehouse on a measured TPC-C run, for 88 MB of data. Paimon does not
      * redistribute existing data when the count changes, so a wrong guess costs a rewrite rather
      * than being permanent.

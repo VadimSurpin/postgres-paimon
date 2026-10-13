@@ -15,7 +15,7 @@
 - Branch is `feat/logical-slot-writer`. `extension/` is **not modified** by any task in this plan; it stays as the `main` architecture for comparison.
 - `java/pom.xml` is **not modified**. It is `<packaging>jar</packaging>` with five shade profiles and no `<modules>`; the writer is an independent Maven project at `java/writer/`.
 - Paimon version `1.4.1` (`paimon-bundle`). PgJDBC `42.7.3`. Hadoop `3.3.4` (`hadoop-client-api`, `hadoop-client-runtime`). JUnit Jupiter `5.10.2`. Java release target `17`.
-- Paimon table options, byte-identical to what `main` writes at `extension/paimon_schema.cpp:220-222`, plus this architecture's two additions:
+- Paimon table options, byte-identical to what `main` writes at `legacy:extension/paimon_schema.cpp:220-222`, plus this architecture's two additions:
   `merge-engine = deduplicate`, `changelog-producer = input`, `sequence.field = _seq,_op_seq`, `ignore-update-before = false`.
 - Reserved Paimon field ids, matching `main`: `_seq` = `32767`, `_xid` = `0xFF00` (65280), `_op_seq` = `0xFF01` (65281). `0xFF02` (65282) was `_tid` on `main` and must stay unused. User columns use `attnum` as field id.
 - `partitionKeys` is always `[]`. Data files go under `bucket-0/`. No `bucket` option is written.
@@ -102,7 +102,7 @@ docs/superpowers/notes/
 
 Decomposition decisions locked in by that structure:
 
-- **Type mapping lives in SQL, once.** `paimon.pg_type_to_paimon()` in `paimon_slot--1.0.sql` mirrors `extension/type_map_pg.h` and emits Paimon type strings into the DDL messages. The writer never owns an OID table, and the Relation message's type OIDs are used only for sanity checks. This is the single biggest duplication the architecture could have had.
+- **Type mapping lives in SQL, once.** `paimon.pg_type_to_paimon()` in `paimon_slot--1.0.sql` mirrors `legacy:extension/type_map_pg.h` and emits Paimon type strings into the DDL messages. The writer never owns an OID table, and the Relation message's type OIDs are used only for sanity checks. This is the single biggest duplication the architecture could have had.
 - **Everything stays text until `RowBuilder`.** The decoder, resolver and batcher pass `String` values. One class converts to Paimon internals, so there is one place where a type bug can live.
 - **`SchemaRegistry` owns the Paimon side; nothing else calls `Catalog`.** `PaimonSink` writes through tables the registry hands it.
 
@@ -320,7 +320,7 @@ Create `sql/paimon_slot/test/sql/paimon_slot.sql`:
 ```sql
 CREATE EXTENSION paimon_slot;
 
--- type mapping, mirroring extension/type_map_pg.h
+-- type mapping, mirroring legacy:extension/type_map_pg.h
 SELECT paimon.pg_type_to_paimon('boolean'::regtype, -1, false)      AS b,
        paimon.pg_type_to_paimon('smallint'::regtype, -1, true)      AS i2,
        paimon.pg_type_to_paimon('integer'::regtype, -1, false)      AS i4,
@@ -359,7 +359,7 @@ SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
 Create `sql/paimon_slot/test/expected/paimon_slot.out` by running the test once the
 implementation exists (step 4), then **reading every line** to confirm it is what the Global
 Constraints require — in particular `DECIMAL(10, 2)` with the space after the comma, matching
-`extension/type_map_pg.h:27`, and `TIMESTAMP WITH LOCAL TIME ZONE`.
+`legacy:extension/type_map_pg.h:27`, and `TIMESTAMP WITH LOCAL TIME ZONE`.
 
 Create `sql/paimon_slot/test/logical.conf`:
 
@@ -424,7 +424,7 @@ CREATE TABLE paimon.table_registry (
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.table_registry', '');
 
--- Mirror of extension/type_map_pg.h.  Returns a Paimon type string.
+-- Mirror of legacy:extension/type_map_pg.h.  Returns a Paimon type string.
 CREATE FUNCTION paimon.pg_type_to_paimon(typid oid, typmod int, notnull boolean)
 RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
@@ -761,7 +761,7 @@ git commit -m "$(printf 'feat(paimon_slot): add_table, remove_table and the crea
 
 `TRUNCATE` is **not** a DDL message: pgoutput delivers a `T` message natively and
 `paimon_pub` publishes truncate by default. `main` captured it via `ProcessUtility`
-(`extension/paimon_ddl.cpp:164`); here the stream carries it.
+(`legacy:extension/paimon_ddl.cpp:164`); here the stream carries it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2718,7 +2718,7 @@ Field ids are **not** settable through `SchemaChange.addColumn`; Paimon assigns 
 `attnum`, kept in the message so the extension's diff and any future field-id-aware path have
 it, and so a reader can correlate the two schemas. Record that in a comment on
 `createTable` — it is a deliberate divergence from `main`, which writes `attnum` directly as
-the Paimon field id at `extension/paimon_schema.cpp:131`. Column **names** are the contract
+the Paimon field id at `legacy:extension/paimon_schema.cpp:131`. Column **names** are the contract
 here, which is why `RowBuilder` maps by name.
 
 `rowBuilder(relid, meta)` caches on `meta.columnNames()` so that a `Relation` message with a
@@ -3251,7 +3251,7 @@ Structure:
   lets `Main` advance the LSN for a DDL-only transaction without creating an empty snapshot.
 - `truncate(relid)`: use `table.newBatchWriteBuilder().withOverwrite()` to commit an empty
   overwrite, mirroring `main`'s `PaimonTableWriter::truncate()`
-  (`extension/paimon_table_writer.cpp:302`). Invalidate the cached write/commit for that
+  (`legacy:extension/paimon_table_writer.cpp:302`). Invalidate the cached write/commit for that
   relid afterwards.
 - A commit whose identifier Paimon has already seen must not fail the writer. Implement
   exactly what Task 1 step 4 recorded; if it throws, catch that type and log at `INFO` with the
@@ -4408,8 +4408,8 @@ git commit -m "$(printf 'test: adapt T4/T10/T11/T16/T17 and add T20 for key move
 - Produces: T18 and T19 green.
 
 This is where the architecture pays off most visibly. On `main`, offload is bespoke C++:
-`extension/paimon_offload_s3.cpp` drives aws-sdk-cpp directly and, after uploading, deletes
-local Parquet files from `bucket-0/` (`extension/paimon_offload_s3.h:20`). Here the warehouse
+`legacy:extension/paimon_offload_s3.cpp` drives aws-sdk-cpp directly and, after uploading, deletes
+local Parquet files from `bucket-0/` (`legacy:extension/paimon_offload_s3.h:20`). Here the warehouse
 simply *is* `s3://bucket/wh`, Paimon's own `FileIO` handles it, and there is no offload step,
 no local staging and no deletion pass. `PaimonOffloadTest`'s assertions about what ends up in
 S3 stay; the mechanism underneath them disappears.
