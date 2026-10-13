@@ -158,8 +158,18 @@ public class PaimonDdlTest {
         }
         check("D1 drop table: table removed from PG catalog", tableGone);
 
+        // The WRITER removes the Paimon table: DROP TABLE emits drop_table and the writer purges
+        // the warehouse data. Wait for that and assert it, rather than deleting the directory by
+        // hand. That hand-deletion was a leftover from main, where DROP TABLE left the data
+        // behind; here it raced the writer's own catalog.dropTable, which can list schema-0 and
+        // then find it gone, and the writer stopped fatally -- taking every later suite with it.
+        File dir = new File(tableDir(tbl));
+        long gone = System.currentTimeMillis() + 30_000;
+        while (dir.exists() && System.currentTimeMillis() < gone) Thread.sleep(250);
+        check("D1 drop table: the writer removed the Paimon table from the warehouse",
+              !dir.exists());
+
         // Re-create the table and verify DML capture still works
-        cleanup(tbl);
         boolean recreateOk = true;
         try (Connection conn = connect()) {
             disableMeta(conn);
@@ -647,13 +657,30 @@ public class PaimonDdlTest {
         while (!f.exists() && System.currentTimeMillis() < deadline) Thread.sleep(500);
     }
 
+    /**
+     * Counts a table's parquet files across EVERY bucket directory. Main's C++ writer put all files
+     * in bucket-0; with fixed bucketing Paimon hashes the primary key, so a table's files spread
+     * over bucket-0, bucket-1, ... and a helper that looks only in bucket-0 waits forever for a
+     * table whose rows hash elsewhere. How the files are found changes with the storage layout;
+     * what the suites assert about their content does not.
+     */
+    static int countParquet(String tbl) {
+        File[] buckets = new File(tableDir(tbl)).listFiles((d, n) -> n.startsWith("bucket-"));
+        int total = 0;
+        if (buckets != null) {
+            for (File b : buckets) {
+                File[] f = b.listFiles((d, n) -> n.endsWith(".parquet"));
+                if (f != null) total += f.length;
+            }
+        }
+        return total;
+    }
+
     static void waitForParquet(String tbl, int minFiles) throws InterruptedException {
-        File bucketDir      = new File(tableDir(tbl) + "/bucket-0");
         File snapshotLatest = new File(tableDir(tbl) + "/snapshot/LATEST");
         long deadline = System.currentTimeMillis() + 120_000;
         while (System.currentTimeMillis() < deadline) {
-            File[] f = bucketDir.listFiles((d, n) -> n.endsWith(".parquet"));
-            if (f != null && f.length >= minFiles && snapshotLatest.exists()) return;
+            if (countParquet(tbl) >= minFiles && snapshotLatest.exists()) return;
             Thread.sleep(500);
         }
         throw new RuntimeException("Timed out waiting for snapshot in " + tbl);
