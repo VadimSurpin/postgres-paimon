@@ -10,6 +10,7 @@ CREATE TABLE paimon.table_registry (
     backfill_due       boolean     NOT NULL DEFAULT true,
     replica_identity   text        NOT NULL DEFAULT 'full',
     changelog_producer text        NOT NULL DEFAULT 'input',
+    buckets            int         NOT NULL DEFAULT 4,
     registered_at      timestamptz NOT NULL DEFAULT now()
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.table_registry', '');
@@ -78,6 +79,34 @@ RETURNS text[] LANGUAGE sql STABLE AS $$
     WHERE c.conrelid = relid AND c.contype = 'p';
 $$;
 
+/*
+ * How many Paimon buckets a table gets, from the only signal available at registration:
+ * its current total size on disk.
+ *
+ *     buckets = clamp(4, ceil(total_size / 1 GiB), 64)
+ *
+ * Fixed (static) bucketing is what removes Paimon's dynamic-bucket key index, which on a
+ * measured TPC-C run was 1.2 GB of a 1.8 GB warehouse -- 63% of it -- for 88 MB of data.
+ *
+ * The floor of 4 is doing almost all the work in practice, and deliberately. The ordinary
+ * registration path requires an EMPTY table (a non-empty one cannot be registered before the
+ * writer's slot exists), where pg_total_relation_size is 16 kB and there is no signal at all;
+ * one bucket would then give every new table a single-bucket hotspot. The size only says
+ * anything when a populated table is re-registered after remove_table().
+ *
+ * The ceiling of 64 is because the writer is single-threaded: beyond that, more buckets only
+ * mean more open files per commit.
+ *
+ * A guess, in other words, with buckets => N on add_table() as the control for when it is
+ * wrong. The count is alterable afterwards, but Paimon does not redistribute existing data, so
+ * changing it costs a rewrite of the table.
+ */
+CREATE FUNCTION paimon.default_buckets(relid oid) RETURNS int
+LANGUAGE sql STABLE AS $$
+    SELECT greatest(4, least(64,
+        ceil(pg_total_relation_size(relid)::numeric / (1024 * 1024 * 1024))::int));
+$$;
+
 CREATE PUBLICATION paimon_pub;
 
 CREATE FUNCTION paimon.emit(payload jsonb) RETURNS void
@@ -120,7 +149,8 @@ END $$;
 
 CREATE FUNCTION paimon.add_table(rel regclass,
                                  replica_identity text DEFAULT 'full',
-                                 changelog_producer text DEFAULT 'input')
+                                 changelog_producer text DEFAULT 'input',
+                                 buckets int DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     v_relid  oid  := rel::oid;
@@ -130,6 +160,7 @@ DECLARE
     v_cols   jsonb;
     v_kind   "char";
     v_has_rows boolean;
+    v_buckets  int;
 BEGIN
     IF replica_identity <> 'full' THEN
         RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
@@ -140,6 +171,10 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: changelog_producer => % is not implemented in v1',
                         changelog_producer
               USING HINT = 'only ''input'' is supported; see design spec section 5';
+    END IF;
+    IF buckets IS NOT NULL AND buckets < 1 THEN
+        RAISE EXCEPTION 'paimon_slot: buckets => % must be a positive integer', buckets
+              USING HINT = 'omit the argument to size it from the table (see paimon.default_buckets), or give a count of 1 or more';
     END IF;
 
     SELECT n.nspname, c.relname, c.relkind
@@ -189,20 +224,25 @@ BEGIN
     -- message plus streaming covers it fully.
     EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s)', rel::text) INTO v_has_rows;
 
+    -- The resolved count, not the argument: the registry records what the table actually got,
+    -- so the writer's startup bootstrap replays the same value it was created with.
+    v_buckets := coalesce(buckets, paimon.default_buckets(v_relid));
+
     EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', rel::text);
     EXECUTE format('ALTER PUBLICATION paimon_pub ADD TABLE %s', rel::text);
 
     INSERT INTO paimon.table_registry
         (relid, schema_name, table_name, pk_cols, cols,
-         backfill_due, replica_identity, changelog_producer)
+         backfill_due, replica_identity, changelog_producer, buckets)
     VALUES (v_relid, v_nsp, v_name, v_pk, v_cols,
-            v_has_rows, replica_identity, changelog_producer);
+            v_has_rows, replica_identity, changelog_producer, v_buckets);
 
     PERFORM paimon.emit(jsonb_build_object(
         'v', 1, 'op', 'create', 'relid', v_relid,
         'schema', v_nsp, 'table', v_name,
         'pk', to_jsonb(v_pk), 'cols', v_cols,
-        'options', jsonb_build_object('changelog-producer', changelog_producer)));
+        'options', jsonb_build_object('changelog-producer', changelog_producer,
+                                      'bucket', v_buckets)));
 END $$;
 
 CREATE FUNCTION paimon.remove_table(rel regclass) RETURNS void

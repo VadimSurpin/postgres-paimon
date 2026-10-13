@@ -369,3 +369,39 @@ DROP TABLE nm_plain, nm_big, nm_dec, nm_dec2, nm_decp, nm_ok1, nm_ok2;
 SELECT count(*) FROM paimon.peek_messages();
 
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- Static (fixed) bucketing: the count add_table() resolves, and the override.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+-- the heuristic: clamp(4, ceil(total_size / 1 GiB), 64).  An empty table is 16 kB, so the
+-- ordinary registration path -- which REQUIRES an empty table -- always lands on the floor.
+CREATE TABLE bk_empty (id int PRIMARY KEY, v text);
+SELECT pg_total_relation_size('bk_empty'::regclass) = 0 AS truly_zero,
+       paimon.default_buckets('bk_empty'::regclass) AS buckets;
+-- the clamp's shape, without needing multi-gigabyte tables: the function is pure arithmetic on
+-- pg_total_relation_size, so exercise the arithmetic directly
+SELECT greatest(4, least(64, ceil(sz::numeric / (1024*1024*1024))::int)) AS buckets, sz
+FROM (VALUES (0), (16384), (1073741823), (1073741824), (1073741825),
+             (4294967296), (8589934592), (68719476736), (274877906944)) v(sz)
+ORDER BY sz;
+-- the resolved count is recorded and emitted
+SELECT paimon.add_table('bk_empty'::regclass);
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_empty';
+SELECT j->'options' AS options FROM (SELECT paimon.peek_messages() AS j) s;
+-- the override
+CREATE TABLE bk_over (id int PRIMARY KEY);
+SELECT paimon.add_table('bk_over'::regclass, buckets => 8);
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_over';
+SELECT j->'options'->>'bucket' AS bucket FROM (SELECT paimon.peek_messages() AS j) s;
+-- a non-positive override is refused, and nothing is registered
+CREATE TABLE bk_bad (id int PRIMARY KEY);
+SELECT paimon.add_table('bk_bad'::regclass, buckets => 0);     -- expect ERROR
+SELECT paimon.add_table('bk_bad'::regclass, buckets => -1);    -- expect ERROR
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'bk_bad';
+SELECT count(*) FROM paimon.peek_messages();
+-- 1 is allowed: a deliberate single bucket is a choice, not an error
+SELECT paimon.add_table('bk_bad'::regclass, buckets => 1);
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_bad';
+SELECT count(*) FROM paimon.peek_messages();
+DROP TABLE bk_empty, bk_over, bk_bad;
+SELECT count(*) FROM paimon.peek_messages();
+SELECT pg_drop_replication_slot('paimon_test');

@@ -242,9 +242,9 @@ SELECT paimon.add_table('ddl_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';   -- drain the create message
-                                                                                                           ?column?                                                                                                            
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                  ?column?                                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 -- blocked: primary key changes
@@ -259,9 +259,9 @@ SELECT paimon.add_table('ddl_u'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                           ?column?                                                                                                            
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_u", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                  ?column?                                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "STRING"}], "table": "ddl_u", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 ALTER TABLE ddl_u ADD COLUMN b int;                           -- allowed
@@ -401,9 +401,9 @@ SELECT paimon.add_table('combo_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                                                                                                         ?column?                                                                                                                                                                                         
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT"}, {"id": 3, "name": "y", "type": "INT"}, {"id": 4, "name": "w", "type": "INT"}, {"id": 5, "name": "x", "type": "INT"}, {"id": 6, "name": "k", "type": "INT"}], "table": "combo_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                                                                                               ?column?                                                                                                                                                                                                
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT"}, {"id": 3, "name": "y", "type": "INT"}, {"id": 4, "name": "w", "type": "INT"}, {"id": 5, "name": "x", "type": "INT"}, {"id": 6, "name": "k", "type": "INT"}], "table": "combo_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 ALTER TABLE combo_t DROP COLUMN b, ADD COLUMN z int DEFAULT 5;       -- expect ERROR
@@ -459,9 +459,9 @@ SELECT paimon.add_table('s4.t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                                         ?column?                                                                                                                          
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}, {"id": 3, "name": "b", "type": "INT"}], "table": "t", "schema": "s4", "options": {"changelog-producer": "input"}}
+                                                                                                                                ?column?                                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}, {"id": 3, "name": "b", "type": "INT"}], "table": "t", "schema": "s4", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 DROP SCHEMA s4 CASCADE;
@@ -488,9 +488,9 @@ ALTER TABLE casc_t ADD COLUMN tcol ct;
 WARNING:  paimon_slot: type dd has no Paimon mapping, using STRING
 WARNING:  paimon_slot: type ct has no Paimon mapping, using STRING
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                          ?column?                                                                                                           
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}], "table": "casc_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                 ?column?                                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "INT"}], "table": "casc_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
  {"v": 1, "op": "add_col", "col": {"id": 3, "name": "dcol", "type": "STRING"}}
  {"v": 1, "op": "add_col", "col": {"id": 4, "name": "tcol", "type": "STRING"}}
 (3 rows)
@@ -530,9 +530,9 @@ WARNING:  paimon_slot: type ct2 has no Paimon mapping, using STRING
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                            ?column?                                                                                                             
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "casc2_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                   ?column?                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "casc2_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 DROP TYPE ct2 CASCADE;
@@ -562,9 +562,9 @@ WARNING:  paimon_slot: type s5.d has no Paimon mapping, using STRING
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                       ?column?                                                                                                        
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "t", "schema": "s5", "options": {"changelog-producer": "input"}}
+                                                                                                              ?column?                                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "c", "type": "STRING"}], "table": "t", "schema": "s5", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 DROP SCHEMA s5 CASCADE;
@@ -586,9 +586,9 @@ SELECT paimon.add_table('ren_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                      ?column?                                                                                       
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "ren_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                             ?column?                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "ren_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 ALTER TABLE ren_t RENAME TO ren_t2;
@@ -627,9 +627,9 @@ SELECT paimon.add_table('ri_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                              ?column?                                                                                                              
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "u", "type": "INT NOT NULL"}], "table": "ri_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                    ?column?                                                                                                                     
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "u", "type": "INT NOT NULL"}], "table": "ri_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 ALTER TABLE ri_t REPLICA IDENTITY DEFAULT;          -- expect ERROR
@@ -717,9 +717,9 @@ SELECT paimon.add_table('bf_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                           ?column?                                                                                                           
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}], "table": "bf_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                 ?column?                                                                                                                  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}], "table": "bf_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 SELECT backfill_due FROM paimon.table_registry WHERE relid = 'bf_t'::regclass;
@@ -825,9 +825,9 @@ SELECT paimon.add_table('df_ok'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                      ?column?                                                                                       
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "df_ok", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                             ?column?                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "df_ok", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 -- ALTER CONSTRAINT cannot change a primary key's deferrability in place
@@ -880,9 +880,9 @@ SELECT paimon.add_table('key_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                                                                       ?column?                                                                                                                                                        
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}, {"id": 3, "name": "nn", "type": "INT NOT NULL"}, {"id": 4, "name": "n", "type": "INT"}], "table": "key_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                                                              ?column?                                                                                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "v", "type": "STRING"}, {"id": 3, "name": "nn", "type": "INT NOT NULL"}, {"id": 4, "name": "n", "type": "INT"}], "table": "key_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 -- the primary key's NAME is unchanged, so the pk guardrail passes; its TYPE is not
@@ -954,9 +954,9 @@ SELECT paimon.add_table('key2_t'::regclass);
 (1 row)
 
 SELECT paimon.peek_messages() - 'relid';
-                                                                                                                                     ?column?                                                                                                                                      
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"v": 1, "op": "create", "pk": ["a", "b"], "cols": [{"id": 1, "name": "a", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT NOT NULL"}, {"id": 3, "name": "v", "type": "STRING"}], "table": "key2_t", "schema": "public", "options": {"changelog-producer": "input"}}
+                                                                                                                                            ?column?                                                                                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["a", "b"], "cols": [{"id": 1, "name": "a", "type": "INT NOT NULL"}, {"id": 2, "name": "b", "type": "INT NOT NULL"}, {"id": 3, "name": "v", "type": "STRING"}], "table": "key2_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
 (1 row)
 
 ALTER TABLE key2_t ALTER COLUMN b TYPE bigint;                    -- expect ERROR
@@ -1077,6 +1077,133 @@ SELECT count(*) FROM paimon.peek_messages();
  count 
 -------
      2
+(1 row)
+
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+-- Static (fixed) bucketing: the count add_table() resolves, and the override.
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+-- the heuristic: clamp(4, ceil(total_size / 1 GiB), 64).  An empty table is 16 kB, so the
+-- ordinary registration path -- which REQUIRES an empty table -- always lands on the floor.
+CREATE TABLE bk_empty (id int PRIMARY KEY, v text);
+SELECT pg_total_relation_size('bk_empty'::regclass) = 0 AS truly_zero,
+       paimon.default_buckets('bk_empty'::regclass) AS buckets;
+ truly_zero | buckets 
+------------+---------
+ f          |       4
+(1 row)
+
+-- the clamp's shape, without needing multi-gigabyte tables: the function is pure arithmetic on
+-- pg_total_relation_size, so exercise the arithmetic directly
+SELECT greatest(4, least(64, ceil(sz::numeric / (1024*1024*1024))::int)) AS buckets, sz
+FROM (VALUES (0), (16384), (1073741823), (1073741824), (1073741825),
+             (4294967296), (8589934592), (68719476736), (274877906944)) v(sz)
+ORDER BY sz;
+ buckets |      sz      
+---------+--------------
+       4 |            0
+       4 |        16384
+       4 |   1073741823
+       4 |   1073741824
+       4 |   1073741825
+       4 |   4294967296
+       8 |   8589934592
+      64 |  68719476736
+      64 | 274877906944
+(9 rows)
+
+-- the resolved count is recorded and emitted
+SELECT paimon.add_table('bk_empty'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_empty';
+ table_name | buckets 
+------------+---------
+ bk_empty   |       4
+(1 row)
+
+SELECT j->'options' AS options FROM (SELECT paimon.peek_messages() AS j) s;
+                   options                    
+----------------------------------------------
+ {"bucket": 4, "changelog-producer": "input"}
+(1 row)
+
+-- the override
+CREATE TABLE bk_over (id int PRIMARY KEY);
+SELECT paimon.add_table('bk_over'::regclass, buckets => 8);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_over';
+ table_name | buckets 
+------------+---------
+ bk_over    |       8
+(1 row)
+
+SELECT j->'options'->>'bucket' AS bucket FROM (SELECT paimon.peek_messages() AS j) s;
+ bucket 
+--------
+ 8
+(1 row)
+
+-- a non-positive override is refused, and nothing is registered
+CREATE TABLE bk_bad (id int PRIMARY KEY);
+SELECT paimon.add_table('bk_bad'::regclass, buckets => 0);     -- expect ERROR
+ERROR:  paimon_slot: buckets => 0 must be a positive integer
+HINT:  omit the argument to size it from the table (see paimon.default_buckets), or give a count of 1 or more
+SELECT paimon.add_table('bk_bad'::regclass, buckets => -1);    -- expect ERROR
+ERROR:  paimon_slot: buckets => -1 must be a positive integer
+HINT:  omit the argument to size it from the table (see paimon.default_buckets), or give a count of 1 or more
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'bk_bad';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     0
+(1 row)
+
+-- 1 is allowed: a deliberate single bucket is a choice, not an error
+SELECT paimon.add_table('bk_bad'::regclass, buckets => 1);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT table_name, buckets FROM paimon.table_registry WHERE table_name = 'bk_bad';
+ table_name | buckets 
+------------+---------
+ bk_bad     |       1
+(1 row)
+
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+DROP TABLE bk_empty, bk_over, bk_bad;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     3
 (1 row)
 
 SELECT pg_drop_replication_slot('paimon_test');
