@@ -646,4 +646,56 @@ class PaimonSinkTest {
         }
     }
 
+
+    /**
+     * BEGIN; INSERT; ALTER TABLE ADD COLUMN; INSERT; COMMIT. Both records reach the sink in one
+     * flush, after the ALTER has been applied, but the first was decoded under the two-column
+     * relation. Building it against the three-column one used to kill the writer for good.
+     */
+    @Test
+    void anAlterInsideATransactionDoesNotRebuildEarlierRecordsAgainstTheNewColumns(
+            @TempDir java.nio.file.Path ownWh) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", ownWh.toString());
+        Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
+        WriterConfig c = WriterConfig.fromEnv(Map.of(
+            "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+            "PGPAIMON_WAREHOUSE", ownWh.toString()));
+        SchemaRegistry r = new SchemaRegistry(cat, c);
+        DdlMessageHandler h = new DdlMessageHandler(r, "paimon");
+        h.handle(msg("""
+             {"v":1,"op":"create","relid":16700,"schema":"public","table":"alt",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"}],
+              "options":{"changelog-producer":"input"}}"""));
+        RelationMeta before = new RelationMeta(16700, "public", "alt",
+            List.of("id", "v"), List.of(true, false));
+        RelationMeta after = new RelationMeta(16700, "public", "alt",
+            List.of("id", "v", "c"), List.of(true, false, false));
+        try (PaimonSink s = new PaimonSink(r, c)) {
+            s.setRelation(16700, before);
+            h.handle(msg("""
+                {"v":1,"op":"add_col","relid":"16700",
+                 "col":{"id":3,"name":"c","type":"INT"}}"""));
+            s.setRelation(16700, after);
+            s.flush(List.of(
+                new SinkRecord(16700, RowKind.INSERT, Arrays.asList("1", "a"),
+                               10L, 0, 1L, before),
+                new SinkRecord(16700, RowKind.INSERT, Arrays.asList("2", "b", "7"),
+                               11L, 1, 1L, after)), 20L, 21L);
+
+            ReadBuilder rb = r.table(16700).newReadBuilder();
+            List<String> got = new ArrayList<>();
+            int ci = r.table(16700).rowType().getFieldIndex("c");
+            InternalRow.FieldGetter cg = InternalRow.createFieldGetter(
+                r.table(16700).rowType().getTypeAt(ci), ci);
+            try (RecordReader<InternalRow> rr =
+                     rb.newRead().createReader(rb.newScan().plan().splits())) {
+                rr.forEachRemaining(row -> got.add(row.getInt(0) + "|" + row.getString(1) + "|"
+                    + String.valueOf(cg.getFieldOrNull(row))));
+            }
+            Collections.sort(got);
+            assertEquals(List.of("1|a|null", "2|b|7"), got);
+        }
+    }
 }

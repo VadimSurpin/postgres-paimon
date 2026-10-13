@@ -116,8 +116,17 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
             }
             Entry e = entry(relid);
             try {
-                RowBuilder rb = registry.rowBuilder(relid, meta);
+                RelationMeta builtFor = null;
+                RowBuilder rb = null;
                 for (SinkRecord r : g.getValue()) {
+                    // Each record is built against the description it was decoded under: an
+                    // ALTER inside the transaction leaves earlier records with fewer columns
+                    // than the current relation. The registry caches by column list.
+                    RelationMeta m = r.meta() != null ? r.meta() : meta;
+                    if (rb == null || m != builtFor) {
+                        rb = registry.rowBuilder(relid, m);
+                        builtFor = m;
+                    }
                     org.apache.paimon.data.GenericRow row;
                     try {
                         row = rb.build(r);

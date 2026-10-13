@@ -91,6 +91,7 @@ public class PaimonDdlTest {
         testD1_dropTable();
         testD2_truncate();
         testD3_addColumn();
+        testD3b_addColumnInsideTransaction();
         testD4_dropColumn();
         testD5_renameColumn();
         testD6_alterColumnType();
@@ -285,6 +286,45 @@ public class PaimonDdlTest {
             // Verify all 4 rows are captured
             PaimonRows rows = waitAndRead(tbl, 4);
             check("D3 add col: 4 rows captured after ADD COLUMN", rows.total == 4);
+        }
+    }
+
+    // ── D3b: ADD COLUMN inside a transaction that also writes the table ───────
+    // BEGIN; INSERT; ALTER TABLE ADD COLUMN; INSERT; COMMIT. The first row was decoded under the
+    // old relation, the second under the new one. Records are built at flush time, so building
+    // the first against the post-ALTER column list used to kill the writer permanently.
+    static void testD3b_addColumnInsideTransaction() throws Exception {
+        System.out.println("\n── D3b: ADD COLUMN inside a transaction ─────────────");
+        String tbl = "ddl_add_col_txn";
+        cleanup(tbl);
+        try (Connection conn = connect()) {
+            exec(conn, "DROP TABLE IF EXISTS " + tbl);
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
+        }
+        waitForFile(new File(tableDir(tbl) + "/schema/schema-0"));
+
+        boolean ok = true;
+        try (Connection conn = connect()) {
+            conn.setAutoCommit(false);
+            exec(conn, "INSERT INTO " + tbl + " VALUES (1,10)");
+            exec(conn, "ALTER TABLE " + tbl + " ADD COLUMN extra TEXT");
+            exec(conn, "INSERT INTO " + tbl + " VALUES (2,20,'new')");
+            conn.commit();
+            // The writer must still be alive afterwards: this row only arrives if it is.
+            conn.setAutoCommit(true);
+            exec(conn, "INSERT INTO " + tbl + " VALUES (3,30,'after')");
+        } catch (Exception e) {
+            ok = false;
+            System.err.println("  transaction error: " + e.getMessage());
+        }
+        check("D3b add col in txn: transaction ran", ok);
+        if (ok) {
+            PaimonRows rows = waitAndRead(tbl, 3);
+            check("D3b add col in txn: all 3 rows reached Paimon (writer survived)",
+                  rows.total == 3);
+            TableSchema schema = readSchema(tbl);
+            check("D3b add col in txn: 'extra' present in the Paimon schema",
+                  schema.fields().stream().anyMatch(f -> f.name().equals("extra")));
         }
     }
 

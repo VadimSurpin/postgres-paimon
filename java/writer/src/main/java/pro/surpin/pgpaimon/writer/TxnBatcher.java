@@ -180,7 +180,7 @@ public final class TxnBatcher {
             }
             for (PartialRecord p : resolver.resolve(event, meta)) {
                 SinkRecord record =
-                    new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid);
+                    new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid, meta);
                 if (skipLsn != 0 && changeLsn == skipLsn && skip(record, meta)) {
                     continue;   // see skip(): the transaction stays open, deliberately
                 }
