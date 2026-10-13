@@ -64,7 +64,7 @@
             <scope>test</scope>
         </dependency>
         <!-- Spark: provided so Spark-dependent sources compile in every profile.
-             The compaction and e2e-test profiles redeclare these as compile scope,
+             The compaction profile redeclares these as compile scope,
              which takes precedence and causes the shade plugin to bundle them. -->
         <dependency>
             <groupId>org.apache.paimon</groupId>
@@ -264,63 +264,6 @@
                                         </filter>
                                     </filters>
                                     <finalName>paimon-compaction</finalName>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-        <profile>
-            <id>e2e-test</id>
-            <dependencies>
-                <dependency>
-                    <groupId>org.apache.paimon</groupId>
-                    <artifactId>paimon-spark-3.5_2.12</artifactId>
-                    <version>${paimon.version}</version>
-                </dependency>
-                <dependency>
-                    <groupId>org.apache.spark</groupId>
-                    <artifactId>spark-sql_2.12</artifactId>
-                    <version>3.5.3</version>
-                </dependency>
-                <dependency>
-                    <groupId>org.apache.spark</groupId>
-                    <artifactId>spark-core_2.12</artifactId>
-                    <version>3.5.3</version>
-                </dependency>
-            </dependencies>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-shade-plugin</artifactId>
-                        <version>3.5.2</version>
-                        <executions>
-                            <execution>
-                                <phase>package</phase>
-                                <goals><goal>shade</goal></goals>
-                                <configuration>
-                                    <transformers>
-                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                            <mainClass>pro.surpin.pgpaimon.PaimonE2ETest</mainClass>
-                                        </transformer>
-                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-                                        <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
-                                            <resource>reference.conf</resource>
-                                        </transformer>
-                                    </transformers>
-                                    <filters>
-                                        <filter>
-                                            <artifact>*:*</artifact>
-                                            <excludes>
-                                                <exclude>META-INF/*.SF</exclude>
-                                                <exclude>META-INF/*.DSA</exclude>
-                                                <exclude>META-INF/*.RSA</exclude>
-                                            </excludes>
-                                        </filter>
-                                    </filters>
-                                    <finalName>paimon-e2e-test</finalName>
                                 </configuration>
                             </execution>
                         </executions>
