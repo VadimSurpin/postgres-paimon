@@ -158,7 +158,8 @@ statement back. The user-visible outcome is identical to pre-execution blocking:
 returned, schema unchanged. The only cost is that a table rewrite may be performed and
 then discarded.
 
-Blocked, matching main:
+Blocked, matching main (and, beyond main, the guardrails listed in §8's poison-record
+amendment: value guards, type changes, names, inheritance, publication integrity):
 
 - PK add, drop or change — detected by diffing the current PK column set against
   `pk_cols`. Replaces main's `ProcessUtility` checks at `legacy:extension/paimon_ddl.cpp:197`
@@ -797,11 +798,52 @@ an "ignore errors" switch:
   setting is visible — but never refused, since refusing would turn a leftover variable into an
   outage.
 
-**What v1 still does not have is a quarantine.** Nothing records the skipped record durably for a
-reader to find — the log line is the whole audit trail — and nothing automates the decision. A
-dead-letter table is a design decision in its own right and is left to a follow-up spec. The hazard
-and the exact operator sequence are written up in `docs/logical-slot-architecture.md`, "A record the
-writer can never apply".
+**Amendment (poison-record review, 2026-10-13): the third is now closed the same way as the
+first two, and a dead-letter queue is not needed.** The paragraph above said "the third cannot be
+closed that way". It can, for every known value: the rule "anything the write path cannot retry must
+be impossible to enqueue" was applied to *values* as it had been to DDL. `add_table()` puts a CHECK
+constraint (`paimon_guard_<attnum>`) on every `numeric`, `timestamp` and `timestamptz` column that
+refuses exactly what Paimon cannot hold — numeric `NaN`, and a timestamp after
+`294247-01-10 04:00:54.775807` except `infinity` — and the DDL trigger adds one to every such column
+added or retyped later, refuses dropping or renaming it, and `remove_table()` removes it. (`numeric`
+beyond `DECIMAL(38, 18)` was already refused at the type: `numeric` without precision, and `p > 38`.)
+
+A systematic review then found more ways to enqueue a permanent stop or a silent loss with ordinary
+SQL, each measured on PostgreSQL 18 with the real writer, and each now refused before commit or made
+representable (the evidence is in the review report; `docs/logical-slot-architecture.md` section 5,
+"Poison records and silent loss", gives every rule with its reason):
+
+| Hole | Was | Now |
+|---|---|---|
+| `numeric(p,s)` with negative scale / scale > precision | `DECIMAL(5, 2046)`; Paimon refuses | refused at `add_table` / `ADD COLUMN` |
+| generated column | NULL for every row; initial load fails | refused |
+| `reg*` column | old names kept after a rename | refused |
+| table name with `$ : /`, `.`/`..`; schema `sys`, `:`, `/` | Paimon cannot create it; `/` nests tables | refused at `add_table` |
+| column `_KEY_*`, blank, `_seq`/`_op_seq`/`_xid` | Paimon refuses the schema | refused |
+| `ALTER COLUMN TYPE` beyond exact widenings, or with `USING` | Paimon refuses, throws in compaction, or rewrites history | refused (`table_rewrite` trigger for `USING`) |
+| inheritance child of a replicated table; parent `ALTER` reaching a replicated child | child rows invisible; column values discarded | refused; descendants synced |
+| enum `RENAME VALUE`, composite `ALTER TYPE` on a used type | every value's text changes, no row change | refused |
+| publication: drop table, `publish` subset, row filter, column list, via-root, rename, drop | silent loss | refused (`ddl_command_end` and `sql_drop` on publications) |
+| `session_replication_role = replica` | every event trigger off | triggers `ENABLE ALWAYS` |
+| `pg_logical_emit_message(true, 'paimon', ...)` by any role | permanent stop, or a forged `drop_table` | messages carry a per-installation credential; others ignored |
+| `BEGIN; TRUNCATE t; INSERT INTO t; COMMIT` | "mixes TRUNCATE and row changes": permanent stop | applied (overwrite at `commitLsn - 1`, records at `commitLsn`) |
+| `BEGIN; INSERT INTO t; DROP TABLE t; COMMIT` | "relation is not tracked": writer stopped | the dropped table's rows are dropped |
+
+What no guardrail can refuse is its own removal. `paimon.health()` checks from the catalog that
+everything the guardrails keep true still is; the writer refuses to start on a problem and stops when
+one appears (`PGPAIMON_HEALTH_INTERVAL_MS`). That converts a bypass into a loud stop rather than a
+silent divergence; it is a residual risk for the interval between bypass and check.
+
+`PGPAIMON_SKIP_LSN` stays, as break-glass for a cause nobody has found yet. **There is deliberately
+no quarantine table**: every known cause is refused before it reaches the slot, and an unknown one
+should stop the writer loudly, not be filed away where nobody looks. The hazard and the operator
+sequence are in `docs/logical-slot-architecture.md`, "A record the writer can never apply".
+
+Residual risks (class 3, loud but not prevented): a transaction larger than the writer's heap fails
+with `OutOfMemoryError` on every replay (the recourse is heap); `USING` and `RENAME VALUE` are
+recognised from the statement text, so a statement assembled in `EXECUTE` to hide the word is not
+caught; a role granted `SELECT` on `paimon.secret` can forge DDL messages; and a guardrail bypassed
+by a superuser is detected only at the next health check.
 
 ### Registry bootstrap on startup
 
@@ -823,7 +865,12 @@ startup cost is one query, independent of how much WAL the slot is holding.
 
 ### New limitations versus main
 
-- Unlogged and temporary tables produce no logical changes and cannot be tracked.
+- Unlogged and temporary tables produce no logical changes and cannot be tracked (PostgreSQL itself
+  refuses them in a publication, and refuses `SET UNLOGGED` on a published table).
+- A table with inheritance children cannot be tracked: the children's rows would be invisible to
+  Paimon although `SELECT` on the parent returns them.
+- Generated and `reg*` columns cannot be tracked; `ALTER COLUMN ... TYPE` is limited to exact
+  widenings without `USING` (§8, "What replayed on retry does not cover").
 - Partitioned tables are **refused outright** in v1. `publish_via_partition_root` would be the route to supporting them, and is not taken here.
 - `wal_level = logical` is mandatory.
 - `merge-engine` is fixed at `deduplicate` for tracked tables.

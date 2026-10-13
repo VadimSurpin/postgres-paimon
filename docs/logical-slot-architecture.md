@@ -48,7 +48,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 279 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 318 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -64,6 +64,7 @@ extension_control_path = '/path/to/postgres-paimon/sql/paimon_slot/_install:$sys
 
 ```sql
 CREATE EXTENSION paimon_slot;     -- superuser; creates schema "paimon" and publication "paimon_pub"
+GRANT SELECT ON paimon.secret TO writer_role;   -- unless the writer connects as a superuser
 CREATE TABLE orders (id int PRIMARY KEY, customer text, amount numeric(12,2));
 SELECT paimon.add_table('orders'::regclass);
 ```
@@ -81,8 +82,10 @@ java -jar java/writer/target/paimon-writer.jar
 |---|---|---|
 | `PGPAIMON_JDBC_URL` | required | database to replicate (one writer per database) |
 | `PGPAIMON_WAREHOUSE` | required | Paimon warehouse: a local path, `hdfs://host:port/wh`, or `s3://bucket/wh` |
-| `PGPAIMON_USER`, `PGPAIMON_PASSWORD` | `postgres`, empty | needs the REPLICATION attribute (or superuser) |
-| `PGPAIMON_SLOT`, `PGPAIMON_PUBLICATION` | `paimon`, `paimon_pub` | |
+| `PGPAIMON_USER`, `PGPAIMON_PASSWORD` | `postgres`, empty | needs the REPLICATION attribute (or superuser), and `SELECT` on `paimon.secret` (section 5, "DDL messages carry a credential") |
+| `PGPAIMON_SLOT` | `paimon` | |
+| `PGPAIMON_PUBLICATION`, `PGPAIMON_MESSAGE_PREFIX` | `paimon_pub`, `paimon` | accepted only with these values: the extension publishes and emits under exactly these names, and any other value replicated nothing without a word |
+| `PGPAIMON_HEALTH_INTERVAL_MS` | `60000` | how often the running writer re-runs `paimon.health()` and stops on a problem (section 3, "When a guardrail was bypassed"); `0` checks only at startup |
 | `PGPAIMON_COMMIT_USER` | `paimon-writer-<slot>` | **must stay stable across restarts**: replay deduplication is scoped to it |
 | `PGPAIMON_SEQ_FIELD`, `PGPAIMON_OP_SEQ_FIELD` | `_seq`, `_op_seq` | mandatory metadata columns (sequencing) |
 | `PGPAIMON_XID_FIELD` | unset (**off**) | set to e.g. `_xid` to add the transaction id column |
@@ -90,7 +93,7 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_BATCH_MAX_BYTES` | `16777216` (16 MiB) | streaming commit batch: estimated size of the buffered text payload |
 | `PGPAIMON_BATCH_MAX_INTERVAL_MS` | `2000` | streaming commit batch: longest a transaction waits for its commit, counted from the batch's **first** transaction. Bounds replication latency |
 | `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per COPY chunk during the **initial load** only (each chunk is a commit of its own). **Not** the streaming batch size: that is `PGPAIMON_BATCH_MAX_ROWS`. The two do not interact |
-| `PGPAIMON_SKIP_LSN` | unset | emergency escape for a single poison record: the change LSN of the ONE record to drop. Read section 3, "A record the writer can never apply", before setting it |
+| `PGPAIMON_SKIP_LSN` | unset | break-glass for a single poison record: the change LSN of the ONE record to drop. Every known way to create one is now refused before commit; read section 3, "A record the writer can never apply", before setting it |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 
 `_xid` is off by default because it is optional (spec section 6). The acceptance harness sets
@@ -438,45 +441,36 @@ table under its current name while the Paimon table keeps the name it was regist
 
 ### A record the writer can never apply (a poison record)
 
-**This is an unsolved gap, not a bug with a workaround.** One ordinary INSERT can permanently stop
-replication for the whole database:
+A *poison record* is a change PostgreSQL has committed that the writer can never apply. The slot
+only advances after a successful Paimon commit, so the record replays on every restart, for ever,
+and replication stops for the whole database. Deleting or correcting the row afterwards does not
+help: the offending WAL record is already in the slot. That is why **every way to create one that
+is known is now refused in PostgreSQL, before commit** (section 5, "Poison records and silent loss:
+what is refused, and why"), each measured on PostgreSQL 18 against the real writer:
 
-```sql
-CREATE TABLE v (id int PRIMARY KEY, amt numeric(10,2));
-SELECT paimon.add_table('v'::regclass);
-INSERT INTO v VALUES (2, 'NaN');
+* `numeric 'NaN'` in a `numeric(p,s)` column, and a `timestamp`/`timestamptz` after
+  `294247-01-10 04:00:54.775807` (the largest instant Paimon can write; PostgreSQL goes about thirty
+  years higher): refused by a CHECK constraint the extension owns on every such column.
+* `numeric(p,s)` with a negative scale or a scale above the precision, a column, table or schema name
+  Paimon or the warehouse cannot take, a type change Paimon cannot apply: refused by `add_table()` or
+  by the DDL guardrails.
+* `BEGIN; TRUNCATE t; INSERT INTO t ...; COMMIT` used to be one too ("mixes TRUNCATE and row
+  changes"). It is now applied: the overwrite first, then the rows inserted after it.
+* A logical message under the `paimon` prefix from any role (`pg_logical_emit_message` is
+  executable by PUBLIC) used to be one too: `SELECT pg_logical_emit_message(true, 'paimon', 'not
+  json')` by a role with no privileges at all stopped the writer for good. The writer now acts only
+  on messages carrying the installation's credential, and logs and ignores the rest.
+
+What can still produce one is a value class nobody has found yet, or a guardrail that was bypassed
+(an event trigger disabled, a constraint dropped with the triggers off). The writer refuses such a
+value rather than inventing one (a silently wrong number is worse), and says so:
+
+```
+SEVERE: fatal: java.lang.IllegalStateException: POISON RECORD in public.v (INSERT at _seq 0/14CD98C8), transaction committing at 0/14CD9958: column 'amt': cannot parse DECIMAL(10, 2) from "NaN": numeric NaN and Infinity have no Paimon representation. THIS IS NOT TRANSIENT and will not clear by itself: ...
 ```
 
-`numeric 'NaN'` has no Paimon representation. The writer refuses it rather than inventing a value
-(a silently wrong number is worse), which is right, but the refusal is fatal and the
-failure is permanent:
-
-```
-SEVERE: fatal: java.lang.IllegalStateException: POISON RECORD in public.v (INSERT at _seq 0/14CD98C8), transaction committing at 0/14CD9958: column 'amt': cannot parse DECIMAL(10, 2) from "NaN": numeric NaN and Infinity have no Paimon representation. THIS IS NOT TRANSIENT and will not clear by itself: the change is already in replication slot 'paimon', the slot advances only after a successful Paimon commit, so every restart replays this same record and fails identically. Deleting or correcting the row in PostgreSQL does NOT help -- the offending WAL record stays in the slot. ...
-```
-
-**`DELETE FROM v WHERE id = 2` does not help** (verified: the restart after the delete exits 1 with
-the same message). The slot only advances past a transaction after that transaction's Paimon commit
-has returned, so the record is replayed on every start, for ever, and no later DML can remove it
-from the slot.
-
-The same applies to any value PostgreSQL stores happily that Paimon cannot represent. Two classes
-of value reach it:
-
-* **`numeric` NaN**, and a `numeric` whose digits do not fit the target `DECIMAL(p, s)`.
-* **A `timestamp` above `294247-01-10 04:00:54.775807`.** That is the largest instant Paimon can
-  write: `Timestamp.toMicros()` is `multiplyExact(millisecond, 1000) + nanoOfMillisecond / 1000`
-  and Parquet's writer calls it for every row, so one microsecond later the arithmetic either
-  throws or silently wraps. PostgreSQL's own maximum, `294276-12-31 23:59:59.999999`, is about
-  thirty years higher, so **a range of perfectly legal PostgreSQL timestamps cannot be stored**
-  and is refused here. Dates are not affected: PostgreSQL's whole date range fits Paimon's int,
-  with about 6700 years to spare. `infinity`, `-infinity`, BC years and years above 9999 are all
-  handled and never refused — but the maximum is a real bound, not a formality.
-
-**No guardrail can prevent this one.** `add_table()` refuses column *types* it cannot map, and
-refuses a `numeric` without explicit precision or above 38 digits, but a `numeric(10,2)` column is
-perfectly mappable and can still be given the value `NaN`. The check can only happen on the write
-path, by which time PostgreSQL has committed and the record is in the slot.
+The paragraphs below are the break-glass for that case. There is no dead-letter table, by design:
+the aim is that nothing reaches the slot that would need one.
 
 #### Recovery: skip the one record, `PGPAIMON_SKIP_LSN`
 
@@ -535,12 +529,43 @@ the same record, and a stale one is announced rather than silently armed.
 cover. It works, at the price it always costs: every tracked table is reloaded from a fresh snapshot
 and Paimon-side changelog history restarts.
 
-**What is still missing.** There is no quarantine: nothing records the skipped record durably for a
-reader to find (the log line is the whole audit trail), and nothing automates the decision — an
-operator must read the error and act. A dead-letter table is the next step and is not in v1. So
-keep reading spec section 8 with the correction it now carries: a failed Paimon commit is replayed
-on retry, but a replay that can never succeed stops the writer until somebody intervenes. Watch for
+**There is deliberately no quarantine.** Nothing records a skipped record durably (the log line is
+the whole audit trail) and nothing automates the decision: an operator reads the error and acts.
+A dead-letter table was considered and rejected; the guardrails make it unneeded for every known
+cause, and a cause that is not known should stop the writer loudly, not be filed away. Watch for
 `SEVERE: fatal:` and alert on the writer being down (section 3, first item).
+
+### When a guardrail was bypassed: `paimon.health()`
+
+The guardrails are event triggers and constraints, and a superuser can remove them: `ALTER EVENT
+TRIGGER ... DISABLE`, a constraint dropped while the triggers are off, a catalog edited by hand.
+Nothing in PostgreSQL can refuse its own guardrail's removal, so the extension can report it
+instead:
+
+```sql
+SELECT * FROM paimon.health();     -- one row per problem; none means healthy
+```
+
+It checks that the three event triggers exist and are `ENABLE ALWAYS`, that `paimon_pub` publishes
+every action of every replicated table with no row filter or column list, and, per replicated table,
+that it exists, is `REPLICA IDENTITY FULL`, has its value guards, has no inheritance children, and
+that `paimon.table_registry.cols` still matches the live table (a mismatch means DDL ran without its
+message reaching the writer).
+
+**The writer runs it at startup and refuses to start on any problem, and re-runs it every
+`PGPAIMON_HEALTH_INTERVAL_MS` (default one minute) and stops on one**:
+
+```
+SEVERE: fatal: java.lang.IllegalStateException: paimon.health() reports 1 problem(s) while running: event trigger paimon_ddl_end is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS). ...
+```
+
+**Why stop rather than warn.** Each problem means changes may be reaching PostgreSQL that the writer
+cannot see or cannot apply. A warning in a log nobody reads is how silent divergence happens; a
+stopped writer is noticed (and the slot keeps everything until it is fixed). Fix what it names, check
+the tables named for changes made meanwhile, and re-register any that changed while unguarded.
+**Residual risk:** between a bypass and the next check (up to the interval) changes are applied as
+they come; a DDL made in that window without its message is detected by the registry mismatch, but
+the rows streamed meanwhile were built against the old schema.
 
 ### Other operational notes
 
@@ -562,7 +587,10 @@ on retry, but a replay that can never succeed stops the writer until somebody in
 * The writer is one process per slot. Multi-writer and HA are non-goals.
 * The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
-  (pgoutput `streaming` is off on purpose), so very large transactions need heap. Completed
+  (pgoutput `streaming` is off on purpose), so very large transactions need heap. **A transaction
+  larger than the writer can hold is a poison record of its own kind** (residual risk): it fails
+  with `OutOfMemoryError` on every replay. The recourse is more heap (`java -Xmx...`), not a skip;
+  size the heap for the largest transaction you run (bulk loads, `UPDATE` of a whole table). Completed
   transactions then wait in the commit batch (see "Commit batching") up to its row, byte and
   interval limits.
 * Stopping the writer with SIGTERM is safe at any time, and commits and confirms whatever is
@@ -604,6 +632,136 @@ the first, there is no way to track a table whose old-row WAL you cannot afford.
 
 Each of these is deliberate. Several look like regressions against the TAM architecture until the
 reason is known. Do not "fix" one without reading its reason.
+
+### Poison records and silent loss: what is refused, and why
+
+Each refusal below exists because the alternative was measured (PostgreSQL 18, Paimon 1.4.1, the
+real writer) to be either a **poison record** — committed in PostgreSQL, never appliable, replication
+stopped for good (section 3) — or **silent loss** — committed in PostgreSQL, never in Paimon, no
+error. Refusing before commit is the only place neither can happen. Every one is a `pg_regress` case
+with its accepted neighbour, and an end-to-end case in `PaimonAdversarialTest`.
+
+**Value guards.** `add_table()` puts a CHECK constraint named `paimon_guard_<attnum>` on every
+`numeric`, `timestamp` and `timestamptz` column, and the DDL trigger adds one to every such column
+added or retyped later:
+
+```
+ERROR:  new row for relation "v" violates check constraint "paimon_guard_2"
+```
+
+* `numeric(p,s)`: refuses `NaN`. Paimon's DECIMAL has no NaN; the writer refuses rather than
+  invent a number. (`Infinity` never reaches a `numeric(p,s)`: PostgreSQL itself refuses it.)
+* `timestamp`, `timestamptz`: refuses anything after `294247-01-10 04:00:54.775807` (UTC), the largest
+  instant Paimon can write (its microsecond arithmetic overflows a `long` one microsecond later;
+  `TextDecoder` explains), except `infinity`, which the writer encodes (below). PostgreSQL's own
+  maximum is thirty years later. Nothing is needed at the low end, nor for `date`: PostgreSQL's whole
+  range fits Paimon's, measured at both extremes.
+
+The guard cannot be dropped, renamed, or replaced by a same-named constraint while the table is
+replicated (`constraint "paimon_guard_2" on public.v is the value guard of column "amt" and must stay
+while the table is replicated`); `remove_table()` drops the guards. `add_table()` validates them
+against the rows already there (one scan, under the lock it holds anyway; a table registered empty
+costs nothing), so a value already present is reported at registration rather than poisoning the
+initial load. A guard added later to a live table is `NOT VALID`: it checks every new and updated row
+— everything the stream will carry — and skips the scan, because an added column is NULL in every
+existing row and a retyped one only arrives from a type that could not hold the value either. A
+constraint already called `paimon_guard_<n>` refuses `add_table()` rather than passing for a guard.
+Consequence: `ALTER COLUMN amt TYPE text` on a guarded column fails in PostgreSQL itself (`operator
+does not exist: text <> numeric`), which the type-change rule below would refuse anyway.
+
+**Type mapping.** `numeric(p,s)` with a negative scale or a scale above the precision (PostgreSQL 15+)
+is refused, with the equivalent type in the hint (`numeric(5,-2)` holds what `numeric(7,0)` holds).
+`pg_type_to_paimon` used to decode `numeric(5,-2)` as `DECIMAL(5, 2046)`.
+
+**Columns the stream cannot carry.** A generated column (`STORED`, or the PostgreSQL 18 default
+`VIRTUAL`) is never published, so Paimon would hold NULL for it in every row, and the initial load
+failed outright on it. A `reg*` column (`regclass`, `regtype`, …, also inside an array or a domain)
+prints a catalog *name* looked up at output time: renaming the object changes every value's text with
+no row change, and Paimon silently keeps the old names (measured). Store the oid instead.
+
+**Names.** The Paimon identity is fixed at `add_table()`, so names are checked there: a table name
+with `$` (Paimon reads it as a system table), `:` (a URI scheme), `/` (it nests the table *inside*
+another table's directory; dropping the outer table deleted the inner one's data, measured), or equal
+to `.`/`..`; a schema name with `:` or `/`, or `sys` (Paimon's system database). Column names (also on
+`ADD COLUMN` and `RENAME COLUMN`): Paimon's `_KEY_` prefix, a name with no visible character, and the
+writer's own `_seq`, `_op_seq`, `_xid`. Dots, upper case, non-ASCII and 63-byte names all work.
+
+**`ALTER COLUMN ... TYPE`: exact widenings only, and never `USING`.** PostgreSQL rewrites the table
+for a type change and *none of the rewritten rows reach the stream*, so Paimon keeps every old value
+and reads it through its own cast. Measured over every pair of mapped types: Paimon refuses about a
+third outright (after PostgreSQL committed: a wedge), throws in the writer's compaction on others
+(a narrowed DECIMAL, STRING to BOOLEAN), and silently rewrites history on others (`INT 2147483647`
+read back as `SMALLINT -1`; integers reinterpreted as timestamps). And a change that keeps the
+Paimon type can still change values in PostgreSQL alone (`char(n)` pads, `timestamp(p)` rounds,
+`json` to `jsonb` normalises). Allowed: `smallint`→`int`→`bigint`; an integer to a `numeric` with room
+for all its digits, or to `text`/`varchar`; `real`→`double precision`; `numeric(p,s)` to one with no
+fewer integer digits or decimal places; `text`↔`varchar(n)`; `timestamp(p)`/`timestamptz(p)` to a
+higher precision. Everything else:
+
+```
+ERROR:  paimon_slot: cannot change the type of replicated column public.t.n from numeric(10,2) to numeric(10,1): it removes integer digits or decimal places
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, ... Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+```
+
+`USING` is refused even for an allowed or unchanged type (`ALTER COLUMN a TYPE int USING a + 1`),
+because the expression can change every value. The rewrite event cannot tell whether `USING` was
+given, so the `table_rewrite` trigger reads the statement text; a false positive (the word elsewhere
+in the same query string) refuses, never loses. **Residual risk:** a statement built in `EXECUTE`
+from fragments that hide the word is not caught.
+
+**Inheritance.** A replicated table may not have inheritance children (`CREATE TABLE ... INHERITS`,
+`ALTER TABLE ... INHERIT`, or registering a parent that has them): a child's rows are returned by
+`SELECT` on the parent but published under the child's own identity, so Paimon would hold only the
+parent's own rows. A replicated table may itself be a child or a partition, and an `ALTER` on its
+parent now reaches its registry: before, `ALTER TABLE parent ADD COLUMN` gave a replicated partition a
+column whose every value the writer discarded.
+
+**Types whose text changes without a row changing.** `ALTER TYPE ... ADD/DROP/ALTER ATTRIBUTE` on a
+composite type, and `ALTER TYPE ... RENAME VALUE` on an enum, are refused while a replicated column
+uses the type (directly, in an array, a domain, a range or another composite): every value's text
+changes and no row change reaches Paimon (measured: `(1,x)` became `(1,x,)` in PostgreSQL, enum `a`
+became `A`, Paimon kept the old text). `ADD VALUE` and type renames stay allowed. `RENAME VALUE` is
+recognised from the statement text, as `USING` is.
+
+**The publication.** `paimon_pub` must publish insert, update, delete and truncate of every replicated
+table, with no row filter, no column list and `publish_via_partition_root = false`, and cannot be
+renamed or dropped:
+
+```
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table public.t is not in publication paimon_pub
+```
+
+Each was measured to lose data silently (an UPDATE under `publish = 'insert'`, a column NULL under a
+column list, rows absent under a row filter or after `DROP TABLE` from the publication). Untracked
+tables may be added and removed, and the owner changed. Other publications on a replicated table do
+not matter: the writer subscribes to `paimon_pub` only (measured). For the same reason the writer
+accepts `PGPAIMON_PUBLICATION` and `PGPAIMON_MESSAGE_PREFIX` only with the extension's own names.
+
+**`ENABLE ALWAYS`.** The three event triggers fire under every `session_replication_role`. In the
+default state they did not fire under `replica` — a setting DBAs use for bulk loads — and every
+guardrail was silently off for that session (measured: `ADD COLUMN ... DEFAULT` and `REPLICA IDENTITY
+DEFAULT` went through).
+
+**DDL messages carry a credential.** `paimon.emit()` adds a per-installation token (`paimon.secret`,
+readable only by its owner and roles granted `SELECT`, which the writer's role needs), and `emit()`
+itself is no longer executable by PUBLIC. The writer ignores, with a WARNING, any message under the
+`paimon` prefix that does not parse or lacks the token. Without it, any role that can connect could
+stop the writer for good with one `pg_logical_emit_message()`, or forge a `drop_table` that purges a
+Paimon table. **Residual risk:** a role with `SELECT` on `paimon.secret` can still forge messages;
+grant it to the writer's role only.
+
+**What is not refused, and why.** `UNLOGGED` and temporary tables cannot be added (PostgreSQL refuses
+them in a publication), and PostgreSQL refuses `ALTER TABLE ... SET UNLOGGED` on a published table, so
+nothing is needed there. A changed `DateStyle`, `extra_float_digits` or `TimeZone` on the database or
+role does not reach the writer: pgjdbc sends `DateStyle=ISO` and `extra_float_digits=3` in its startup
+packet and the writer pins the rest (measured with `ALTER DATABASE ... SET DateStyle = 'SQL, DMY'` and
+`extra_float_digits = 0`). Unmapped types (`interval`, `money`, arrays, ranges, `json`, `inet`, enums,
+composites, domains, …) are replicated as their text, which round-trips exactly (measured for every
+built-in family); the text of `money` and `interval` follows the server's `lc_monetary` and
+`IntervalStyle`, so changing those changes the text of new rows only. A domain is mapped as STRING
+even over `numeric` or `timestamp`, so it needs and gets no value guard. A two-phase transaction is
+replicated at `COMMIT PREPARED`. `TRUNCATE ... CASCADE` across replicated tables, and `DROP SCHEMA
+... CASCADE`, are applied.
 
 ### A non-empty table cannot be added once the writer's slot exists; an empty one can
 
@@ -709,8 +867,9 @@ that declares NOT NULL over them is a silent lie to every reader. PostgreSQL's o
 validates the live table, not that history. (The option is also per table and read from the stored
 options, so enabling it would not even cover tables created by an earlier run.)
 
-What still works: `ALTER COLUMN ... TYPE` on any non-key column, and `DROP NOT NULL` (Paimon accepts
-that direction; verified). To change a key's type, re-register the table.
+What still works: `ALTER COLUMN ... TYPE` on a non-key column where it is an exact widening (see
+"Poison records and silent loss" above for the list and why the rest is refused), and `DROP NOT NULL`
+(Paimon accepts that direction; verified). To change a key's type, re-register the table.
 
 ### `REPLICA IDENTITY` must stay FULL on a tracked table
 
@@ -738,6 +897,9 @@ HINT:  choose a different column name
 
 Paimon 1.4.1 rejects any schema containing one, and the writer would fail at table creation. The
 check runs in `add_table()` and on `ADD COLUMN` / column rename. Rename the column in PostgreSQL.
+The same check refuses a name starting with `_KEY_` (case-sensitive), a name with no visible
+character, and the writer's metadata fields `_seq`, `_op_seq` and `_xid` (all measured to fail
+Paimon's `createTable`: "must not contain duplicate fields").
 
 ### `ALTER TABLE ... RENAME TO` deliberately does nothing
 
@@ -792,7 +954,11 @@ companion boolean column. Nothing detects the collision.
 
 * `wal_level = logical` is mandatory.
 * Unlogged and temporary tables produce no logical changes and cannot be tracked:
-  `ERROR:  cannot add relation "u" to publication` (`This operation is not supported for unlogged tables.`).
+  `ERROR:  cannot add relation "u" to publication` (`This operation is not supported for unlogged tables.`),
+  and a tracked table cannot be made unlogged (`cannot change table "u1" to unlogged because it is
+  part of a publication`). Both are PostgreSQL's own refusals.
+* A table with inheritance children cannot be tracked, and a tracked table cannot gain one (section 5,
+  "Poison records and silent loss"). A tracked table may be an inheritance child or a partition.
 * Only ordinary tables are accepted. A partitioned table is refused outright
   (`ERROR:  paimon_slot: p is not an ordinary table (relkind p)`); the design calls for
   `publish_via_partition_root` to be set deliberately before partitioned tables are supported, and v1
@@ -802,7 +968,7 @@ companion boolean column. Nothing detects the collision.
   is not a key, and `deduplicate` has nothing to deduplicate on. Deferred to a follow-up spec.
 * `merge-engine` is fixed at `deduplicate`; `changelog-producer = input`.
 * `VACUUM`, `VACUUM FREEZE` and `CHECKPOINT` emit no logical changes, so they produce no Paimon records.
-* `remove_table()` stops tracking and never deletes Paimon data. `DROP TABLE` of a tracked table
+* `remove_table()` stops tracking, drops the value guards (`paimon_guard_<n>`), and never deletes Paimon data. `DROP TABLE` of a tracked table
   *does* drop the Paimon table (this fixes main's `gaps.md` item 3), and dropping a column drops it
   from the Paimon schema too (item 1).
 * Binary-mode pgoutput decoding is not implemented; text mode is exact for the supported types.
@@ -856,7 +1022,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 279 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 318 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
@@ -865,9 +1031,11 @@ The harness (`test/slot-acceptance/`) needs no Docker. It builds its own Postgre
 port 5442 (leaving a cluster on 5441 alone), installs the extension from the worktree, runs the writer
 jar locally, runs the JDBC suites and exits with their status. With no arguments it runs **every**
 suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDdlTest`,
-`PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`, named
-explicitly in the script's `ALL_SUITES` and printed at the start of the run — which is **238
-checks**. Name a subset to run just those (plus the smoke suite). A named suite that matches no
+`PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`,
+`PaimonAdversarialTest`, named explicitly in the script's `ALL_SUITES` and printed at the start of
+the run — which is **357 checks**. `PaimonAdversarialTest` is the hostile-DBA suite: every hole in
+section 5's "Poison records and silent loss", run end to end, each asserting either PostgreSQL's
+refusal followed by a row that still reaches Paimon, or a row-for-row comparison of the two. Name a subset to run just those (plus the smoke suite). A named suite that matches no
 tests, or whose every test is skipped, fails the harness; naming a suite that does not exist, such
 as the removed `PaimonE2ETest`, fails it the same way.
 
