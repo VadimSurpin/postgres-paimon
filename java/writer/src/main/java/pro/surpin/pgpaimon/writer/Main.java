@@ -47,7 +47,13 @@ public final class Main {
 
         boolean slotExists;
         List<RegistryRow> rows;
+        String token;
         try (Connection conn = plainConnection(config)) {
+            // 1a. the guardrails are still in force: refuse to start if any was bypassed
+            //     (HealthCheck says why) -- before anything is read or written.
+            HealthCheck.requireHealthy(HealthCheck.problems(conn), "at startup");
+            // 1b. the credential every DDL message carries (DdlMessageHandler says why).
+            token = readToken(conn);
             // 2. CHECK that the slot exists. Main never creates it: the initial backfill must
             //    read the snapshot exported by the slot's own creation (Backfiller, Task 13).
             slotExists = slotExists(conn, config.slotName());
@@ -123,7 +129,8 @@ public final class Main {
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry, mini,
             config.skipLsn(),
             (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record));
-        DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix());
+        DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix(), token);
+        HealthCheck health = new HealthCheck(() -> plainConnection(config), config.healthIntervalMs());
         SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle, ddl::isDdl,
             new PipelineHandler.Target() {
                 @Override public void setRelation(long relid, RelationMeta meta) {
@@ -132,7 +139,7 @@ public final class Main {
                 @Override public void truncate(long relid, long commitLsn) throws Exception {
                     sink.truncate(relid, commitLsn);
                 }
-            }, batcher, mini);
+            }, batcher, mini, health::maybeCheck);
         SlotConsumer consumer = new SlotConsumer(config, decoder, handler);
         consumerRef[0] = consumer;
 
@@ -340,6 +347,25 @@ public final class Main {
         return DriverManager.getConnection(config.jdbcUrl(), p);
     }
 
+    /** The installation's DDL message credential; the writer's role must be able to read it. */
+    static String readToken(Connection conn) throws java.sql.SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT token FROM paimon.secret");
+             ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) {
+                throw new IllegalStateException("paimon.secret is empty: the extension's DDL"
+                    + " message credential is missing; recreate the extension");
+            }
+            return rs.getString(1);
+        } catch (java.sql.SQLException e) {
+            if ("42501".equals(e.getSQLState())) {
+                throw new IllegalStateException("the writer's role cannot read paimon.secret, the"
+                    + " credential every DDL message carries: GRANT SELECT ON paimon.secret TO "
+                    + "<the writer's role>", e);
+            }
+            throw e;
+        }
+    }
+
     static boolean slotExists(Connection conn, String slotName) throws java.sql.SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT 1 FROM pg_replication_slots WHERE slot_name = ?")) {
@@ -401,10 +427,19 @@ public final class Main {
         private final MiniBatcher mini;
         private final Map<Long, RelationMeta> relations = new HashMap<>();
         private final Set<Long> pendingTruncates = new LinkedHashSet<>();
+        private final Runnable periodic;
 
         PipelineHandler(LongPredicate tracked, LongFunction<List<String>> primaryKey,
                         Consumer<PgEvent.Message> ddl, Predicate<PgEvent.Message> isDdl,
                         Target target, TxnBatcher batcher, MiniBatcher mini) {
+            this(tracked, primaryKey, ddl, isDdl, target, batcher, mini, () -> { });
+        }
+
+        /** {@code periodic} runs on every event and idle tick (the health check). */
+        PipelineHandler(LongPredicate tracked, LongFunction<List<String>> primaryKey,
+                        Consumer<PgEvent.Message> ddl, Predicate<PgEvent.Message> isDdl,
+                        Target target, TxnBatcher batcher, MiniBatcher mini, Runnable periodic) {
+            this.periodic = periodic;
             this.tracked = tracked;
             this.primaryKey = primaryKey;
             this.ddl = ddl;
@@ -417,6 +452,7 @@ public final class Main {
         @Override
         public void onEvent(PgEvent event, long changeLsn) throws Exception {
             mini.tick();    // the time limit also fires while events are flowing
+            periodic.run();
             if (event instanceof PgEvent.Relation r) {
                 RelationMeta meta = withRegistryKey(r.meta());
                 RelationMeta before = relations.get(meta.relid());
@@ -500,6 +536,7 @@ public final class Main {
         @Override
         public void onIdle() throws Exception {
             mini.tick();
+            periodic.run();
         }
 
         @Override

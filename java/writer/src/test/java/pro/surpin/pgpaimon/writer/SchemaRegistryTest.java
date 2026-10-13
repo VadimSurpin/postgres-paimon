@@ -33,7 +33,7 @@ class SchemaRegistryTest {
         env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
         cfg = WriterConfig.fromEnv(env);
         reg = new SchemaRegistry(catalog, cfg);
-        handler = new DdlMessageHandler(reg, "paimon");
+        handler = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
     }
 
     /**
@@ -50,7 +50,7 @@ class SchemaRegistryTest {
 
     /** The same message at a chosen LSN: this is how a replay is spelled. */
     private static PgEvent.Message msg(String json, long lsn) {
-        return new PgEvent.Message(true, lsn, "paimon", json.getBytes(StandardCharsets.UTF_8));
+        return new PgEvent.Message(true, lsn, "paimon", TestAuth.authed(json));
     }
 
     @Test @Order(1)

@@ -227,4 +227,37 @@ class WriterConfigTest {
             assertTrue(ex.getMessage().contains(bad[0]), ex.getMessage());
         }
     }
+
+    /**
+     * The extension publishes to paimon_pub and emits DDL under 'paimon' and nothing else, so a
+     * writer configured otherwise would replicate nothing and say nothing.
+     */
+    @Test
+    void thePublicationAndThePrefixCanOnlyBeTheExtensionsOwn() {
+        Map<String, String> base = Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://h/db",
+                                          "PGPAIMON_WAREHOUSE", "/wh");
+        Map<String, String> pub = new HashMap<>(base);
+        pub.put("PGPAIMON_PUBLICATION", "other_pub");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> WriterConfig.fromEnv(pub));
+        assertTrue(e.getMessage().contains("PGPAIMON_PUBLICATION must be 'paimon_pub'"), e.getMessage());
+        Map<String, String> prefix = new HashMap<>(base);
+        prefix.put("PGPAIMON_MESSAGE_PREFIX", "mine");
+        assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(prefix));
+        Map<String, String> explicit = new HashMap<>(base);
+        explicit.put("PGPAIMON_PUBLICATION", "paimon_pub");
+        explicit.put("PGPAIMON_MESSAGE_PREFIX", "paimon");
+        assertEquals("paimon_pub", WriterConfig.fromEnv(explicit).publicationName());
+    }
+
+    @Test
+    void theHealthIntervalDefaultsToAMinuteAndZeroTurnsItOff() {
+        Map<String, String> env = new HashMap<>(Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://h/db",
+                                                       "PGPAIMON_WAREHOUSE", "/wh"));
+        assertEquals(60_000L, WriterConfig.fromEnv(env).healthIntervalMs());
+        env.put("PGPAIMON_HEALTH_INTERVAL_MS", "0");
+        assertEquals(0L, WriterConfig.fromEnv(env).healthIntervalMs());
+        env.put("PGPAIMON_HEALTH_INTERVAL_MS", "-1");
+        assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(env));
+    }
 }

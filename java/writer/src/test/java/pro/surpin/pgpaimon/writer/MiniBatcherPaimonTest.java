@@ -37,7 +37,7 @@ class MiniBatcherPaimonTest {
         env.put("PGPAIMON_WAREHOUSE", wh.toString());
         cfg = WriterConfig.fromEnv(env);
         reg = new SchemaRegistry(catalog, cfg);
-        DdlMessageHandler ddl = new DdlMessageHandler(reg, "paimon");
+        DdlMessageHandler ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
         for (long relid : new long[] {GUARDED, UNGUARDED, A, B, C}) {
             ddlLsn += 0x10;
             ddl.handle(new PgEvent.Message(true, ddlLsn, "paimon", ("""
@@ -45,7 +45,7 @@ class MiniBatcherPaimonTest {
                  "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
                                      {"id":2,"name":"v","type":"STRING"}],
                  "options":{"changelog-producer":"input"}}""".formatted(relid, relid))
-                .getBytes(StandardCharsets.UTF_8)));
+                .transform(TestAuth::authed)));
         }
     }
 

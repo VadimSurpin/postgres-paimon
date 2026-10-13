@@ -43,7 +43,7 @@ class PaimonSinkTest {
         env.put("PGPAIMON_WAREHOUSE", wh.toString());
         cfg = WriterConfig.fromEnv(env);
         reg = new SchemaRegistry(catalog, cfg);
-        ddl = new DdlMessageHandler(reg, "paimon");
+        ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
         ddl.handle(msg("""
              {"v":1,"op":"create","relid":16500,"schema":"public","table":"s",
               "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
@@ -68,7 +68,7 @@ class PaimonSinkTest {
 
     private static PgEvent.Message msg(String json) {
         return new PgEvent.Message(true, NEXT_LSN.addAndGet(0x10), "paimon",
-                                   json.getBytes(StandardCharsets.UTF_8));
+                                   TestAuth.authed(json));
     }
 
     private static SinkRecord rec(RowKind k, String id, String v, long seq, int op) {
@@ -354,7 +354,7 @@ class PaimonSinkTest {
             "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
             "PGPAIMON_WAREHOUSE", ownWh.toString()));
         SchemaRegistry r = new SchemaRegistry(cat, c);
-        new DdlMessageHandler(r, "paimon").handle(msg("""
+        new DdlMessageHandler(r, "paimon", TestAuth.TOKEN).handle(msg("""
              {"v":1,"op":"create","relid":16600,"schema":"public","table":"iso",
               "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
                                   {"id":2,"name":"v","type":"STRING"}],
@@ -662,7 +662,7 @@ class PaimonSinkTest {
             "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
             "PGPAIMON_WAREHOUSE", ownWh.toString()));
         SchemaRegistry r = new SchemaRegistry(cat, c);
-        DdlMessageHandler h = new DdlMessageHandler(r, "paimon");
+        DdlMessageHandler h = new DdlMessageHandler(r, "paimon", TestAuth.TOKEN);
         h.handle(msg("""
              {"v":1,"op":"create","relid":16700,"schema":"public","table":"alt",
               "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},

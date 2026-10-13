@@ -26,12 +26,25 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            String seqField, String opSeqField, String xidField,
                            int flushMaxRecords, long skipLsn,
                            long batchMaxRows, long batchMaxBytes, long batchMaxIntervalMs,
+                           long healthIntervalMs,
                            Map<String, String> catalogOptions) {
 
     /** Defaults for the streaming commit batch; see {@link MiniBatcher}. */
     public static final String DEFAULT_BATCH_MAX_ROWS = "10000";
     public static final String DEFAULT_BATCH_MAX_BYTES = "16777216";    // 16 MiB
     public static final String DEFAULT_BATCH_MAX_INTERVAL_MS = "2000";
+    /** How often the running writer re-runs paimon.health(); see {@link HealthCheck}. */
+    public static final String DEFAULT_HEALTH_INTERVAL_MS = "60000";
+
+    /**
+     * The publication and message prefix the extension uses. Both are fixed in
+     * paimon_slot--1.0.sql (add_table adds tables to paimon_pub, paimon.emit uses the prefix),
+     * so the writer configured with anything else would receive no tables or no DDL at all, and
+     * say nothing. The settings are kept so that a deployment naming them explicitly still
+     * starts, but only with these values.
+     */
+    static final String PUBLICATION = "paimon_pub";
+    static final String MESSAGE_PREFIX = "paimon";
 
     public static WriterConfig fromEnv(Map<String, String> env) {
         String jdbc = require(env, "PGPAIMON_JDBC_URL");
@@ -54,8 +67,8 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             getOrDefault(env, "PGPAIMON_PASSWORD", ""),
             wh,
             getOrDefault(env, "PGPAIMON_SLOT", "paimon"),
-            getOrDefault(env, "PGPAIMON_PUBLICATION", "paimon_pub"),
-            getOrDefault(env, "PGPAIMON_MESSAGE_PREFIX", "paimon"),
+            fixed(env, "PGPAIMON_PUBLICATION", PUBLICATION),
+            fixed(env, "PGPAIMON_MESSAGE_PREFIX", MESSAGE_PREFIX),
             getOrDefault(env, "PGPAIMON_COMMIT_USER", "paimon-writer-" + getOrDefault(env, "PGPAIMON_SLOT", "paimon")),
             getOrDefault(env, "PGPAIMON_SEQ_FIELD", "_seq"),
             getOrDefault(env, "PGPAIMON_OP_SEQ_FIELD", "_op_seq"),
@@ -65,7 +78,19 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             parseMin(env, "PGPAIMON_BATCH_MAX_ROWS", DEFAULT_BATCH_MAX_ROWS, 1),
             parseMin(env, "PGPAIMON_BATCH_MAX_BYTES", DEFAULT_BATCH_MAX_BYTES, 1),
             parseMin(env, "PGPAIMON_BATCH_MAX_INTERVAL_MS", DEFAULT_BATCH_MAX_INTERVAL_MS, 0),
+            parseMin(env, "PGPAIMON_HEALTH_INTERVAL_MS", DEFAULT_HEALTH_INTERVAL_MS, 0),
             Map.copyOf(cat));
+    }
+
+    /** A setting that may only take the one value the extension uses; see {@link #PUBLICATION}. */
+    private static String fixed(Map<String, String> env, String key, String only) {
+        String v = getOrDefault(env, key, only);
+        if (!only.equals(v)) {
+            throw new IllegalArgumentException(key + " must be '" + only + "' (got '" + v
+                + "'): the paimon_slot extension publishes tracked tables and emits DDL under"
+                + " that name only, so any other value would replicate nothing and say nothing");
+        }
+        return v;
     }
 
     /** A blank value is treated as unset: null. */

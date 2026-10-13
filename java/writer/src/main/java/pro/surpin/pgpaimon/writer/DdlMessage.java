@@ -18,6 +18,9 @@ import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectMap
  * deliberately lenient so that the handler can reject an unsupported {@code v} or an unknown
  * {@code op} by name before it complains about a missing field.
  *
+ * <p>{@code auth} is the installation's credential (paimon.secret), which every message the
+ * extension emits carries; {@link DdlMessageHandler} acts on nothing without it.
+ *
  * <p>{@code relid} is a JSON string (jsonb renders an oid as text) and is held as an unsigned
  * 32-bit value in a {@code long}. A Paimon type string carries its nullability
  * ({@code "INT NOT NULL"}); there is no separate boolean.
@@ -25,7 +28,7 @@ import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectMap
 public record DdlMessage(int version, String op, long relid, String schema, String table,
                          List<String> pk, List<Col> cols, Col col, Integer id,
                          String from, String to, String name, String type,
-                         Map<String, String> options) {
+                         Map<String, String> options, String auth) {
 
     /** {@code id} is the PostgreSQL attnum: advisory only, Paimon assigns its own field ids. */
     public record Col(int id, String name, String type) {}
@@ -92,7 +95,8 @@ public record DdlMessage(int version, String op, long relid, String schema, Stri
             text(n, "op"), relid, text(n, "schema"), text(n, "table"),
             pk, cols, n.hasNonNull("col") ? col(n.get("col")) : null,
             n.hasNonNull("id") ? n.get("id").asInt() : null,
-            text(n, "from"), text(n, "to"), text(n, "name"), text(n, "type"), options);
+            text(n, "from"), text(n, "to"), text(n, "name"), text(n, "type"), options,
+            text(n, "auth"));
     }
 
     /** Parses the {@code cols} jsonb of a {@code paimon.table_registry} row (a JSON array). */

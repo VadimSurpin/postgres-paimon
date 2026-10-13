@@ -16,10 +16,21 @@ public final class DdlMessageHandler {
 
     private final SchemaRegistry registry;
     private final String expectedPrefix;
+    private final String token;
 
-    public DdlMessageHandler(SchemaRegistry registry, String expectedPrefix) {
+    /**
+     * @param token the installation's credential, read from {@code paimon.secret} at startup.
+     *              Required: a handler that accepted unauthenticated messages would let any role
+     *              that can connect drive the writer (see {@link #handle}).
+     */
+    public DdlMessageHandler(SchemaRegistry registry, String expectedPrefix, String token) {
+        if (token == null || token.isEmpty()) {
+            throw new IllegalArgumentException("the DDL message credential (paimon.secret) is"
+                + " required");
+        }
         this.registry = registry;
         this.expectedPrefix = expectedPrefix;
+        this.token = token;
     }
 
     /** Whether {@link #handle} would act on this message (it ignores other prefixes). */
@@ -27,11 +38,38 @@ public final class DdlMessageHandler {
         return expectedPrefix.equals(m.prefix());
     }
 
+    /**
+     * Applies one message, or ignores it with a WARNING when it was not emitted by the extension.
+     *
+     * <p>{@code pg_logical_emit_message()} is executable by PUBLIC, so anything under the prefix
+     * may come from any role that can connect. Before the credential, one
+     * {@code SELECT pg_logical_emit_message(true, 'paimon', 'not json')} by a role with no
+     * privileges at all stopped the writer for good -- the message is in the slot and replays on
+     * every restart, a poison record -- and a well-formed forged {@code drop_table} would have
+     * purged a Paimon table. So a message that does not parse, or does not carry this
+     * installation's credential, is not ours: it is reported and skipped, never applied and
+     * never fatal. Every message the extension emits is valid JSON carrying the credential
+     * (paimon.emit), so nothing legitimate can land here. A message that IS authenticated and
+     * still wrong is a defect of ours, and stays fatal below.
+     */
     public void handle(PgEvent.Message m) {
         if (!expectedPrefix.equals(m.prefix())) {
             return;
         }
-        DdlMessage d = DdlMessage.parse(m.content());
+        DdlMessage d;
+        try {
+            d = DdlMessage.parse(m.content());
+        } catch (RuntimeException e) {
+            LOG.warning(ignored(m, "it is not a JSON object (" + e.getMessage() + ")"));
+            return;
+        }
+        if (d.auth() == null || !java.security.MessageDigest.isEqual(
+                d.auth().getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                token.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+            LOG.warning(ignored(m, d.auth() == null ? "it carries no credential"
+                                                    : "its credential is not this installation's"));
+            return;
+        }
         if (d.version() != WIRE_VERSION) {
             throw new IllegalStateException("unsupported DDL message version " + d.version()
                 + " (this writer understands " + WIRE_VERSION + ")");
@@ -67,6 +105,14 @@ public final class DdlMessageHandler {
             }
             default -> throw new IllegalStateException("unknown DDL op '" + op + "'");
         }
+    }
+
+    private String ignored(PgEvent.Message m, String why) {
+        return "IGNORED a logical message with prefix '" + expectedPrefix + "' at "
+            + SlotConsumer.formatLsn(m.lsn()) + ": " + why + ", so it was not emitted by the"
+            + " paimon_slot extension. Some role called pg_logical_emit_message() with this"
+            + " prefix (it is executable by PUBLIC); nothing was applied. If it was meant to be"
+            + " a DDL message, emit it through the extension instead";
     }
 
     private static <T> T need(T v, String field, String op) {
