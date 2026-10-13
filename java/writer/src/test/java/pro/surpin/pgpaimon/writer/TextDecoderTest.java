@@ -530,4 +530,74 @@ class TextDecoderTest {
         assertTrue(e.getMessage().contains("no Paimon representation"), e.getMessage());
     }
 
+
+    // ---- edge values, as PostgreSQL 18's walsender printed them (poison-report.md, probe "ext") ----
+
+    @Test
+    void integerExtremesExactly() {
+        assertEquals(Short.MIN_VALUE, TextDecoder.toPaimon(DataTypes.SMALLINT(), "-32768"));
+        assertEquals(Short.MAX_VALUE, TextDecoder.toPaimon(DataTypes.SMALLINT(), "32767"));
+        assertEquals(Integer.MIN_VALUE, TextDecoder.toPaimon(DataTypes.INT(), "-2147483648"));
+        assertEquals(Long.MIN_VALUE,
+                     TextDecoder.toPaimon(DataTypes.BIGINT(), "-9223372036854775808"));
+    }
+
+    @Test
+    void floatEdgesKeepTheirBits() {
+        // -0 keeps its sign; the smallest normal and subnormal values survive exactly
+        assertEquals(Double.doubleToRawLongBits(-0.0d), Double.doubleToRawLongBits(
+            (Double) TextDecoder.toPaimon(DataTypes.DOUBLE(), "-0")));
+        assertEquals(Float.MIN_NORMAL, TextDecoder.toPaimon(DataTypes.FLOAT(), "1.1754944e-38"));
+        assertEquals(Double.MIN_VALUE, TextDecoder.toPaimon(DataTypes.DOUBLE(), "5e-324"));
+        assertEquals(Float.MAX_VALUE, TextDecoder.toPaimon(DataTypes.FLOAT(), "3.4028235e+38"));
+        assertTrue(Float.isNaN((Float) TextDecoder.toPaimon(DataTypes.FLOAT(), "NaN")));
+        assertEquals(Float.NEGATIVE_INFINITY, TextDecoder.toPaimon(DataTypes.FLOAT(), "-Infinity"));
+    }
+
+    @Test
+    void numericAtExactlyThirtyEightDigits() {
+        String max = "9".repeat(38);
+        assertEquals(max, ((Decimal) TextDecoder.toPaimon(DataTypes.DECIMAL(38, 0), max))
+            .toBigDecimal().toPlainString());
+        assertEquals("-" + max, ((Decimal) TextDecoder.toPaimon(DataTypes.DECIMAL(38, 0), "-" + max))
+            .toBigDecimal().toPlainString());
+        String frac = "0." + "9".repeat(38);
+        assertEquals(frac, ((Decimal) TextDecoder.toPaimon(DataTypes.DECIMAL(38, 38), frac))
+            .toBigDecimal().toPlainString());
+        String tiny = "-0." + "0".repeat(37) + "1";
+        assertEquals(tiny, ((Decimal) TextDecoder.toPaimon(DataTypes.DECIMAL(38, 38), tiny))
+            .toBigDecimal().toPlainString());
+        // numeric(3,3) is now the largest scale-over-precision form the extension accepts
+        assertEquals("0.001", ((Decimal) TextDecoder.toPaimon(DataTypes.DECIMAL(3, 3), "0.001"))
+            .toBigDecimal().toPlainString());
+    }
+
+    @Test
+    void textKeepsEveryCharacterIncludingControlAndAstral() {
+        String s = "tab\there\nnl \\ back \"q\" 's' \u0001 \u007f \uD83D\uDE00 \u00e9";
+        assertEquals(BinaryString.fromString(s), TextDecoder.toPaimon(DataTypes.STRING(), s));
+        String big = "x".repeat(3_000_000);
+        assertEquals(3_000_000,
+            ((BinaryString) TextDecoder.toPaimon(DataTypes.STRING(), big)).numChars());
+    }
+
+    @Test
+    void sixDigitFractionsAndTheMicrosecondBelowTheMaximum() {
+        Timestamp t = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(),
+            "2000-02-29 23:59:59.999999");
+        assertEquals("2000-02-29T23:59:59.999999", t.toLocalDateTime().toString());
+        Timestamp max = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP(),
+            "294247-01-10 04:00:54.775807");
+        assertEquals(Long.MAX_VALUE, max.toMicros());
+        assertThrows(TextDecoder.UnrepresentableValueException.class,
+            () -> TextDecoder.toPaimon(DataTypes.TIMESTAMP(), "294247-01-10 04:00:54.775808"));
+    }
+
+    @Test
+    void timestamptzAtTheMaximumInAnotherZoneIsTheSameInstant() {
+        // the extension's guard compares in UTC, so this is the value it lets through
+        Timestamp t = (Timestamp) TextDecoder.toPaimon(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(),
+            "294247-01-09 23:00:54.775807-05");
+        assertEquals(Long.MAX_VALUE, t.toMicros());
+    }
 }
