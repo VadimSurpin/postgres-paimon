@@ -1,9 +1,10 @@
 name: Paimon compatibility tests
 
-# Builds all Java compatibility-test and utility jars.
+# Builds all Java acceptance-test and utility jars.
 # These are NOT release artifacts — they are standalone tools for verifying
-# that paimon_heap output is readable by the Apache Paimon Java API and for
-# running integration tests against a live PostgreSQL instance.
+# that what paimon-writer produces is readable by the Apache Paimon Java API and for
+# running integration tests against a live PostgreSQL instance. They are exercised
+# end to end by test/slot-acceptance/run_acceptance.sh, not by this workflow.
 
 on:
   push:
@@ -58,10 +59,6 @@ jobs:
       - name: Build offload-test jar
         working-directory: java
         run: mvn -B package -P offload-test --no-transfer-progress
-
-      - name: Build e2e-test jar
-        working-directory: java
-        run: mvn -B package -P e2e-test --no-transfer-progress
 
       - name: Build compaction jar
         working-directory: java
