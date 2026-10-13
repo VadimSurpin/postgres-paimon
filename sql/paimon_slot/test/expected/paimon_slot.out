@@ -54,24 +54,30 @@ SELECT paimon.pk_cols('reg_t'::regclass);
 (1 row)
 
 SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
-               jsonb_pretty                
--------------------------------------------
- [                                        +
-     {                                    +
-         "id": 1,                         +
-         "name": "id",                    +
-         "type": "INT NOT NULL"           +
-     },                                   +
-     {                                    +
-         "id": 2,                         +
-         "name": "amount",                +
-         "type": "DECIMAL(10, 2) NOT NULL"+
-     },                                   +
-     {                                    +
-         "id": 3,                         +
-         "name": "note",                  +
-         "type": "STRING"                 +
-     }                                    +
+                jsonb_pretty                
+--------------------------------------------
+ [                                         +
+     {                                     +
+         "id": 1,                          +
+         "name": "id",                     +
+         "type": "INT NOT NULL",           +
+         "typid": 23,                      +
+         "typmod": -1                      +
+     },                                    +
+     {                                     +
+         "id": 2,                          +
+         "name": "amount",                 +
+         "type": "DECIMAL(10, 2) NOT NULL",+
+         "typid": 1700,                    +
+         "typmod": 655366                  +
+     },                                    +
+     {                                     +
+         "id": 3,                          +
+         "name": "note",                   +
+         "type": "STRING",                 +
+         "typid": 25,                      +
+         "typmod": -1                      +
+     }                                     +
  ]
 (1 row)
 
@@ -80,29 +86,37 @@ ALTER TABLE reg_t ADD COLUMN tmp int;
 ALTER TABLE reg_t DROP COLUMN tmp;
 ALTER TABLE reg_t ADD COLUMN kept int;
 SELECT jsonb_pretty(paimon.table_cols('reg_t'::regclass));
-               jsonb_pretty                
--------------------------------------------
- [                                        +
-     {                                    +
-         "id": 1,                         +
-         "name": "id",                    +
-         "type": "INT NOT NULL"           +
-     },                                   +
-     {                                    +
-         "id": 2,                         +
-         "name": "amount",                +
-         "type": "DECIMAL(10, 2) NOT NULL"+
-     },                                   +
-     {                                    +
-         "id": 3,                         +
-         "name": "note",                  +
-         "type": "STRING"                 +
-     },                                   +
-     {                                    +
-         "id": 5,                         +
-         "name": "kept",                  +
-         "type": "INT"                    +
-     }                                    +
+                jsonb_pretty                
+--------------------------------------------
+ [                                         +
+     {                                     +
+         "id": 1,                          +
+         "name": "id",                     +
+         "type": "INT NOT NULL",           +
+         "typid": 23,                      +
+         "typmod": -1                      +
+     },                                    +
+     {                                     +
+         "id": 2,                          +
+         "name": "amount",                 +
+         "type": "DECIMAL(10, 2) NOT NULL",+
+         "typid": 1700,                    +
+         "typmod": 655366                  +
+     },                                    +
+     {                                     +
+         "id": 3,                          +
+         "name": "note",                   +
+         "type": "STRING",                 +
+         "typid": 25,                      +
+         "typmod": -1                      +
+     },                                    +
+     {                                     +
+         "id": 5,                          +
+         "name": "kept",                   +
+         "type": "INT",                    +
+         "typid": 23,                      +
+         "typmod": -1                      +
+     }                                     +
  ]
 (1 row)
 
@@ -353,19 +367,23 @@ SELECT paimon.peek_messages() - 'relid';
 
 -- the registry tracked every change
 SELECT jsonb_pretty(cols) FROM paimon.table_registry WHERE relid = 'ddl_t'::regclass;
-          jsonb_pretty          
---------------------------------
- [                             +
-     {                         +
-         "id": 1,              +
-         "name": "id",         +
-         "type": "INT NOT NULL"+
-     },                        +
-     {                         +
-         "id": 2,              +
-         "name": "a",          +
-         "type": "STRING"      +
-     }                         +
+          jsonb_pretty           
+---------------------------------
+ [                              +
+     {                          +
+         "id": 1,               +
+         "name": "id",          +
+         "type": "INT NOT NULL",+
+         "typid": 23,           +
+         "typmod": -1           +
+     },                         +
+     {                          +
+         "id": 2,               +
+         "name": "a",           +
+         "type": "STRING",      +
+         "typid": 1043,         +
+         "typmod": 68           +
+     }                          +
  ]
 (1 row)
 
@@ -1204,6 +1222,835 @@ SELECT count(*) FROM paimon.peek_messages();
  count 
 -------
      3
+(1 row)
+
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+-- =====================================================================================
+-- Poison records and silent data loss: every guardrail below refuses, before PostgreSQL
+-- commits, a change the writer could never apply or would silently lose. Each refusal is
+-- paired with the accepted neighbour it must not catch.
+-- =====================================================================================
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+\set VERBOSITY default
+-- (1) value guards: numeric NaN, and timestamps beyond Paimon's largest writable instant
+CREATE TABLE vg_t (id int PRIMARY KEY, n numeric(10,2), ts timestamp, tz timestamptz,
+                   d date, t text);
+SELECT paimon.add_table('vg_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                                                                                                                       ?column?                                                                                                                                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "n", "type": "DECIMAL(10, 2)"}, {"id": 3, "name": "ts", "type": "TIMESTAMP"}, {"id": 4, "name": "tz", "type": "TIMESTAMP WITH LOCAL TIME ZONE"}, {"id": 5, "name": "d", "type": "DATE"}, {"id": 6, "name": "t", "type": "STRING"}], "table": "vg_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
+(1 row)
+
+SELECT conname, pg_get_expr(conbin, conrelid), convalidated FROM pg_constraint
+WHERE conrelid = 'vg_t'::regclass AND contype = 'c' ORDER BY conname;
+    conname     |                                                         pg_get_expr                                                          | convalidated 
+----------------+------------------------------------------------------------------------------------------------------------------------------+--------------
+ paimon_guard_2 | (n <> 'NaN'::numeric)                                                                                                        | t
+ paimon_guard_3 | ((ts <= 'Sun Jan 10 04:00:54.775807 294247'::timestamp without time zone) OR (ts = 'infinity'::timestamp without time zone)) | t
+ paimon_guard_4 | ((tz <= 'Sat Jan 09 20:00:54.775807 294247 PST'::timestamp with time zone) OR (tz = 'infinity'::timestamp with time zone))   | t
+(3 rows)
+
+INSERT INTO vg_t (id, n) VALUES (1, 'NaN');                                     -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_2"
+DETAIL:  Failing row contains (1, NaN, null, null, null, null).
+INSERT INTO vg_t (id, n) VALUES (1, 'Infinity');            -- expect ERROR (PostgreSQL itself)
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 10, scale 2 cannot hold an infinite value.
+INSERT INTO vg_t (id, ts) VALUES (2, '294247-01-10 04:00:54.775808');           -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_3"
+DETAIL:  Failing row contains (2, null, Sun Jan 10 04:00:54.775808 294247, null, null, null).
+INSERT INTO vg_t (id, tz) VALUES (3, '294247-01-10 04:00:54.775808+00');        -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_4"
+DETAIL:  Failing row contains (3, null, null, Sat Jan 09 20:00:54.775808 294247 PST, null, null).
+INSERT INTO vg_t (id, ts) VALUES (4, '294276-12-31 23:59:59.999999');           -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_3"
+DETAIL:  Failing row contains (4, null, Sun Dec 31 23:59:59.999999 294276, null, null, null).
+-- the neighbours: the largest writable instant, infinity (encoded by the writer), dates at
+-- PostgreSQL's own extremes (Paimon holds its whole date range), ordinary values
+INSERT INTO vg_t VALUES (5, 99999999.99, '294247-01-10 04:00:54.775807',
+                         '294247-01-10 04:00:54.775807+00', '5874897-12-31', 'x');
+INSERT INTO vg_t VALUES (6, -1.5, 'infinity', '-infinity', '4714-11-24 BC', NULL);
+INSERT INTO vg_t VALUES (7, NULL, '4714-11-24 00:00:00 BC', NULL, NULL, NULL);
+SET TimeZone = 'America/New_York';
+INSERT INTO vg_t (id, tz) VALUES (8, '294247-01-09 23:00:54.775807');   -- = the maximum in UTC
+INSERT INTO vg_t (id, tz) VALUES (9, '294247-01-09 23:00:54.775808');           -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_4"
+DETAIL:  Failing row contains (9, null, null, Sat Jan 09 23:00:54.775808 294247 EST, null, null).
+RESET TimeZone;
+SELECT id FROM vg_t ORDER BY id;
+ id 
+----
+  5
+  6
+  7
+  8
+(4 rows)
+
+-- the guard is recognised under any DateStyle and TimeZone (its constants deparse through them)
+SET DateStyle = 'SQL, DMY';
+SET TimeZone = 'Asia/Kathmandu';
+ALTER TABLE vg_t ADD COLUMN after_style int;
+RESET DateStyle;
+RESET TimeZone;
+SELECT paimon.peek_messages() - 'relid';
+                                     ?column?                                      
+-----------------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 7, "name": "after_style", "type": "INT"}}
+(1 row)
+
+-- a guard cannot be dropped, renamed, or replaced by a same-named constraint
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2;                                -- expect ERROR
+ERROR:  paimon_slot: constraint "paimon_guard_2" on public.vg_t is the value guard of column "n" and must stay while the table is replicated
+HINT:  it keeps values Paimon cannot represent (numeric NaN, a timestamp after 294247-01-10 04:00:54.775807) out of the replication stream, where one would stop replication for good; paimon.remove_table() drops it
+ALTER TABLE vg_t RENAME CONSTRAINT paimon_guard_3 TO mine;                      -- expect ERROR
+ERROR:  paimon_slot: constraint "paimon_guard_3" on public.vg_t is the value guard of column "ts" and must stay while the table is replicated
+HINT:  it keeps values Paimon cannot represent (numeric NaN, a timestamp after 294247-01-10 04:00:54.775807) out of the replication stream, where one would stop replication for good; paimon.remove_table() drops it
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_4,
+  ADD CONSTRAINT paimon_guard_4 CHECK (true);                                   -- expect ERROR
+ERROR:  paimon_slot: constraint "paimon_guard_4" on public.vg_t is the value guard of column "tz" and must stay while the table is replicated
+HINT:  it keeps values Paimon cannot represent (numeric NaN, a timestamp after 294247-01-10 04:00:54.775807) out of the replication stream, where one would stop replication for good; paimon.remove_table() drops it
+-- a column added later gets its guard, NOT VALID: the column is NULL in every existing row
+ALTER TABLE vg_t ADD COLUMN n2 numeric(5,1), ADD COLUMN ts2 timestamptz, ADD COLUMN i2 int;
+SELECT conname, convalidated FROM pg_constraint
+WHERE conrelid = 'vg_t'::regclass AND contype = 'c' ORDER BY conname;
+    conname     | convalidated 
+----------------+--------------
+ paimon_guard_2 | t
+ paimon_guard_3 | t
+ paimon_guard_4 | t
+ paimon_guard_8 | f
+ paimon_guard_9 | f
+(5 rows)
+
+INSERT INTO vg_t (id, n2) VALUES (10, 'NaN');                                   -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_8"
+DETAIL:  Failing row contains (10, null, null, null, null, null, null, NaN, null, null).
+SELECT paimon.peek_messages() - 'relid';
+                                               ?column?                                               
+------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "add_col", "col": {"id": 8, "name": "n2", "type": "DECIMAL(5, 1)"}}
+ {"v": 1, "op": "add_col", "col": {"id": 9, "name": "ts2", "type": "TIMESTAMP WITH LOCAL TIME ZONE"}}
+ {"v": 1, "op": "add_col", "col": {"id": 10, "name": "i2", "type": "INT"}}
+(3 rows)
+
+-- an existing bad value refuses add_table, naming the way to find it
+CREATE TABLE vg_bad (id int PRIMARY KEY, n numeric(5,2));
+INSERT INTO vg_bad VALUES (1, 'NaN');
+SELECT paimon.add_table('vg_bad'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: vg_bad already holds a value Paimon cannot represent
+HINT:  numeric NaN, or a timestamp after 294247-01-10 04:00:54.775807 ('infinity' is fine); find the rows with SELECT * FROM vg_bad WHERE NOT ((n <> 'NaN'::numeric)), correct them, and add the table again
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'vg_bad';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'vg_bad'::regclass AND contype = 'c';
+ count 
+-------
+     0
+(1 row)
+
+-- a same-named constraint that is not the guard refuses add_table rather than pass for one
+CREATE TABLE vg_named (id int PRIMARY KEY, n numeric(5,2) CONSTRAINT paimon_guard_2 CHECK (n > 0));
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ERROR:  paimon_slot: constraint name "paimon_guard_2" on vg_named is reserved for paimon_slot
+HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum>; rename or drop that constraint first
+-- remove_table drops the guards (and only them), after which they are ordinary DDL again
+ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
+SELECT paimon.peek_messages() - 'relid';
+ ?column? 
+----------
+(0 rows)
+
+SELECT paimon.remove_table('vg_t'::regclass);
+ remove_table 
+--------------
+ 
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c';
+  conname  
+-----------
+ users_own
+(1 row)
+
+INSERT INTO vg_t (id, n) VALUES (11, 'NaN');                         -- allowed: not replicated
+DROP TABLE vg_t, vg_bad, vg_named;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     0
+(1 row)
+
+-- (2) numeric typmods Paimon's DECIMAL cannot take (PostgreSQL 15+)
+SELECT paimon.pg_type_to_paimon(1700, (5 << 16 | (-2 & 2047)) + 4, false) AS neg_scale,
+       paimon.pg_type_to_paimon(1700, (3 << 16 | 5) + 4, false)          AS scale_over;
+   neg_scale    |  scale_over   
+----------------+---------------
+ DECIMAL(5, -2) | DECIMAL(3, 5)
+(1 row)
+
+CREATE TABLE ns_neg (id int PRIMARY KEY, a numeric(5,-2));
+CREATE TABLE ns_over (id int PRIMARY KEY, a numeric(3,5));
+CREATE TABLE ns_ok (id int PRIMARY KEY, a numeric(3,3));
+SELECT paimon.add_table('ns_neg'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: column "a" is numeric(5,-2), a negative scale, which Paimon DECIMAL cannot represent
+HINT:  Use numeric(7,0), which holds the same values. See design spec section 5.
+SELECT paimon.add_table('ns_over'::regclass);                                   -- expect ERROR
+ERROR:  paimon_slot: column "a" is numeric(3,5), a scale larger than the precision, which Paimon DECIMAL cannot represent
+HINT:  Use numeric(5,5), which holds the same values. See design spec section 5.
+SELECT paimon.add_table('ns_ok'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE ns_ok ADD COLUMN b numeric(2,-1);                                   -- expect ERROR
+ERROR:  paimon_slot: column "b" is numeric(2,-1), a negative scale, which Paimon DECIMAL cannot represent
+HINT:  Use numeric(3,0), which holds the same values. See design spec section 5.
+SELECT paimon.peek_messages() - 'relid';
+                                                                                                                     ?column?                                                                                                                      
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}, {"id": 2, "name": "a", "type": "DECIMAL(3, 3)"}], "table": "ns_ok", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
+(1 row)
+
+DROP TABLE ns_neg, ns_over, ns_ok;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+-- (3) columns the stream cannot carry: generated columns and reg* types
+CREATE TABLE gc_stored (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2) STORED);
+CREATE TABLE gc_virtual (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2));
+CREATE TABLE gc_ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, a int);
+SELECT paimon.add_table('gc_stored'::regclass);                                 -- expect ERROR
+ERROR:  paimon_slot: column "g" of gc_stored is a generated column, which logical replication does not carry
+HINT:  paimon_pub does not publish generated columns, so Paimon would hold NULL there for every row; drop the expression (ALTER COLUMN ... DROP EXPRESSION) or leave the column out of the replicated table
+SELECT paimon.add_table('gc_virtual'::regclass);                                -- expect ERROR
+ERROR:  paimon_slot: column "g" of gc_virtual is a generated column, which logical replication does not carry
+HINT:  paimon_pub does not publish generated columns, so Paimon would hold NULL there for every row; drop the expression (ALTER COLUMN ... DROP EXPRESSION) or leave the column out of the replicated table
+SELECT paimon.add_table('gc_ident'::regclass);           -- an identity column is an ordinary value
+ add_table 
+-----------
+ 
+(1 row)
+
+CREATE DOMAIN rt_dom AS regtype;
+CREATE TABLE rc_t (id int PRIMARY KEY, r regclass);
+CREATE TABLE rc_arr (id int PRIMARY KEY, r rt_dom[]);
+CREATE TABLE rc_oid (id int PRIMARY KEY, r oid);
+SET client_min_messages = error;
+SELECT paimon.add_table('rc_t'::regclass);                                      -- expect ERROR
+ERROR:  paimon_slot: column "r" of rc_t has type regclass, whose text form is a catalog lookup
+HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
+SELECT paimon.add_table('rc_arr'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: column "r" of rc_arr has type rt_dom[], whose text form is a catalog lookup
+HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
+SELECT paimon.add_table('rc_oid'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE rc_oid ADD COLUMN r2 regrole;                                       -- expect ERROR
+ERROR:  paimon_slot: column "r2" of rc_oid has type regrole, whose text form is a catalog lookup
+HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
+RESET client_min_messages;
+SELECT j->>'op' AS op, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 2;
+   op   |   tbl    
+--------+----------
+ create | gc_ident
+ create | rc_oid
+(2 rows)
+
+DROP TABLE gc_stored, gc_virtual, gc_ident, rc_t, rc_arr, rc_oid;
+DROP DOMAIN rt_dom;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     2
+(1 row)
+
+-- (4) names Paimon or the warehouse cannot take
+CREATE TABLE "id$x" (id int PRIMARY KEY);
+CREATE TABLE "id:x" (id int PRIMARY KEY);
+CREATE TABLE "id/x" (id int PRIMARY KEY);
+CREATE TABLE "." (id int PRIMARY KEY);
+CREATE TABLE ".." (id int PRIMARY KEY);
+CREATE SCHEMA sys;
+CREATE TABLE sys.t (id int PRIMARY KEY);
+CREATE SCHEMA "s:x";
+CREATE TABLE "s:x".t (id int PRIMARY KEY);
+SELECT paimon.add_table('"id$x"'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: table name "id$x" cannot be a Paimon table name
+HINT:  Paimon reads "$" as a system-table suffix, ":" as a URI scheme, and "/", "." and ".." as paths in the warehouse; rename the table before paimon.add_table() (a later RENAME TO does not change the Paimon name)
+SELECT paimon.add_table('"id:x"'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: table name "id:x" cannot be a Paimon table name
+HINT:  Paimon reads "$" as a system-table suffix, ":" as a URI scheme, and "/", "." and ".." as paths in the warehouse; rename the table before paimon.add_table() (a later RENAME TO does not change the Paimon name)
+SELECT paimon.add_table('"id/x"'::regclass);                                    -- expect ERROR
+ERROR:  paimon_slot: table name "id/x" cannot be a Paimon table name
+HINT:  Paimon reads "$" as a system-table suffix, ":" as a URI scheme, and "/", "." and ".." as paths in the warehouse; rename the table before paimon.add_table() (a later RENAME TO does not change the Paimon name)
+SELECT paimon.add_table('"."'::regclass);                                       -- expect ERROR
+ERROR:  paimon_slot: table name "." cannot be a Paimon table name
+HINT:  Paimon reads "$" as a system-table suffix, ":" as a URI scheme, and "/", "." and ".." as paths in the warehouse; rename the table before paimon.add_table() (a later RENAME TO does not change the Paimon name)
+SELECT paimon.add_table('".."'::regclass);                                      -- expect ERROR
+ERROR:  paimon_slot: table name ".." cannot be a Paimon table name
+HINT:  Paimon reads "$" as a system-table suffix, ":" as a URI scheme, and "/", "." and ".." as paths in the warehouse; rename the table before paimon.add_table() (a later RENAME TO does not change the Paimon name)
+SELECT paimon.add_table('sys.t'::regclass);                                     -- expect ERROR
+ERROR:  paimon_slot: schema name "sys" cannot be a Paimon database name
+HINT:  the schema becomes the Paimon database; Paimon reserves "sys" and reads ":" and "/" as parts of a path; move the table to another schema before paimon.add_table()
+SELECT paimon.add_table('"s:x".t'::regclass);                                   -- expect ERROR
+ERROR:  paimon_slot: schema name "s:x" cannot be a Paimon database name
+HINT:  the schema becomes the Paimon database; Paimon reserves "sys" and reads ":" and "/" as parts of a path; move the table to another schema before paimon.add_table()
+-- the neighbours, all measured to work in Paimon: a dot, upper case, non-ASCII, a schema
+-- whose name merely contains "sys"
+CREATE TABLE "a.b" (id int PRIMARY KEY);
+CREATE TABLE "Upper" (id int PRIMARY KEY);
+CREATE TABLE "naïve_表" (id int PRIMARY KEY);
+CREATE SCHEMA "sys2";
+CREATE TABLE sys2.t (id int PRIMARY KEY);
+SELECT paimon.add_table('"a.b"'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.add_table('"Upper"'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.add_table('"naïve_表"'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT paimon.add_table('sys2.t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT j->>'schema' AS sch, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 1, 2;
+  sch   |   tbl    
+--------+----------
+ public | Upper
+ public | a.b
+ public | naïve_表
+ sys2   | t
+(4 rows)
+
+-- column names: Paimon's _KEY_ prefix (case-sensitive), no visible character, the writer's
+-- metadata fields; then the accepted neighbours
+CREATE TABLE cn_t (id int PRIMARY KEY);
+SELECT paimon.add_table('cn_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE cn_t ADD COLUMN "_KEY_a" int;                                       -- expect ERROR
+ERROR:  paimon_slot: column name "_KEY_a" starts with _KEY_, which Paimon reserves
+HINT:  choose a different column name
+ALTER TABLE cn_t ADD COLUMN " " int;                                            -- expect ERROR
+ERROR:  paimon_slot: column name " " has no visible character, which Paimon refuses
+HINT:  choose a different column name
+ALTER TABLE cn_t ADD COLUMN _seq int;                                           -- expect ERROR
+ERROR:  paimon_slot: column name "_seq" is a metadata field the writer adds to every Paimon table
+HINT:  choose a different column name (the writer's fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)
+ALTER TABLE cn_t ADD COLUMN _op_seq int;                                        -- expect ERROR
+ERROR:  paimon_slot: column name "_op_seq" is a metadata field the writer adds to every Paimon table
+HINT:  choose a different column name (the writer's fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)
+ALTER TABLE cn_t ADD COLUMN _xid int;                                           -- expect ERROR
+ERROR:  paimon_slot: column name "_xid" is a metadata field the writer adds to every Paimon table
+HINT:  choose a different column name (the writer's fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)
+ALTER TABLE cn_t ADD COLUMN a int;
+ALTER TABLE cn_t RENAME COLUMN a TO _seq;                                       -- expect ERROR
+ERROR:  paimon_slot: column name "_seq" is a metadata field the writer adds to every Paimon table
+HINT:  choose a different column name (the writer's fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)
+ALTER TABLE cn_t ADD COLUMN "_key_a" int, ADD COLUMN "_SEQ" int, ADD COLUMN " x" int;
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid = 'cn_t'::regclass;
+       jsonb_path_query_array        
+-------------------------------------
+ ["id", "a", "_key_a", "_SEQ", " x"]
+(1 row)
+
+DROP TABLE "id$x", "id:x", "id/x", ".", "..", sys.t, "s:x".t, "a.b", "Upper", "naïve_表",
+           sys2.t, cn_t;
+DROP SCHEMA sys, "s:x", sys2;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+    10
+(1 row)
+
+-- (5) ALTER COLUMN ... TYPE: only exact widenings
+SET client_min_messages = error;     -- json's unmapped-type WARNING repeats on every ALTER
+CREATE TABLE tc_t (id int PRIMARY KEY, i2 smallint, i4 int, i8 bigint, f4 real, f8 float8,
+                   n numeric(10,2), t text, v varchar(5), c char(5), ts timestamp(3),
+                   tz timestamptz, j json, k int);
+SELECT paimon.add_table('tc_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE smallint;                                 -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.i4 from integer to smallint: it narrows an integer
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN i8 TYPE int;                                      -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.i8 from bigint to integer: it narrows an integer
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE numeric(9,0);                             -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.i4 from integer to numeric(9,0): the numeric has too few integer digits for every value of the integer type
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN f8 TYPE real;                                     -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.f8 from double precision to real: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN f4 TYPE numeric(10,2);                            -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.f4 from real to numeric(10,2): Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(9,2);                              -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.n from numeric(10,2) to numeric(9,2): it removes integer digits or decimal places
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(10,1);                             -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.n from numeric(10,2) to numeric(10,1): it removes integer digits or decimal places
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(10,4);                             -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.n from numeric(10,2) to numeric(10,4): it removes integer digits or decimal places
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN n TYPE float8;                                    -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.n from numeric(10,2) to double precision: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN n TYPE text;  -- expect ERROR (PostgreSQL: the guard does not fit text)
+ERROR:  operator does not exist: text <> numeric
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ALTER TABLE tc_t ALTER COLUMN t TYPE char(10);                                  -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.t from text to character(10): Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN c TYPE char(10);                                  -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.c from character(5) to character(10): Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN c TYPE text;                                      -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.c from character(5) to text: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(0);                             -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.ts from timestamp(3) without time zone to timestamp(0) without time zone: it rounds the fractional seconds
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamptz;                              -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.ts from timestamp(3) without time zone to timestamp with time zone: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN tz TYPE timestamp;                                -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.tz from timestamp with time zone to timestamp without time zone: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN j TYPE jsonb;                                     -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.tc_t.j from json to jsonb: Paimon could not apply it to the rows it already holds without changing them
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN t TYPE int USING t::int;                          -- expect ERROR
+ERROR:  paimon_slot: ALTER COLUMN ... TYPE ... USING is not supported on replicated table public.tc_t
+HINT:  PostgreSQL rewrites the rows without sending them, so values a USING expression changes would never reach Paimon. Change the type without USING (only exact widenings are allowed), or ADD COLUMN, UPDATE it with the expression, DROP the old column and RENAME the new one -- each step replicates.
+-- USING is refused even when the type does not change: the values do
+ALTER TABLE tc_t ALTER COLUMN k TYPE int USING k + 1;                           -- expect ERROR
+ERROR:  paimon_slot: ALTER COLUMN ... TYPE ... USING is not supported on replicated table public.tc_t
+HINT:  PostgreSQL rewrites the rows without sending them, so values a USING expression changes would never reach Paimon. Change the type without USING (only exact widenings are allowed), or ADD COLUMN, UPDATE it with the expression, DROP the old column and RENAME the new one -- each step replicates.
+ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k;                            -- expect ERROR
+ERROR:  paimon_slot: ALTER COLUMN ... TYPE ... USING is not supported on replicated table public.tc_t
+HINT:  PostgreSQL rewrites the rows without sending them, so values a USING expression changes would never reach Paimon. Change the type without USING (only exact widenings are allowed), or ADD COLUMN, UPDATE it with the expression, DROP the old column and RENAME the new one -- each step replicates.
+DO $$ BEGIN EXECUTE 'ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k * 2'; END $$; -- expect ERROR
+ERROR:  paimon_slot: ALTER COLUMN ... TYPE ... USING is not supported on replicated table public.tc_t
+HINT:  PostgreSQL rewrites the rows without sending them, so values a USING expression changes would never reach Paimon. Change the type without USING (only exact widenings are allowed), or ADD COLUMN, UPDATE it with the expression, DROP the old column and RENAME the new one -- each step replicates.
+SELECT count(*) FROM paimon.peek_messages();                         -- nothing was emitted
+ count 
+-------
+     0
+(1 row)
+
+-- the widenings
+ALTER TABLE tc_t ALTER COLUMN i2 TYPE int;
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE bigint;
+ALTER TABLE tc_t ALTER COLUMN i8 TYPE numeric(19,0);
+ALTER TABLE tc_t ALTER COLUMN k TYPE text;
+ALTER TABLE tc_t ALTER COLUMN f4 TYPE float8;
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(14,4);
+ALTER TABLE tc_t ALTER COLUMN v TYPE varchar(10);
+ALTER TABLE tc_t ALTER COLUMN v TYPE text;
+ALTER TABLE tc_t ALTER COLUMN t TYPE varchar(20);
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(6);
+SELECT paimon.peek_messages() - 'relid';
+                                   ?column?                                   
+------------------------------------------------------------------------------
+ {"v": 1, "id": 2, "op": "alter_col", "name": "i2", "type": "INT"}
+ {"v": 1, "id": 3, "op": "alter_col", "name": "i4", "type": "BIGINT"}
+ {"v": 1, "id": 4, "op": "alter_col", "name": "i8", "type": "DECIMAL(19, 0)"}
+ {"v": 1, "id": 14, "op": "alter_col", "name": "k", "type": "STRING"}
+ {"v": 1, "id": 5, "op": "alter_col", "name": "f4", "type": "DOUBLE"}
+ {"v": 1, "id": 7, "op": "alter_col", "name": "n", "type": "DECIMAL(14, 4)"}
+(6 rows)
+
+-- the retyped numeric kept its guard; i8, now numeric, gained one
+SELECT conname, pg_get_expr(conbin, conrelid) FROM pg_constraint
+WHERE conrelid = 'tc_t'::regclass AND contype = 'c' ORDER BY conname;
+     conname     |                                                         pg_get_expr                                                          
+-----------------+------------------------------------------------------------------------------------------------------------------------------
+ paimon_guard_11 | ((ts <= 'Sun Jan 10 04:00:54.775807 294247'::timestamp without time zone) OR (ts = 'infinity'::timestamp without time zone))
+ paimon_guard_12 | ((tz <= 'Sat Jan 09 20:00:54.775807 294247 PST'::timestamp with time zone) OR (tz = 'infinity'::timestamp with time zone))
+ paimon_guard_4  | (i8 <> 'NaN'::numeric)
+ paimon_guard_7  | (n <> 'NaN'::numeric)
+(4 rows)
+
+DROP TABLE tc_t;
+RESET client_min_messages;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+-- (6) inheritance and partitions
+CREATE TABLE ih_par (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('ih_par'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+CREATE TABLE ih_child () INHERITS (ih_par);                                     -- expect ERROR
+ERROR:  paimon_slot: ih_par has inheritance child ih_child and cannot be replicated
+HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
+CREATE TABLE ih_other (id int PRIMARY KEY, v text);
+ALTER TABLE ih_other INHERIT ih_par;                                            -- expect ERROR
+ERROR:  paimon_slot: ih_par has inheritance child ih_other and cannot be replicated
+HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
+CREATE TABLE ih_p2 (id int PRIMARY KEY, v text);
+CREATE TABLE ih_c2 () INHERITS (ih_p2);
+SELECT paimon.add_table('ih_p2'::regclass);                                     -- expect ERROR
+ERROR:  paimon_slot: ih_p2 has inheritance child ih_c2 and cannot be replicated
+HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
+-- a replicated CHILD is fine, and its parent's ALTER now reaches its registry
+CREATE TABLE ih_rc (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('ih_rc'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE ih_rc INHERIT ih_p2;
+ALTER TABLE ih_p2 ADD COLUMN z int;
+ALTER TABLE ih_p2 ADD COLUMN zz int DEFAULT 1;                                  -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.ih_rc.zz)
+HINT:  add the column without a default, then UPDATE it
+CREATE TABLE pt_par (id int, k int, PRIMARY KEY (id, k)) PARTITION BY LIST (k);
+CREATE TABLE pt_1 PARTITION OF pt_par FOR VALUES IN (1);
+SELECT paimon.add_table('pt_1'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER TABLE pt_par ADD COLUMN extra numeric(10,2);
+ALTER TABLE pt_par ALTER COLUMN extra TYPE numeric(8,2);                        -- expect ERROR
+ERROR:  paimon_slot: cannot change the type of replicated column public.pt_1.extra from numeric(10,2) to numeric(8,2): it removes integer digits or decimal places
+HINT:  PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.
+SELECT j->>'op' AS op, j->>'table' AS tbl, j->'col'->>'name' AS col
+FROM (SELECT paimon.peek_messages() AS j) s;
+   op    |  tbl   |  col  
+---------+--------+-------
+ create  | ih_par | 
+ create  | ih_rc  | 
+ add_col |        | z
+ create  | pt_1   | 
+ add_col |        | extra
+(5 rows)
+
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid IN ('ih_rc'::regclass, 'pt_1'::regclass) ORDER BY table_name;
+ jsonb_path_query_array 
+------------------------
+ ["id", "v", "z"]
+ ["id", "k", "extra"]
+(2 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'pt_1'::regclass AND contype = 'c';
+    conname     
+----------------
+ paimon_guard_3
+(1 row)
+
+DROP TABLE ih_par, ih_other, ih_c2, ih_rc, ih_p2, pt_par;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     3
+(1 row)
+
+-- (7) types whose every value changes text without a row change
+CREATE TYPE ty_comp AS (a int);
+CREATE TYPE ty_free AS (a int);
+CREATE TYPE ty_mood AS ENUM ('a', 'b');
+CREATE TYPE ty_mood2 AS ENUM ('a', 'b');
+CREATE TYPE ty_unused AS ENUM ('a');
+SET client_min_messages = error;
+CREATE TABLE ty_t (id int PRIMARY KEY, c ty_comp, m ty_mood[]);
+SELECT paimon.add_table('ty_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+RESET client_min_messages;
+ALTER TYPE ty_comp ADD ATTRIBUTE b int;                                         -- expect ERROR
+ERROR:  paimon_slot: composite type ty_comp is used by replicated column ty_t.c
+HINT:  changing its attributes changes the text of every value already replicated, without any row change reaching Paimon; create a new type and migrate the column (ADD COLUMN, UPDATE, DROP COLUMN, RENAME COLUMN)
+ALTER TYPE ty_mood RENAME VALUE 'a' TO 'A';              -- expect ERROR (used inside an array)
+ERROR:  paimon_slot: cannot rename a value of enum type ty_mood while replicated column ty_t.m uses it
+HINT:  rows already replicated keep the old label in Paimon, because a rename changes no row; add the new value (ALTER TYPE ... ADD VALUE), UPDATE the rows to it, then stop using the old one
+ALTER TYPE ty_mood ADD VALUE 'c';
+ALTER TYPE ty_mood RENAME TO ty_mood_renamed;           -- a type rename changes no value text
+ALTER TYPE ty_free ADD ATTRIBUTE b int;
+ALTER TYPE ty_unused RENAME VALUE 'a' TO 'A';
+ALTER TYPE ty_mood2 RENAME VALUE 'a' TO 'A';
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+DROP TABLE ty_t;
+DROP TYPE ty_comp, ty_free, ty_mood_renamed, ty_mood2, ty_unused;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
+(1 row)
+
+-- (8) the publication cannot be changed in a way that silently stops changes
+CREATE TABLE pub_t (id int PRIMARY KEY, a int, b text);
+SELECT paimon.add_table('pub_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+ALTER PUBLICATION paimon_pub DROP TABLE pub_t;                                  -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t is not in publication paimon_pub
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+ALTER PUBLICATION paimon_pub SET (publish = 'insert');                          -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub does not publish every action (publish must be 'insert, update, delete, truncate')
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+ALTER PUBLICATION paimon_pub SET (publish = 'insert, update, delete');          -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub does not publish every action (publish must be 'insert, update, delete, truncate')
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+ALTER PUBLICATION paimon_pub SET (publish_via_partition_root = true);           -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub has publish_via_partition_root = true
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+-- SET TABLE restating every replicated table, with pub_t given a column list, a row filter,
+-- or neither (the last is a no-op restatement, and allowed)
+CREATE FUNCTION pg_temp.restate(pub_t_spec text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE 'ALTER PUBLICATION paimon_pub SET TABLE '
+        || (SELECT string_agg(CASE WHEN relid = 'pub_t'::regclass THEN pub_t_spec
+                                   ELSE 'ONLY ' || relid::regclass::text END, ', ')
+              FROM paimon.table_registry);
+END $$;
+SELECT pg_temp.restate('ONLY pub_t (id, a)');                                   -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t has a column list in publication paimon_pub
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+SELECT pg_temp.restate('ONLY pub_t WHERE (a > 0)');                             -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t has a row filter in publication paimon_pub
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+SELECT pg_temp.restate('ONLY pub_t');
+ restate 
+---------
+ 
+(1 row)
+
+ALTER PUBLICATION paimon_pub RENAME TO renamed_pub;                             -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub does not exist (dropped or renamed)
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+DROP PUBLICATION paimon_pub;                                                    -- expect ERROR
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub does not exist (dropped or renamed)
+HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
+-- the neighbours: an untracked table may come and go, the owner may change
+CREATE TABLE pub_plain (id int PRIMARY KEY);
+ALTER PUBLICATION paimon_pub ADD TABLE pub_plain;
+ALTER PUBLICATION paimon_pub DROP TABLE pub_plain;
+ALTER PUBLICATION paimon_pub OWNER TO CURRENT_USER;
+SELECT * FROM paimon.publication_problems();
+ publication_problems 
+----------------------
+(0 rows)
+
+-- remove_table and DROP TABLE still leave the publication, legitimately
+SELECT paimon.remove_table('pub_t'::regclass);
+ remove_table 
+--------------
+ 
+(1 row)
+
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub' AND tablename = 'pub_t';
+ count 
+-------
+     0
+(1 row)
+
+SELECT paimon.add_table('pub_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+DROP TABLE pub_t, pub_plain;
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub';
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
+ drained 
+---------
+ t
+(1 row)
+
+-- (9) session_replication_role = replica no longer silences the guardrails
+CREATE TABLE srr_t (id int PRIMARY KEY);
+SELECT paimon.add_table('srr_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT evtname, evtenabled FROM pg_event_trigger WHERE evtname LIKE 'paimon%' ORDER BY 1;
+       evtname        | evtenabled 
+----------------------+------------
+ paimon_ddl_end       | A
+ paimon_sql_drop      | A
+ paimon_table_rewrite | A
+(3 rows)
+
+SET session_replication_role = replica;
+ALTER TABLE srr_t ADD COLUMN d int DEFAULT 5;                                   -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.srr_t.d)
+HINT:  add the column without a default, then UPDATE it
+ALTER TABLE srr_t REPLICA IDENTITY DEFAULT;                                     -- expect ERROR
+ERROR:  paimon_slot: replica identity of a replicated table must stay FULL
+HINT:  the writer needs the complete old row; see design spec section 5
+ALTER TABLE srr_t ADD COLUMN e int;
+RESET session_replication_role;
+SELECT paimon.peek_messages() - 'relid';
+                                                                                             ?column?                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"v": 1, "op": "create", "pk": ["id"], "cols": [{"id": 1, "name": "id", "type": "INT NOT NULL"}], "table": "srr_t", "schema": "public", "options": {"bucket": 4, "changelog-producer": "input"}}
+ {"v": 1, "op": "add_col", "col": {"id": 2, "name": "e", "type": "INT"}}
+(2 rows)
+
+-- (10) paimon.health(): what the guardrails keep true, checked from the catalog
+SELECT * FROM paimon.health();
+ health 
+--------
+(0 rows)
+
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE;   -- back to ORIGIN: silent under replica role
+ALTER EVENT TRIGGER paimon_sql_drop DISABLE;
+SELECT * FROM paimon.health();
+                                                                                        health                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ event trigger paimon_ddl_end is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS)
+ event trigger paimon_sql_drop is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS)
+(2 rows)
+
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE srr_t ADD COLUMN unseen int;     -- bypasses the trigger: the registry goes stale
+ALTER TABLE srr_t REPLICA IDENTITY DEFAULT;
+SELECT * FROM paimon.health();
+                                                                                        health                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ event trigger paimon_ddl_end is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS)
+ event trigger paimon_sql_drop is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS)
+ replicated table srr_t does not have REPLICA IDENTITY FULL
+ replicated table srr_t has changed without its DDL being replicated: paimon.table_registry.cols no longer matches the table
+(4 rows)
+
+ALTER TABLE srr_t REPLICA IDENTITY FULL;
+ALTER TABLE srr_t DROP COLUMN unseen;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS;
+SELECT * FROM paimon.health();
+ health 
+--------
+(0 rows)
+
+DROP TABLE srr_t;
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
+ drained 
+---------
+ t
+(1 row)
+
+-- (11) DDL messages carry the installation's credential; nobody else can emit one
+CREATE TABLE au_t (id int PRIMARY KEY);
+SELECT paimon.add_table('au_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SELECT position(format('"auth": "%s"', (SELECT token FROM paimon.secret)) IN data) > 0 AS has_auth
+FROM pg_logical_slot_get_changes('paimon_test', NULL, NULL)
+WHERE data LIKE 'message:%';
+ has_auth 
+----------
+ t
+(1 row)
+
+SELECT length(token) >= 64 AS long_token FROM paimon.secret;
+ long_token 
+------------
+ t
+(1 row)
+
+CREATE ROLE paimon_nobody;
+SELECT has_table_privilege('paimon_nobody', 'paimon.secret', 'SELECT') AS can_read_secret,
+       has_function_privilege('paimon_nobody', 'paimon.emit(jsonb)', 'EXECUTE') AS can_emit;
+ can_read_secret | can_emit 
+-----------------+----------
+ f               | f
+(1 row)
+
+DROP ROLE paimon_nobody;
+DROP TABLE au_t;
+SELECT count(*) FROM paimon.peek_messages();
+ count 
+-------
+     1
 (1 row)
 
 SELECT pg_drop_replication_slot('paimon_test');

@@ -405,3 +405,331 @@ SELECT count(*) FROM paimon.peek_messages();
 DROP TABLE bk_empty, bk_over, bk_bad;
 SELECT count(*) FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- =====================================================================================
+-- Poison records and silent data loss: every guardrail below refuses, before PostgreSQL
+-- commits, a change the writer could never apply or would silently lose. Each refusal is
+-- paired with the accepted neighbour it must not catch.
+-- =====================================================================================
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+\set VERBOSITY default
+
+-- (1) value guards: numeric NaN, and timestamps beyond Paimon's largest writable instant
+CREATE TABLE vg_t (id int PRIMARY KEY, n numeric(10,2), ts timestamp, tz timestamptz,
+                   d date, t text);
+SELECT paimon.add_table('vg_t'::regclass);
+SELECT paimon.peek_messages() - 'relid';
+SELECT conname, pg_get_expr(conbin, conrelid), convalidated FROM pg_constraint
+WHERE conrelid = 'vg_t'::regclass AND contype = 'c' ORDER BY conname;
+INSERT INTO vg_t (id, n) VALUES (1, 'NaN');                                     -- expect ERROR
+INSERT INTO vg_t (id, n) VALUES (1, 'Infinity');            -- expect ERROR (PostgreSQL itself)
+INSERT INTO vg_t (id, ts) VALUES (2, '294247-01-10 04:00:54.775808');           -- expect ERROR
+INSERT INTO vg_t (id, tz) VALUES (3, '294247-01-10 04:00:54.775808+00');        -- expect ERROR
+INSERT INTO vg_t (id, ts) VALUES (4, '294276-12-31 23:59:59.999999');           -- expect ERROR
+-- the neighbours: the largest writable instant, infinity (encoded by the writer), dates at
+-- PostgreSQL's own extremes (Paimon holds its whole date range), ordinary values
+INSERT INTO vg_t VALUES (5, 99999999.99, '294247-01-10 04:00:54.775807',
+                         '294247-01-10 04:00:54.775807+00', '5874897-12-31', 'x');
+INSERT INTO vg_t VALUES (6, -1.5, 'infinity', '-infinity', '4714-11-24 BC', NULL);
+INSERT INTO vg_t VALUES (7, NULL, '4714-11-24 00:00:00 BC', NULL, NULL, NULL);
+SET TimeZone = 'America/New_York';
+INSERT INTO vg_t (id, tz) VALUES (8, '294247-01-09 23:00:54.775807');   -- = the maximum in UTC
+INSERT INTO vg_t (id, tz) VALUES (9, '294247-01-09 23:00:54.775808');           -- expect ERROR
+RESET TimeZone;
+SELECT id FROM vg_t ORDER BY id;
+-- the guard is recognised under any DateStyle and TimeZone (its constants deparse through them)
+SET DateStyle = 'SQL, DMY';
+SET TimeZone = 'Asia/Kathmandu';
+ALTER TABLE vg_t ADD COLUMN after_style int;
+RESET DateStyle;
+RESET TimeZone;
+SELECT paimon.peek_messages() - 'relid';
+-- a guard cannot be dropped, renamed, or replaced by a same-named constraint
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2;                                -- expect ERROR
+ALTER TABLE vg_t RENAME CONSTRAINT paimon_guard_3 TO mine;                      -- expect ERROR
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_4,
+  ADD CONSTRAINT paimon_guard_4 CHECK (true);                                   -- expect ERROR
+-- a column added later gets its guard, NOT VALID: the column is NULL in every existing row
+ALTER TABLE vg_t ADD COLUMN n2 numeric(5,1), ADD COLUMN ts2 timestamptz, ADD COLUMN i2 int;
+SELECT conname, convalidated FROM pg_constraint
+WHERE conrelid = 'vg_t'::regclass AND contype = 'c' ORDER BY conname;
+INSERT INTO vg_t (id, n2) VALUES (10, 'NaN');                                   -- expect ERROR
+SELECT paimon.peek_messages() - 'relid';
+-- an existing bad value refuses add_table, naming the way to find it
+CREATE TABLE vg_bad (id int PRIMARY KEY, n numeric(5,2));
+INSERT INTO vg_bad VALUES (1, 'NaN');
+SELECT paimon.add_table('vg_bad'::regclass);                                    -- expect ERROR
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'vg_bad';
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'vg_bad'::regclass AND contype = 'c';
+-- a same-named constraint that is not the guard refuses add_table rather than pass for one
+CREATE TABLE vg_named (id int PRIMARY KEY, n numeric(5,2) CONSTRAINT paimon_guard_2 CHECK (n > 0));
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+-- remove_table drops the guards (and only them), after which they are ordinary DDL again
+ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
+SELECT paimon.peek_messages() - 'relid';
+SELECT paimon.remove_table('vg_t'::regclass);
+SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c';
+INSERT INTO vg_t (id, n) VALUES (11, 'NaN');                         -- allowed: not replicated
+DROP TABLE vg_t, vg_bad, vg_named;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (2) numeric typmods Paimon's DECIMAL cannot take (PostgreSQL 15+)
+SELECT paimon.pg_type_to_paimon(1700, (5 << 16 | (-2 & 2047)) + 4, false) AS neg_scale,
+       paimon.pg_type_to_paimon(1700, (3 << 16 | 5) + 4, false)          AS scale_over;
+CREATE TABLE ns_neg (id int PRIMARY KEY, a numeric(5,-2));
+CREATE TABLE ns_over (id int PRIMARY KEY, a numeric(3,5));
+CREATE TABLE ns_ok (id int PRIMARY KEY, a numeric(3,3));
+SELECT paimon.add_table('ns_neg'::regclass);                                    -- expect ERROR
+SELECT paimon.add_table('ns_over'::regclass);                                   -- expect ERROR
+SELECT paimon.add_table('ns_ok'::regclass);
+ALTER TABLE ns_ok ADD COLUMN b numeric(2,-1);                                   -- expect ERROR
+SELECT paimon.peek_messages() - 'relid';
+DROP TABLE ns_neg, ns_over, ns_ok;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (3) columns the stream cannot carry: generated columns and reg* types
+CREATE TABLE gc_stored (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2) STORED);
+CREATE TABLE gc_virtual (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2));
+CREATE TABLE gc_ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, a int);
+SELECT paimon.add_table('gc_stored'::regclass);                                 -- expect ERROR
+SELECT paimon.add_table('gc_virtual'::regclass);                                -- expect ERROR
+SELECT paimon.add_table('gc_ident'::regclass);           -- an identity column is an ordinary value
+CREATE DOMAIN rt_dom AS regtype;
+CREATE TABLE rc_t (id int PRIMARY KEY, r regclass);
+CREATE TABLE rc_arr (id int PRIMARY KEY, r rt_dom[]);
+CREATE TABLE rc_oid (id int PRIMARY KEY, r oid);
+SET client_min_messages = error;
+SELECT paimon.add_table('rc_t'::regclass);                                      -- expect ERROR
+SELECT paimon.add_table('rc_arr'::regclass);                                    -- expect ERROR
+SELECT paimon.add_table('rc_oid'::regclass);
+ALTER TABLE rc_oid ADD COLUMN r2 regrole;                                       -- expect ERROR
+RESET client_min_messages;
+SELECT j->>'op' AS op, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 2;
+DROP TABLE gc_stored, gc_virtual, gc_ident, rc_t, rc_arr, rc_oid;
+DROP DOMAIN rt_dom;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (4) names Paimon or the warehouse cannot take
+CREATE TABLE "id$x" (id int PRIMARY KEY);
+CREATE TABLE "id:x" (id int PRIMARY KEY);
+CREATE TABLE "id/x" (id int PRIMARY KEY);
+CREATE TABLE "." (id int PRIMARY KEY);
+CREATE TABLE ".." (id int PRIMARY KEY);
+CREATE SCHEMA sys;
+CREATE TABLE sys.t (id int PRIMARY KEY);
+CREATE SCHEMA "s:x";
+CREATE TABLE "s:x".t (id int PRIMARY KEY);
+SELECT paimon.add_table('"id$x"'::regclass);                                    -- expect ERROR
+SELECT paimon.add_table('"id:x"'::regclass);                                    -- expect ERROR
+SELECT paimon.add_table('"id/x"'::regclass);                                    -- expect ERROR
+SELECT paimon.add_table('"."'::regclass);                                       -- expect ERROR
+SELECT paimon.add_table('".."'::regclass);                                      -- expect ERROR
+SELECT paimon.add_table('sys.t'::regclass);                                     -- expect ERROR
+SELECT paimon.add_table('"s:x".t'::regclass);                                   -- expect ERROR
+-- the neighbours, all measured to work in Paimon: a dot, upper case, non-ASCII, a schema
+-- whose name merely contains "sys"
+CREATE TABLE "a.b" (id int PRIMARY KEY);
+CREATE TABLE "Upper" (id int PRIMARY KEY);
+CREATE TABLE "naïve_表" (id int PRIMARY KEY);
+CREATE SCHEMA "sys2";
+CREATE TABLE sys2.t (id int PRIMARY KEY);
+SELECT paimon.add_table('"a.b"'::regclass);
+SELECT paimon.add_table('"Upper"'::regclass);
+SELECT paimon.add_table('"naïve_表"'::regclass);
+SELECT paimon.add_table('sys2.t'::regclass);
+SELECT j->>'schema' AS sch, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 1, 2;
+-- column names: Paimon's _KEY_ prefix (case-sensitive), no visible character, the writer's
+-- metadata fields; then the accepted neighbours
+CREATE TABLE cn_t (id int PRIMARY KEY);
+SELECT paimon.add_table('cn_t'::regclass);
+ALTER TABLE cn_t ADD COLUMN "_KEY_a" int;                                       -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN " " int;                                            -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN _seq int;                                           -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN _op_seq int;                                        -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN _xid int;                                           -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN a int;
+ALTER TABLE cn_t RENAME COLUMN a TO _seq;                                       -- expect ERROR
+ALTER TABLE cn_t ADD COLUMN "_key_a" int, ADD COLUMN "_SEQ" int, ADD COLUMN " x" int;
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid = 'cn_t'::regclass;
+DROP TABLE "id$x", "id:x", "id/x", ".", "..", sys.t, "s:x".t, "a.b", "Upper", "naïve_表",
+           sys2.t, cn_t;
+DROP SCHEMA sys, "s:x", sys2;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (5) ALTER COLUMN ... TYPE: only exact widenings
+SET client_min_messages = error;     -- json's unmapped-type WARNING repeats on every ALTER
+CREATE TABLE tc_t (id int PRIMARY KEY, i2 smallint, i4 int, i8 bigint, f4 real, f8 float8,
+                   n numeric(10,2), t text, v varchar(5), c char(5), ts timestamp(3),
+                   tz timestamptz, j json, k int);
+SELECT paimon.add_table('tc_t'::regclass);
+SELECT count(*) FROM paimon.peek_messages();
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE smallint;                                 -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN i8 TYPE int;                                      -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE numeric(9,0);                             -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN f8 TYPE real;                                     -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN f4 TYPE numeric(10,2);                            -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(9,2);                              -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(10,1);                             -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(10,4);                             -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN n TYPE float8;                                    -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN n TYPE text;  -- expect ERROR (PostgreSQL: the guard does not fit text)
+ALTER TABLE tc_t ALTER COLUMN t TYPE char(10);                                  -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN c TYPE char(10);                                  -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN c TYPE text;                                      -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(0);                             -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamptz;                              -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN tz TYPE timestamp;                                -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN j TYPE jsonb;                                     -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN t TYPE int USING t::int;                          -- expect ERROR
+-- USING is refused even when the type does not change: the values do
+ALTER TABLE tc_t ALTER COLUMN k TYPE int USING k + 1;                           -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k;                            -- expect ERROR
+DO $$ BEGIN EXECUTE 'ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k * 2'; END $$; -- expect ERROR
+SELECT count(*) FROM paimon.peek_messages();                         -- nothing was emitted
+-- the widenings
+ALTER TABLE tc_t ALTER COLUMN i2 TYPE int;
+ALTER TABLE tc_t ALTER COLUMN i4 TYPE bigint;
+ALTER TABLE tc_t ALTER COLUMN i8 TYPE numeric(19,0);
+ALTER TABLE tc_t ALTER COLUMN k TYPE text;
+ALTER TABLE tc_t ALTER COLUMN f4 TYPE float8;
+ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(14,4);
+ALTER TABLE tc_t ALTER COLUMN v TYPE varchar(10);
+ALTER TABLE tc_t ALTER COLUMN v TYPE text;
+ALTER TABLE tc_t ALTER COLUMN t TYPE varchar(20);
+ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(6);
+SELECT paimon.peek_messages() - 'relid';
+-- the retyped numeric kept its guard; i8, now numeric, gained one
+SELECT conname, pg_get_expr(conbin, conrelid) FROM pg_constraint
+WHERE conrelid = 'tc_t'::regclass AND contype = 'c' ORDER BY conname;
+DROP TABLE tc_t;
+RESET client_min_messages;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (6) inheritance and partitions
+CREATE TABLE ih_par (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('ih_par'::regclass);
+CREATE TABLE ih_child () INHERITS (ih_par);                                     -- expect ERROR
+CREATE TABLE ih_other (id int PRIMARY KEY, v text);
+ALTER TABLE ih_other INHERIT ih_par;                                            -- expect ERROR
+CREATE TABLE ih_p2 (id int PRIMARY KEY, v text);
+CREATE TABLE ih_c2 () INHERITS (ih_p2);
+SELECT paimon.add_table('ih_p2'::regclass);                                     -- expect ERROR
+-- a replicated CHILD is fine, and its parent's ALTER now reaches its registry
+CREATE TABLE ih_rc (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('ih_rc'::regclass);
+ALTER TABLE ih_rc INHERIT ih_p2;
+ALTER TABLE ih_p2 ADD COLUMN z int;
+ALTER TABLE ih_p2 ADD COLUMN zz int DEFAULT 1;                                  -- expect ERROR
+CREATE TABLE pt_par (id int, k int, PRIMARY KEY (id, k)) PARTITION BY LIST (k);
+CREATE TABLE pt_1 PARTITION OF pt_par FOR VALUES IN (1);
+SELECT paimon.add_table('pt_1'::regclass);
+ALTER TABLE pt_par ADD COLUMN extra numeric(10,2);
+ALTER TABLE pt_par ALTER COLUMN extra TYPE numeric(8,2);                        -- expect ERROR
+SELECT j->>'op' AS op, j->>'table' AS tbl, j->'col'->>'name' AS col
+FROM (SELECT paimon.peek_messages() AS j) s;
+SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
+WHERE relid IN ('ih_rc'::regclass, 'pt_1'::regclass) ORDER BY table_name;
+SELECT conname FROM pg_constraint WHERE conrelid = 'pt_1'::regclass AND contype = 'c';
+DROP TABLE ih_par, ih_other, ih_c2, ih_rc, ih_p2, pt_par;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (7) types whose every value changes text without a row change
+CREATE TYPE ty_comp AS (a int);
+CREATE TYPE ty_free AS (a int);
+CREATE TYPE ty_mood AS ENUM ('a', 'b');
+CREATE TYPE ty_mood2 AS ENUM ('a', 'b');
+CREATE TYPE ty_unused AS ENUM ('a');
+SET client_min_messages = error;
+CREATE TABLE ty_t (id int PRIMARY KEY, c ty_comp, m ty_mood[]);
+SELECT paimon.add_table('ty_t'::regclass);
+RESET client_min_messages;
+ALTER TYPE ty_comp ADD ATTRIBUTE b int;                                         -- expect ERROR
+ALTER TYPE ty_mood RENAME VALUE 'a' TO 'A';              -- expect ERROR (used inside an array)
+ALTER TYPE ty_mood ADD VALUE 'c';
+ALTER TYPE ty_mood RENAME TO ty_mood_renamed;           -- a type rename changes no value text
+ALTER TYPE ty_free ADD ATTRIBUTE b int;
+ALTER TYPE ty_unused RENAME VALUE 'a' TO 'A';
+ALTER TYPE ty_mood2 RENAME VALUE 'a' TO 'A';
+SELECT count(*) FROM paimon.peek_messages();
+DROP TABLE ty_t;
+DROP TYPE ty_comp, ty_free, ty_mood_renamed, ty_mood2, ty_unused;
+SELECT count(*) FROM paimon.peek_messages();
+
+-- (8) the publication cannot be changed in a way that silently stops changes
+CREATE TABLE pub_t (id int PRIMARY KEY, a int, b text);
+SELECT paimon.add_table('pub_t'::regclass);
+ALTER PUBLICATION paimon_pub DROP TABLE pub_t;                                  -- expect ERROR
+ALTER PUBLICATION paimon_pub SET (publish = 'insert');                          -- expect ERROR
+ALTER PUBLICATION paimon_pub SET (publish = 'insert, update, delete');          -- expect ERROR
+ALTER PUBLICATION paimon_pub SET (publish_via_partition_root = true);           -- expect ERROR
+-- SET TABLE restating every replicated table, with pub_t given a column list, a row filter,
+-- or neither (the last is a no-op restatement, and allowed)
+CREATE FUNCTION pg_temp.restate(pub_t_spec text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE 'ALTER PUBLICATION paimon_pub SET TABLE '
+        || (SELECT string_agg(CASE WHEN relid = 'pub_t'::regclass THEN pub_t_spec
+                                   ELSE 'ONLY ' || relid::regclass::text END, ', ')
+              FROM paimon.table_registry);
+END $$;
+SELECT pg_temp.restate('ONLY pub_t (id, a)');                                   -- expect ERROR
+SELECT pg_temp.restate('ONLY pub_t WHERE (a > 0)');                             -- expect ERROR
+SELECT pg_temp.restate('ONLY pub_t');
+ALTER PUBLICATION paimon_pub RENAME TO renamed_pub;                             -- expect ERROR
+DROP PUBLICATION paimon_pub;                                                    -- expect ERROR
+-- the neighbours: an untracked table may come and go, the owner may change
+CREATE TABLE pub_plain (id int PRIMARY KEY);
+ALTER PUBLICATION paimon_pub ADD TABLE pub_plain;
+ALTER PUBLICATION paimon_pub DROP TABLE pub_plain;
+ALTER PUBLICATION paimon_pub OWNER TO CURRENT_USER;
+SELECT * FROM paimon.publication_problems();
+-- remove_table and DROP TABLE still leave the publication, legitimately
+SELECT paimon.remove_table('pub_t'::regclass);
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub' AND tablename = 'pub_t';
+SELECT paimon.add_table('pub_t'::regclass);
+DROP TABLE pub_t, pub_plain;
+SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub';
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
+
+-- (9) session_replication_role = replica no longer silences the guardrails
+CREATE TABLE srr_t (id int PRIMARY KEY);
+SELECT paimon.add_table('srr_t'::regclass);
+SELECT evtname, evtenabled FROM pg_event_trigger WHERE evtname LIKE 'paimon%' ORDER BY 1;
+SET session_replication_role = replica;
+ALTER TABLE srr_t ADD COLUMN d int DEFAULT 5;                                   -- expect ERROR
+ALTER TABLE srr_t REPLICA IDENTITY DEFAULT;                                     -- expect ERROR
+ALTER TABLE srr_t ADD COLUMN e int;
+RESET session_replication_role;
+SELECT paimon.peek_messages() - 'relid';
+
+-- (10) paimon.health(): what the guardrails keep true, checked from the catalog
+SELECT * FROM paimon.health();
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE;   -- back to ORIGIN: silent under replica role
+ALTER EVENT TRIGGER paimon_sql_drop DISABLE;
+SELECT * FROM paimon.health();
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE srr_t ADD COLUMN unseen int;     -- bypasses the trigger: the registry goes stale
+ALTER TABLE srr_t REPLICA IDENTITY DEFAULT;
+SELECT * FROM paimon.health();
+ALTER TABLE srr_t REPLICA IDENTITY FULL;
+ALTER TABLE srr_t DROP COLUMN unseen;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS;
+SELECT * FROM paimon.health();
+DROP TABLE srr_t;
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
+
+-- (11) DDL messages carry the installation's credential; nobody else can emit one
+CREATE TABLE au_t (id int PRIMARY KEY);
+SELECT paimon.add_table('au_t'::regclass);
+SELECT position(format('"auth": "%s"', (SELECT token FROM paimon.secret)) IN data) > 0 AS has_auth
+FROM pg_logical_slot_get_changes('paimon_test', NULL, NULL)
+WHERE data LIKE 'message:%';
+SELECT length(token) >= 64 AS long_token FROM paimon.secret;
+CREATE ROLE paimon_nobody;
+SELECT has_table_privilege('paimon_nobody', 'paimon.secret', 'SELECT') AS can_read_secret,
+       has_function_privilege('paimon_nobody', 'paimon.emit(jsonb)', 'EXECUTE') AS can_emit;
+DROP ROLE paimon_nobody;
+DROP TABLE au_t;
+SELECT count(*) FROM paimon.peek_messages();
+SELECT pg_drop_replication_slot('paimon_test');
