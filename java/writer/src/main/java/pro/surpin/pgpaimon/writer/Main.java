@@ -508,6 +508,27 @@ public final class Main {
         }
 
         @Override
+        public boolean hasUnconfirmed() {
+            return mini.hasBuffered();
+        }
+
+        /**
+         * The keepalive guard's fallback (see {@link SlotConsumer#guardBeforeNextRead}): after a
+         * Relation message, which carries LSN 0, the next read could auto-advance the flushed
+         * position past the buffer, so the buffered transactions are committed and confirmed now.
+         * The open transaction is not touched: it is incomplete, and an auto-advance cannot pass
+         * its commit record.
+         */
+        @Override
+        public void commitUnconfirmed() throws Exception {
+            if (mini.hasBuffered()) {
+                LOG.fine("keepalive guard: committing " + mini.bufferedRows()
+                    + " buffered record(s) before an auto-advance could confirm past them");
+                mini.flushBuffered();
+            }
+        }
+
+        @Override
         public void onDisconnect() {
             batcher.discardOpenTransaction();
             pendingTruncates.clear();   // that transaction never committed

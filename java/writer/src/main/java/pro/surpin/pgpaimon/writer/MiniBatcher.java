@@ -33,8 +33,11 @@ import java.util.logging.Logger;
  *       relation description.</li>
  *   <li><b>The commit identifier is the commit LSN of the LAST transaction</b> in the batch, and
  *       the confirmed position is that transaction's end LSN. The downstream flusher commits and
- *       only then confirms (see {@code Main.confirmingFlusher}); transactions still buffered are
- *       never confirmed.</li>
+ *       only then confirms (see {@code Main.confirmingFlusher}). Transactions still buffered are
+ *       never confirmed by this class; that pgjdbc cannot confirm them either, on a keepalive,
+ *       is the job of the keepalive guard ({@link SlotConsumer#autoAdvanceGateMayOpen}), which
+ *       rewinds pgjdbc's position below the message just received or, after a Relation
+ *       message, calls {@link #flushBuffered()}, before the next read whenever it could.</li>
  *   <li><b>Already-committed transactions are dropped at assembly, per table.</b> See below.</li>
  *   <li><b>An exception is fatal.</b> The buffer is emptied before the commit is attempted and
  *       the exception propagates; nothing after it is confirmed.</li>
