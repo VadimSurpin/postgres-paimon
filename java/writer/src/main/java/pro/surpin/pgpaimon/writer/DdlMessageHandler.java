@@ -22,6 +22,11 @@ public final class DdlMessageHandler {
         this.expectedPrefix = expectedPrefix;
     }
 
+    /** Whether {@link #handle} would act on this message (it ignores other prefixes). */
+    public boolean isDdl(PgEvent.Message m) {
+        return expectedPrefix.equals(m.prefix());
+    }
+
     public void handle(PgEvent.Message m) {
         if (!expectedPrefix.equals(m.prefix())) {
             return;

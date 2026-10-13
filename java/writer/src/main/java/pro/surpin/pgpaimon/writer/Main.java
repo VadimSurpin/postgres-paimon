@@ -18,6 +18,7 @@ import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 import java.util.function.LongPredicate;
+import java.util.function.Predicate;
 import java.util.logging.Logger;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
@@ -107,12 +108,23 @@ public final class Main {
         // 6. the pipeline
         PgOutputDecoder decoder = new PgOutputDecoder();
         SlotConsumer[] consumerRef = new SlotConsumer[1];
-        TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry,
+        // TxnBatcher -> MiniBatcher -> confirming flusher -> PaimonSink: a transaction is complete
+        // at TxnBatcher, several are committed together at MiniBatcher, and the slot is confirmed
+        // only after that commit returns.
+        OffsetStore liveOffsets = new OffsetStore(registry, config);
+        MiniBatcher.Limits limits = new MiniBatcher.Limits(config.batchMaxRows(),
+            config.batchMaxBytes(), config.batchMaxIntervalMs());
+        MiniBatcher mini = new MiniBatcher(
             confirmingFlusher(sink, lsn -> consumerRef[0].confirm(lsn)),
+            liveOffsets::highestCommitted, limits);
+        LOG.info("commit batching: up to " + limits.maxRows() + " change records, "
+            + limits.maxBytes() + " estimated bytes or " + limits.maxIntervalMs()
+            + " ms since the batch's first transaction, whichever comes first (PGPAIMON_BATCH_*)");
+        TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry, mini,
             config.skipLsn(),
             (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record));
         DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix());
-        SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle,
+        SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle, ddl::isDdl,
             new PipelineHandler.Target() {
                 @Override public void setRelation(long relid, RelationMeta meta) {
                     sink.setRelation(relid, meta);
@@ -120,7 +132,7 @@ public final class Main {
                 @Override public void truncate(long relid, long commitLsn) throws Exception {
                     sink.truncate(relid, commitLsn);
                 }
-            }, batcher);
+            }, batcher, mini);
         SlotConsumer consumer = new SlotConsumer(config, decoder, handler);
         consumerRef[0] = consumer;
 
@@ -383,28 +395,49 @@ public final class Main {
         private final LongPredicate tracked;
         private final LongFunction<List<String>> primaryKey;
         private final Consumer<PgEvent.Message> ddl;
+        private final Predicate<PgEvent.Message> isDdl;
         private final Target target;
         private final TxnBatcher batcher;
+        private final MiniBatcher mini;
         private final Map<Long, RelationMeta> relations = new HashMap<>();
         private final Set<Long> pendingTruncates = new LinkedHashSet<>();
 
         PipelineHandler(LongPredicate tracked, LongFunction<List<String>> primaryKey,
-                        Consumer<PgEvent.Message> ddl, Target target, TxnBatcher batcher) {
+                        Consumer<PgEvent.Message> ddl, Predicate<PgEvent.Message> isDdl,
+                        Target target, TxnBatcher batcher, MiniBatcher mini) {
             this.tracked = tracked;
             this.primaryKey = primaryKey;
             this.ddl = ddl;
+            this.isDdl = isDdl;
             this.target = target;
             this.batcher = batcher;
+            this.mini = mini;
         }
 
         @Override
         public void onEvent(PgEvent event, long changeLsn) throws Exception {
+            mini.tick();    // the time limit also fires while events are flowing
             if (event instanceof PgEvent.Relation r) {
                 RelationMeta meta = withRegistryKey(r.meta());
+                RelationMeta before = relations.get(meta.relid());
+                if (before != null && !before.equals(meta)) {
+                    // Buffered records were shaped by the old description; the sink builds them
+                    // at flush time from whatever it holds then.
+                    mini.flushBuffered();
+                }
                 target.setRelation(meta.relid(), meta);
                 relations.put(meta.relid(), meta);
             } else if (event instanceof PgEvent.Message m) {
-                ddl.accept(m);
+                if (isDdl.test(m)) {
+                    // A batch never spans a schema change: records are built against the schema
+                    // current at flush time. Commit and confirm what is buffered, then change it.
+                    mini.flushBuffered();
+                    ddl.accept(m);
+                    // A relation id may now name a different Paimon table.
+                    mini.forgetCommitted();
+                } else {
+                    ddl.accept(m);
+                }
             } else if (event instanceof PgEvent.Truncate t) {
                 // Buffered, not applied: sink.truncate needs this transaction's commit LSN as
                 // its commitIdentifier and that only arrives with the Commit. The batcher still
@@ -417,6 +450,12 @@ public final class Main {
             } else if (event instanceof PgEvent.Commit c) {
                 // Before the batcher flushes (and so confirms): were the slot confirmed first,
                 // a crash here would lose the truncate. A replay is filtered by commit LSN.
+                //
+                // The buffer is flushed first, so the overwrite lands after every earlier append
+                // and before every later one; the rest of this transaction then starts a new
+                // buffer. Without that, an earlier transaction's rows would be committed after
+                // the truncate that is meant to remove them.
+                boolean barrier = false;
                 for (long relid : pendingTruncates) {
                     // BEGIN; TRUNCATE t; DROP TABLE t; COMMIT: the drop_table message arrives
                     // between the Truncate and the Commit and untracks the relation, so there
@@ -428,7 +467,12 @@ public final class Main {
                             + " (dropped in the same transaction)");
                         continue;
                     }
+                    if (!barrier) {
+                        mini.flushBuffered();
+                        barrier = true;
+                    }
                     target.truncate(relid, c.commitLsn());
+                    mini.noteCommitted(relid, c.commitLsn());
                 }
                 pendingTruncates.clear();
             }
@@ -454,9 +498,20 @@ public final class Main {
         }
 
         @Override
+        public void onIdle() throws Exception {
+            mini.tick();
+        }
+
+        @Override
+        public void onShutdown() throws Exception {
+            mini.drain();
+        }
+
+        @Override
         public void onDisconnect() {
             batcher.discardOpenTransaction();
             pendingTruncates.clear();   // that transaction never committed
+            mini.discard();             // complete but unconfirmed: replays from the last confirmed LSN
         }
     }
 }

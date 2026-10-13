@@ -72,6 +72,17 @@ public final class OffsetStore {
         }
     }
 
+    /**
+     * The highest identifier our commitUser has committed to one table; 0 if it has committed
+     * nothing (0 is never a commit LSN). The per-table answer that {@link MiniBatcher} needs to
+     * drop transactions the table already holds; {@link #highestCommittedLsn} reports only the
+     * minimum across tables.
+     */
+    public long highestCommitted(long relid) {
+        Long ours = ourHighest(relid);
+        return ours == null ? 0 : ours;
+    }
+
     /** The highest identifier committed by our commitUser to one table, or null if there is none. */
     private Long ourHighest(long relid) {
         FileStoreTable t = registry.table(relid);

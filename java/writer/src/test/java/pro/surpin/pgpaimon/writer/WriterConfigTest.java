@@ -187,4 +187,44 @@ class WriterConfigTest {
         }
     }
 
+    @Test
+    void theStreamingBatchLimitsHaveDefaultsAndAreSeparateFromTheBackfillChunk() {
+        WriterConfig c = WriterConfig.fromEnv(minimal());
+        assertEquals(10_000, c.batchMaxRows());
+        assertEquals(16L * 1024 * 1024, c.batchMaxBytes());
+        assertEquals(2_000, c.batchMaxIntervalMs());
+        assertEquals(10_000, c.flushMaxRecords(), "the backfill chunk is a different setting");
+
+        Map<String, String> e = minimal();
+        e.put("PGPAIMON_FLUSH_MAX_RECORDS", "300");
+        assertEquals(10_000, WriterConfig.fromEnv(e).batchMaxRows(),
+            "PGPAIMON_FLUSH_MAX_RECORDS must not size the streaming batch");
+        e = minimal();
+        e.put("PGPAIMON_BATCH_MAX_ROWS", "1");
+        assertEquals(10_000, WriterConfig.fromEnv(e).flushMaxRecords(),
+            "PGPAIMON_BATCH_MAX_ROWS must not size the backfill chunk");
+    }
+
+    @Test
+    void theBatchLimitsAreConfigurableAndRefuseNonsense() {
+        Map<String, String> e = minimal();
+        e.put("PGPAIMON_BATCH_MAX_ROWS", "1");
+        e.put("PGPAIMON_BATCH_MAX_BYTES", "4096");
+        e.put("PGPAIMON_BATCH_MAX_INTERVAL_MS", "0");
+        WriterConfig c = WriterConfig.fromEnv(e);
+        assertEquals(1, c.batchMaxRows());
+        assertEquals(4096, c.batchMaxBytes());
+        assertEquals(0, c.batchMaxIntervalMs());
+
+        for (String[] bad : new String[][] {
+                {"PGPAIMON_BATCH_MAX_ROWS", "0"}, {"PGPAIMON_BATCH_MAX_ROWS", "lots"},
+                {"PGPAIMON_BATCH_MAX_BYTES", "0"}, {"PGPAIMON_BATCH_MAX_BYTES", "-5"},
+                {"PGPAIMON_BATCH_MAX_INTERVAL_MS", "-1"}, {"PGPAIMON_BATCH_MAX_INTERVAL_MS", "1s"}}) {
+            Map<String, String> b = minimal();
+            b.put(bad[0], bad[1]);
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> WriterConfig.fromEnv(b), bad[0] + "=" + bad[1]);
+            assertTrue(ex.getMessage().contains(bad[0]), ex.getMessage());
+        }
+    }
 }

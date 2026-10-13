@@ -28,6 +28,21 @@ public final class SlotConsumer {
     public interface Handler {
         void onEvent(PgEvent event, long changeLsn) throws Exception;
         void onDisconnect();
+
+        /**
+         * Called from the loop when no message is pending, about every 10 ms. The only way a
+         * time-based flush can fire when no events arrive; the loop is single-threaded and there
+         * is deliberately no timer thread. An exception is fatal, like one from onEvent.
+         */
+        default void onIdle() throws Exception {
+        }
+
+        /**
+         * Called once on a clean stop, after the last event and before the final status update, so
+         * anything buffered can be committed and confirmed first. An exception is fatal.
+         */
+        default void onShutdown() throws Exception {
+        }
     }
 
     private static final Logger LOG = Logger.getLogger(SlotConsumer.class.getName());
@@ -73,6 +88,13 @@ public final class SlotConsumer {
                     // relies on. It is passed on untouched.
                     ByteBuffer buf = stream.readPending();
                     if (buf == null) {
+                        try {
+                            handler.onIdle();
+                        } catch (RuntimeException e) {
+                            throw e;
+                        } catch (Exception e) {
+                            throw new HandlerFailure(e);
+                        }
                         Thread.sleep(10);
                         continue;
                     }
@@ -89,7 +111,15 @@ public final class SlotConsumer {
                         throw new HandlerFailure(e);
                     }
                 }
-                // Clean stop: report the confirmed position now rather than at the next interval.
+                // Clean stop: commit and confirm what the handler still buffers, then report the
+                // confirmed position now rather than at the next interval.
+                try {
+                    handler.onShutdown();
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new HandlerFailure(e);
+                }
                 try {
                     stream.forceUpdateStatus();
                 } catch (SQLException e) {

@@ -12,7 +12,9 @@ import org.apache.paimon.table.sink.TableWriteImpl;
 
 /**
  * Commits decoded transactions to Paimon, once per touched table, with
- * {@code commitIdentifier = commitLsn}.
+ * {@code commitIdentifier = commitLsn}. The caller decides what one commit holds: with
+ * {@link MiniBatcher} it is a batch of whole transactions and {@code commitLsn} is the commit LSN
+ * of the last one; this class neither knows nor cares.
  *
  * <p>Effectively-once rests on three measured facts (Task 1 spike 3, Paimon 1.4.1):
  * <ul>
@@ -213,7 +215,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                 + " (paimon.remove_table, delete the Paimon table, paimon.add_table).", cause);
         }
         return new IllegalStateException("POISON RECORD in " + where
-            + ", transaction committing at " + SlotConsumer.formatLsn(commitLsn) + ": "
+            + ", in the commit batch ending at " + SlotConsumer.formatLsn(commitLsn) + ": "
             + cause.getMessage()
             + ". THIS IS NOT TRANSIENT and will not clear by itself: the change is already in"
             + " replication slot '" + config.slotName() + "', the slot advances only after a"

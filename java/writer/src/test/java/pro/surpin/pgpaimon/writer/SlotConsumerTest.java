@@ -53,18 +53,28 @@ class SlotConsumerTest {
         final List<Long> confirmed = new ArrayList<>();
         final Set<Long> tracked = new HashSet<>(Set.of(1L, 2L));
         final TxnBatcher batcher;
+        final MiniBatcher mini;
         final Main.PipelineHandler handler;
+        long now;    // fake clock, nanoseconds
 
+        /** One transaction per commit: the pre-batching behaviour, which these tests assume. */
         Fixture() {
+            this(new MiniBatcher.Limits(1, Long.MAX_VALUE, 0));
+        }
+
+        Fixture(MiniBatcher.Limits limits) {
             TxnBatcher.Flusher inner = (records, commitLsn, endLsn) -> {
                 calls.add("flush@" + commitLsn);
                 flushed.add(List.copyOf(records));
             };
-            batcher = new TxnBatcher(new ToastResolver(), null,
-                Main.confirmingFlusher(inner, confirmed::add));
+            mini = new MiniBatcher(Main.confirmingFlusher(inner, lsn -> {
+                calls.add("confirm@" + lsn);
+                confirmed.add(lsn);
+            }), relid -> 0L, limits, () -> now);
+            batcher = new TxnBatcher(new ToastResolver(), null, mini);
             handler = new Main.PipelineHandler(tracked::contains, r -> List.of("id"),
-                m -> calls.add("ddl"),
-                this, batcher);
+                m -> calls.add("ddl"), m -> true,
+                this, batcher, mini);
         }
 
         RelationMeta lastMeta;
@@ -89,7 +99,7 @@ class SlotConsumerTest {
         assertEquals(List.of(), f.calls, "nothing may be applied before the Commit is known");
         f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
         // the untracked relation 99 is dropped; the truncate precedes the confirm
-        assertEquals(List.of("truncate1@50", "flush@50"), f.calls);
+        assertEquals(List.of("truncate1@50", "flush@50", "confirm@55"), f.calls);
         assertEquals(List.of(55L), f.confirmed);
     }
 
@@ -116,7 +126,7 @@ class SlotConsumerTest {
         f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
         f.handler.onEvent(insert(1, "1"), 42L);
         f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
-        assertEquals(List.of("relation1", "flush@50"), f.calls,
+        assertEquals(List.of("relation1", "flush@50", "confirm@55"), f.calls,
             "the stale truncate of relation 2 must not survive the disconnect");
         assertEquals(1, f.flushed.size());
         assertEquals(1, f.flushed.get(0).size());
@@ -149,6 +159,155 @@ class SlotConsumerTest {
         f.handler.onEvent(new PgEvent.Relation(META), 0L);
         f.handler.onEvent(new PgEvent.Message(true, 5L, "paimon", new byte[0]), 5L);
         assertEquals(List.of("relation1", "ddl"), f.calls);
+    }
+
+    // ---- mini-batch commits through the real handler --------------------------------------
+
+    static final MiniBatcher.Limits HOLD = new MiniBatcher.Limits(1_000_000, 1L << 40, 3_600_000);
+
+    /** One complete transaction with one insert into {@code relid}. */
+    static void txn(Fixture f, long commitLsn, long endLsn, long relid) throws Exception {
+        f.handler.onEvent(new PgEvent.Begin(endLsn, 0L, commitLsn), commitLsn - 5);
+        f.handler.onEvent(insert(relid, "1"), commitLsn - 3);
+        f.handler.onEvent(new PgEvent.Commit(commitLsn, endLsn, 0L), commitLsn);
+    }
+
+    @Test
+    void aDdlMessageFlushesTheBufferBeforeItIsApplied() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        txn(f, 100, 110, 1);
+        txn(f, 200, 210, 1);
+        assertEquals(List.of("relation1"), f.calls, "buffered, not committed");
+        f.handler.onEvent(new PgEvent.Message(true, 250L, "paimon", new byte[0]), 250L);
+        assertEquals(List.of("relation1", "flush@200", "confirm@210", "ddl"), f.calls,
+            "the batch (identifier = the last transaction's commit LSN) precedes the schema change");
+        assertEquals(2, f.flushed.get(0).size());
+    }
+
+    @Test
+    void aMessageThatIsNotDdlDoesNotBreakTheBatch() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        // a second handler whose predicate rejects the message
+        List<String> calls = new ArrayList<>();
+        MiniBatcher mini = new MiniBatcher((r, c, e) -> calls.add("flush@" + c), x -> 0L, HOLD);
+        TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, mini);
+        Main.PipelineHandler h = new Main.PipelineHandler(x -> true, r -> List.of("id"),
+            m -> calls.add("other-message"), m -> false, f, batcher, mini);
+        h.onEvent(new PgEvent.Relation(META), 0L);
+        h.onEvent(new PgEvent.Begin(110, 0L, 1L), 95L);
+        h.onEvent(insert(1, "1"), 97L);
+        h.onEvent(new PgEvent.Commit(100, 110, 0L), 100L);
+        h.onEvent(new PgEvent.Message(true, 120L, "someone-else", new byte[0]), 120L);
+        assertEquals(List.of("other-message"), calls);
+        assertTrue(mini.hasBuffered());
+    }
+
+    @Test
+    void aTruncateFlushesTheBufferFirstAndTheRestOfItsTransactionStartsANewOne() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        f.handler.onEvent(new PgEvent.Relation(new RelationMeta(2, "public", "u",
+            List.of("id"), List.of(true))), 0L);
+        txn(f, 100, 110, 1);                              // an append to table 1, buffered
+        f.calls.clear();
+
+        f.handler.onEvent(new PgEvent.Begin(310, 0L, 7L), 290L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 291L);
+        f.handler.onEvent(insert(2, "5"), 292L);          // DML on ANOTHER table, same transaction
+        f.handler.onEvent(new PgEvent.Commit(300, 310, 0L), 300L);
+
+        assertEquals(List.of("flush@100", "confirm@110", "truncate1@300"), f.calls,
+            "earlier append, then the overwrite under this transaction's commit LSN; the"
+            + " remainder waits in a new buffer");
+        assertTrue(f.mini.hasBuffered());
+        assertEquals(List.of(110L), f.confirmed, "the truncating transaction is not confirmed yet");
+
+        f.handler.onShutdown();
+        assertEquals(List.of("flush@100", "confirm@110", "truncate1@300", "flush@300", "confirm@310"),
+            f.calls);
+        assertEquals(1, f.flushed.get(1).size());
+        assertEquals(2L, f.flushed.get(1).get(0).relid());
+    }
+
+    @Test
+    void aTruncateOnlyTransactionConfirmsAfterTheOverwrite() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        f.handler.onEvent(new PgEvent.Begin(310, 0L, 7L), 290L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 291L);
+        f.handler.onEvent(new PgEvent.Commit(300, 310, 0L), 300L);
+        assertEquals(List.of("truncate1@300", "flush@300", "confirm@310"), f.calls);
+    }
+
+    @Test
+    void theIdleCallbackFiresTheTimeLimitWhenNoEventsArrive() throws Exception {
+        Fixture f = new Fixture(new MiniBatcher.Limits(1_000_000, 1L << 40, 1000));
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        txn(f, 100, 110, 1);
+        f.now = 999_000_000L;
+        f.handler.onIdle();
+        assertEquals(List.of(), f.confirmed);
+        f.now = 1_000_000_000L;
+        f.handler.onIdle();
+        assertEquals(List.of(110L), f.confirmed);
+        assertEquals(List.of("relation1", "flush@100", "confirm@110"), f.calls);
+    }
+
+    @Test
+    void theTimeLimitAlsoFiresWhileEventsAreFlowing() throws Exception {
+        Fixture f = new Fixture(new MiniBatcher.Limits(1_000_000, 1L << 40, 1000));
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        txn(f, 100, 110, 1);
+        f.now = 5_000_000_000L;
+        // a long transaction is streaming in; its first event reaches the aged buffer
+        f.handler.onEvent(new PgEvent.Begin(210, 0L, 8L), 190L);
+        assertEquals(List.of(110L), f.confirmed, "only the completed transaction, never the open one");
+    }
+
+    @Test
+    void aCleanStopDrainsAndAConnectionLossDiscards() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        txn(f, 100, 110, 1);
+        f.handler.onDisconnect();
+        f.handler.onShutdown();
+        assertEquals(List.of(), f.confirmed, "discarded: complete but unconfirmed, replays");
+        assertTrue(f.flushed.isEmpty());
+
+        txn(f, 100, 110, 1);                  // the replay
+        f.handler.onShutdown();
+        assertEquals(List.of(110L), f.confirmed);
+    }
+
+    @Test
+    void aChangedRelationFlushesTheBufferButAnIdenticalOneDoesNot() throws Exception {
+        Fixture f = new Fixture(HOLD);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        txn(f, 100, 110, 1);
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);        // pgoutput resends it
+        assertTrue(f.flushed.isEmpty(), "same description: keep batching");
+        f.handler.onEvent(new PgEvent.Relation(new RelationMeta(1, "public", "t",
+            List.of("id", "extra"), List.of(true, false))), 0L);
+        assertEquals(1, f.flushed.size(), "records were shaped by the old description");
+        assertEquals(List.of(110L), f.confirmed);
+    }
+
+    @Test
+    void anExceptionFromTheCommitPropagatesOutOfTheHandlerAndConfirmsNothing() throws Exception {
+        List<Long> confirmed = new ArrayList<>();
+        MiniBatcher mini = new MiniBatcher(Main.confirmingFlusher(
+            (r, c, e) -> { throw new java.io.IOException("commit failed"); }, confirmed::add),
+            x -> 0L, new MiniBatcher.Limits(1, 1L << 40, 0));
+        TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, mini);
+        Main.PipelineHandler h = new Main.PipelineHandler(x -> true, r -> List.of("id"),
+            m -> { }, m -> true, new Fixture(), batcher, mini);
+        h.onEvent(new PgEvent.Relation(META), 0L);
+        h.onEvent(new PgEvent.Begin(110, 0L, 1L), 95L);
+        h.onEvent(insert(1, "1"), 97L);
+        assertThrows(java.io.IOException.class,
+            () -> h.onEvent(new PgEvent.Commit(100, 110, 0L), 100L));
+        assertTrue(confirmed.isEmpty());
+        assertFalse(batcher.hasOpenTransaction());
     }
 
     @Test

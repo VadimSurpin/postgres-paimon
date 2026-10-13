@@ -11,11 +11,13 @@ import java.util.*;
  * {@code PGPAIMON_DATABASE} that is parsed and then ignored is the failure mode this branch has
  * already had to fix twice.
  *
- * <p>There is deliberately no flush interval and no flush size for the streaming path: a batch is
- * one committed PostgreSQL transaction or nothing ({@link TxnBatcher}), so a timer or a record
- * count could only split a transaction, which would break atomicity and let the slot advance past
- * records that were never written. {@code flushMaxRecords} is a chunk size for the initial load
- * only, where each chunk is a commit of its own.
+ * <p>Two different knobs are easy to conflate and must not be. {@code flushMaxRecords}
+ * ({@code PGPAIMON_FLUSH_MAX_RECORDS}) is the chunk size of the <em>initial load</em> only, where
+ * each COPY chunk is a commit of its own. {@code batchMaxRows}, {@code batchMaxBytes} and
+ * {@code batchMaxIntervalMs} ({@code PGPAIMON_BATCH_*}) size the <em>streaming</em> commit: how
+ * many completed PostgreSQL transactions {@link MiniBatcher} accumulates into one Paimon commit.
+ * Neither can split a transaction -- a limit is only checked between whole transactions -- so the
+ * limits are "at least this much", never "exactly this much".
  */
 public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            String password, String warehouse,
@@ -23,7 +25,13 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            String messagePrefix, String commitUser,
                            String seqField, String opSeqField, String xidField,
                            int flushMaxRecords, long skipLsn,
+                           long batchMaxRows, long batchMaxBytes, long batchMaxIntervalMs,
                            Map<String, String> catalogOptions) {
+
+    /** Defaults for the streaming commit batch; see {@link MiniBatcher}. */
+    public static final String DEFAULT_BATCH_MAX_ROWS = "10000";
+    public static final String DEFAULT_BATCH_MAX_BYTES = "16777216";    // 16 MiB
+    public static final String DEFAULT_BATCH_MAX_INTERVAL_MS = "2000";
 
     public static WriterConfig fromEnv(Map<String, String> env) {
         String jdbc = require(env, "PGPAIMON_JDBC_URL");
@@ -54,6 +62,9 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             get(env, "PGPAIMON_XID_FIELD"),
             (int) parseNumber(env, "PGPAIMON_FLUSH_MAX_RECORDS", "10000", Integer.MAX_VALUE),
             parseLsn(env, "PGPAIMON_SKIP_LSN"),
+            parseMin(env, "PGPAIMON_BATCH_MAX_ROWS", DEFAULT_BATCH_MAX_ROWS, 1),
+            parseMin(env, "PGPAIMON_BATCH_MAX_BYTES", DEFAULT_BATCH_MAX_BYTES, 1),
+            parseMin(env, "PGPAIMON_BATCH_MAX_INTERVAL_MS", DEFAULT_BATCH_MAX_INTERVAL_MS, 0),
             Map.copyOf(cat));
     }
 
@@ -105,6 +116,15 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(key + " must be a number, got '" + v + "'", e);
         }
+    }
+
+    /** A number of at least {@code min}: a limit below its minimum would be a typo, not a choice. */
+    private static long parseMin(Map<String, String> env, String key, String dflt, long min) {
+        long n = parseNumber(env, key, dflt, Long.MAX_VALUE);
+        if (n < min) {
+            throw new IllegalArgumentException(key + " must be at least " + min + ", got " + n);
+        }
+        return n;
     }
 
     private static String require(Map<String, String> env, String key) {
