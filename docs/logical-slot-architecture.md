@@ -101,8 +101,9 @@ java -jar java/writer/target/paimon-writer.jar
 A PostgreSQL transaction is **not** one Paimon commit. The writer accumulates completed
 transactions and commits them together, because a Paimon commit costs a snapshot, a manifest and
 at least one file per touched bucket however small the change: committing every transaction left
-the ten-row TPC-C `district` table with 1,664 snapshots and 12,391 files (see the measured
-before/after below). The batch is flushed when **any one** of three limits is reached:
+the ten-row TPC-C `district` table with 1,673 snapshots and 12,443 files in the measured local
+before/after run below (fixed buckets; an earlier CI run with dynamic buckets, also one commit per
+transaction, gave 1,664 and 12,391). The batch is flushed when **any one** of three limits is reached:
 
 | Limit | Default | Counted |
 |---|---|---|
@@ -133,10 +134,67 @@ however many transactions arrive, and a row is visible within about two seconds.
   refuses to start.
 
 **What the commit looks like.** The commit identifier is the commit LSN of the **last**
-transaction in the batch, and the position confirmed to PostgreSQL is that transaction's end LSN,
-sent only after the commit has returned. Transactions that are buffered but not yet committed are
-never confirmed. Empty transactions (DDL only, or touching only untracked tables) with nothing
-buffered are confirmed at once with no snapshot; behind buffered data they queue with it.
+transaction in the batch, and the position the writer confirms to PostgreSQL is that transaction's
+end LSN, set only after the commit has returned. Empty transactions (DDL only, or touching only
+untracked tables) with nothing buffered are confirmed at once with no snapshot; behind buffered
+data they queue with it.
+
+**The writer is not the only thing that moves the confirmed position: pgjdbc does too.** pgjdbc
+42.7.3 (`V3PGReplicationStream`) advances its own flushed position on a keepalive, to the
+walsender's send pointer, when three things hold: the flushed LSN in the last status update it
+actually **sent** is at or above the WAL start of the last message it received, and the send
+pointer is above both that sent value and the current flushed position. If the keepalive asks for
+a reply, the advanced value goes to the server inside the same read, before the writer sees it.
+The send pointer is past every transaction already delivered, but delivered is not committed: a
+buffered transaction is delivered and uncommitted. Two kinds of message open the gate while
+something sits in the buffer:
+
+* a transaction that **began before the last status update**. Logical decoding sends transactions
+  in commit order, but each record keeps its original LSN, so such a transaction's Begin and rows
+  arrive after later-starting ones with LSNs below the confirmed position;
+* a **Relation message**, which pgoutput sends with LSN 0 (measured on PostgreSQL 18; it precedes
+  the first change to a table on a connection, and the first after its cache entry is invalidated).
+
+A keepalive in that window confirmed past the buffer. Before the fix this lost data for good,
+measured: with A (200,000 rows) open, B committed and buffered, A's commit and a reply-requested
+keepalive in its burst moved the slot past B; after `kill -9` the restart began past B and B's row
+never reached Paimon. The walsender sends a reply-requested keepalive once
+`wal_sender_timeout / 2` (30 s at the default) passes without a reply, so a slow commit, a GC pause
+or a lowered timeout was enough.
+
+**The guard.** After handling each message and before reading the next, if something is
+buffered and that message's start LSN is at or below the stream's current flushed position, the
+writer shuts the gate itself:
+
+* **rewind** (the message started above 0): it sets pgjdbc's flushed position just below the
+  message's start and sends a status update at once. The last value sent is then below the last
+  message's start, so no keepalive can advance anything until the next message, which is checked
+  the same way. Nothing is committed and nothing new is confirmed: the value is lower than one
+  already sent, and PostgreSQL 18 ignores a flushed position below the slot's own (measured; a
+  server that did not would only replay more, which the commit-identifier filter and the drop rule
+  absorb);
+* **commit** (a Relation message, LSN 0): no position is below 0, so the buffer is committed and
+  confirmed before the next read.
+
+Why that is enough: pgjdbc's current flushed position is never below the last value it sent (the
+writer only lowers it together with an immediate status update; pgjdbc only raises it), so when the
+message started above it the gate is shut. And the check cannot be relaxed, because a periodic
+status update can go out inside any read. What an auto-advance can still pass is the transaction
+being received, which is safe: during its burst the send pointer is at most the start of its commit
+record, and PostgreSQL replays a transaction whose commit record starts at or above the confirmed
+position. With `PGPAIMON_BATCH_MAX_ROWS=1` nothing is buffered, so this exposure never existed
+there; that was measured too (the auto-advance stopped exactly at the open transaction's commit
+record and the transaction replayed whole). Unit tests drive the real consumer loop against a model
+of pgjdbc's stream; acceptance tests T16e (rewind) and T16f (Relation message) repeat the losing
+sequence live, and both fail on the code before the fix.
+
+**What it costs.** A status update per rewind, and an early commit when a Relation message arrives
+behind buffered data (the first change to a table on a connection, or after its cache entry is
+invalidated). Measured with pgbench (8 and 32 clients, 2 s interval) against a standalone pgjdbc
+client applying the same rule, not the writer itself: 19 and 45 rewinds in 20 s and about 175
+transactions per batch. Committing on every trigger instead, the first version of this
+fix, gave 1.3 transactions per batch at 8 clients, because each commit raised the flushed position
+over the transactions still in flight and the next one tripped the guard again.
 
 **A batch never spans a schema change or an overwrite.** Records are built against the table's
 schema as it is when the batch is flushed, so a batch holding records from before and after an

@@ -599,8 +599,12 @@ transaction.
    transaction in it, under a fixed `commitUser`, through
    `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
 6. Only after the Paimon commit returns does `SlotConsumer` advance the flushed and applied LSN,
-   and it advances it to the **last** transaction's end LSN. Buffered, uncommitted transactions are
-   never confirmed.
+   and it advances it to the **last** transaction's end LSN. pgjdbc can also advance it on a
+   keepalive (see the end of this section), so before reading each next message, when something is
+   buffered and the message just handled started at or below the flushed position, the consumer
+   shuts that off: it rewinds pgjdbc's flushed position below the message and sends it at once, or,
+   for a Relation message (LSN 0), commits and confirms the buffer. No buffered transaction can be
+   passed by that advance.
 7. On restart, `OffsetStore` reads the highest committed identifier for that `commitUser` from the
    Paimon snapshots and resumes the slot from it (the minimum across tables). `filterAndCommit`
    discards commits whose identifier is at or below one that `commitUser` has already used, and
@@ -656,9 +660,45 @@ need to agree, and the several transactions in a batch share one identifier but 
 
 Confirming the LSN only after the Paimon commit returns is what makes crash recovery a
 property of the code rather than best-effort, and is why `legacy:extension/paimon_wal.cpp` has no
-counterpart here. pgjdbc advances its own flushed position on a keepalive, gated on
-`explicitlyFlushedLSN >= startOfLastMessageLSN`; with a batch sitting in the buffer across idle
-keepalives that gate was re-verified live (T16c) rather than assumed.
+counterpart here. **But the writer is not the only party that moves the flushed position.**
+
+pgjdbc 42.7.3 (`V3PGReplicationStream.processKeepAliveMessage`, read with `javap -c -p` and
+reproduced with a standalone client that never calls `setFlushedLSN`) sets
+`lastFlushedLSN = serverLSN` on a keepalive when `explicitlyFlushedLSN >= startOfLastMessageLSN`,
+`serverLSN > explicitlyFlushedLSN` and `serverLSN > lastFlushedLSN`. `explicitlyFlushedLSN` is the
+flushed value of the last status update actually *sent*; `startOfLastMessageLSN` is the WAL start
+of the last XLogData message; `serverLSN` is the walsender's send pointer, the end of the last WAL
+record it has decoded. A reply-requested keepalive sends the advanced value inside the same
+`readPending()` call. An earlier version of this note said the gate had been "re-verified live
+(T16c)" for buffered transactions. That was wrong: T16c had no interleaved transaction, and the
+gate opens on exactly that.
+
+* A transaction that began before the last status update arrives after later-starting ones (commit
+  order) with its records' original LSNs, below `explicitlyFlushedLSN`. Relation messages carry
+  LSN 0 (measured). Either opens the gate, and a keepalive then confirms past everything buffered. This
+  was reproduced live on `2b22ca9`: a one-row transaction committed while a 200,000-row one was open
+  was buffered, the older one's burst opened the gate, and after `kill -9` the row was permanently
+  absent from Paimon.
+* **The guard** (`SlotConsumer.guardBeforeNextRead`): after each message, if something is buffered
+  and the message's start LSN is at or below `getLastFlushedLSN()`, the consumer either *rewinds*
+  (sets the flushed LSN to the message's start minus one and calls `forceUpdateStatus()`, so
+  `explicitlyFlushedLSN` is below `startOfLastMessageLSN`) or, for a Relation message at LSN 0,
+  commits and confirms the buffer. `lastFlushedLSN` is only ever lowered together with an immediate
+  send and otherwise only rises, so it bounds `explicitlyFlushedLSN` from above at every read, and
+  when the test is false the gate stays shut until the next message. The test is also necessary,
+  because a periodic status update can be sent inside any read. The rewind confirms nothing new:
+  the value is below one already sent, and PostgreSQL 18 ignores it (measured). Committing on every
+  trigger, the first version, was also safe but ended a batch at nearly every transaction under
+  concurrent load (1.3 transactions per batch with 8 pgbench clients, against about 175 with the
+  rewind; measured with a standalone pgjdbc client applying each rule).
+* **The open transaction is not exposed, and never was, batched or not** (measured with
+  one commit per transaction): during a transaction's burst the send pointer is at most the start of
+  its commit record, and decoding skips only transactions whose commit record starts strictly below
+  `confirmed_flush_lsn`, so a transaction passed mid-burst is replayed whole.
+* Tests: unit tests run the real consumer loop and pipeline against a field-for-field model of
+  pgjdbc's stream and check, at every status update, that nothing below the flushed value sent is
+  uncommitted; acceptance tests T16e (rewind) and T16f (Relation message) repeat the live sequence
+  and fail on `2b22ca9`.
 
 ---
 
