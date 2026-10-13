@@ -293,6 +293,35 @@ class MiniBatcherTest {
         assertEquals(txCount, perSeq.size(), "no stray records: " + perSeq);
     }
 
+    /**
+     * Reconnect in the same process. The new stream starts at the server's confirmed_flush_lsn,
+     * which can be behind what this process has already committed (the confirm travels with the
+     * next status update), so committed transactions are replayed into the SAME MiniBatcher,
+     * whose cached identifier was read before that commit. Only the per-table update after the
+     * commit lets rule 4 recognise them; the lookup is never consulted again.
+     */
+    @Test
+    void afterAnInProcessReconnectTheTransactionsThisProcessCommittedAreDropped() throws Exception {
+        FakeStore s = new FakeStore();
+        MiniBatcher b = s.batcher(BIG, new long[1]);
+        tx(b, 1, 1);
+        tx(b, 2, 1);
+        tx(b, 3, 1);
+        b.flushBuffered();                         // T1..T3 committed under L3
+        assertEquals(List.of("commit@3000 rel1 n=3", "confirm@3010"), s.log);
+
+        b.discard();                               // the connection drops
+        tx(b, 1, 1);                               // the server replays from before T1
+        tx(b, 2, 1);
+        tx(b, 3, 1);
+        tx(b, 4, 1);
+        b.flushBuffered();                         // regrouped as T1..T4 under L4 > L3
+
+        assertEquals("commit@4000 rel1 n=1", s.log.get(2),
+            "T1..T3 dropped at assembly; only T4 is committed");
+        assertExactlyOnce(s, 1, 4);
+    }
+
     @Test
     void replayGroupedLargerDoesNotDuplicateTheOverlap() throws Exception {
         FakeStore s = new FakeStore();
