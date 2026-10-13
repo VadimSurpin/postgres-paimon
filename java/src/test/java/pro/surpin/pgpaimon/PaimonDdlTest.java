@@ -82,7 +82,7 @@ public class PaimonDdlTest {
         jdbcUrl   = args.length > 1 ? args[1] : DEFAULT_JDBC;
 
         System.out.println("╔════════════════════════════════════════════════════╗");
-        System.out.println("║         paimon_heap DDL Hook Test Suite            ║");
+        System.out.println("║         paimon_slot DDL Guardrail Test Suite       ║");
         System.out.println("╚════════════════════════════════════════════════════╝");
         System.out.printf("  Warehouse : %s%n", warehouse);
         System.out.printf("  JDBC      : %s%n", jdbcUrl);
@@ -130,7 +130,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_drop_table";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(2,'b')");
@@ -172,7 +171,6 @@ public class PaimonDdlTest {
         // Re-create the table and verify DML capture still works
         boolean recreateOk = true;
         try (Connection conn = connect()) {
-            disableMeta(conn);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'re-a'),(2,'re-b'),(3,'re-c')");
         } catch (Exception e) {
@@ -195,7 +193,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_truncate";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20),(3,30),(4,40),(5,50)");
@@ -243,7 +240,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_add_col";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
@@ -301,7 +297,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_drop_col";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v INT, extra TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10,'a'),(2,20,'b')");
@@ -351,7 +346,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_rename_col";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v_old INT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,100),(2,200)");
@@ -396,7 +390,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_alter_type";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v SMALLINT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,10),(2,20)");
@@ -445,7 +438,7 @@ public class PaimonDdlTest {
     }
 
     // ── D7: a table without a primary key cannot be tracked ──────────────────
-    // Main blocked ADD PRIMARY KEY on a paimon_heap table so that Paimon's key
+    // The original implementation blocked ADD PRIMARY KEY on a tracked table so that Paimon's key
     // semantics never changed mid-life.  Here a table can only be tracked if it
     // already has a key, and the key is frozen once tracked (D8).  The guardrail
     // therefore moves to the door: paimon.add_table() must refuse a key-less table,
@@ -502,7 +495,6 @@ public class PaimonDdlTest {
         String tbl = "ddl_drop_pk_blocked";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMeta(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a')");
@@ -555,7 +547,7 @@ public class PaimonDdlTest {
     }
 
     // ── D9: Non-paimon passthrough ────────────────────────────────────────────
-    // The hook must only intercept paimon_heap tables; DDL on plain heap tables
+    // The guardrails must only apply to tracked tables; DDL on untracked tables
     // must pass through untouched.  Specifically, ADD PRIMARY KEY on a heap
     // table must NOT be blocked.
     static void testD9_nonPaimonPassthrough() throws Exception {
@@ -636,10 +628,6 @@ public class PaimonDdlTest {
 
     static void exec(Connection c, String sql) throws SQLException {
         try (Statement s = c.createStatement()) { s.execute(sql); }
-    }
-
-    static void disableMeta(Connection c) throws SQLException {
-        noGuc();
     }
 
     static void cleanup(String tbl) {
@@ -771,7 +759,7 @@ public class PaimonDdlTest {
 
     // ── Slot-architecture setup helpers (the only thing the port changes) ─────
 
-    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    /** Creates a tracked table: CREATE TABLE, then register it with paimon.add_table(). */
     static void createTracked(Connection conn, String tbl, String columns) throws Exception {
         exec(conn, "DROP TABLE IF EXISTS " + tbl);
         exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
@@ -787,16 +775,6 @@ public class PaimonDdlTest {
     /** These suites create every table in PG_SCHEMA. */
     static String tableDir(String tbl) {
         return tableDir(PG_SCHEMA, tbl);
-    }
-
-    static boolean gucNoteLogged = false;
-
-    /** paimon_heap.* GUCs no longer exist: metadata columns are writer-side configuration. */
-    static void noGuc() {
-        if (!gucNoteLogged) {
-            gucNoteLogged = true;
-            System.out.println("  note: paimon_heap.* GUCs are no-ops in the slot architecture");
-        }
     }
 
     static String env(String name, String dflt) {

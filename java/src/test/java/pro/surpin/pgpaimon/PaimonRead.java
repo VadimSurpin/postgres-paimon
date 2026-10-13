@@ -19,16 +19,19 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Read a Paimon table written by paimon-daemon using the standard manifest
- * read path.  The daemon now writes SimpleStats (per-column nullable arrays)
- * so the Paimon 0.9.0 Java reader can deserialise the manifests directly.
+ * Read a Paimon table written by paimon-writer using the standard manifest
+ * read path and print its schema and rows.
  *
- * Bucketed tables (written with a fixed bucket number but no bucket-key) are
- * handled automatically: merge-engine options are stripped and bucket is set
- * to -1 so Paimon reads all files as an unordered append table.
+ * Each PostgreSQL schema is its own Paimon database, so a table lives at
+ * {@code <warehouse>/<schema>.db/<table>}. Pass {@code <warehouse>/<schema>.db}
+ * as the first argument, for example {@code /wh/public.db}.
+ *
+ * Tables are written with a fixed bucket count, so their files are spread over
+ * several bucket directories. merge-engine options are stripped and bucket is
+ * set to -1 so Paimon reads every file as an unordered table.
  *
  * Usage:
- *   java -jar paimon-reader.jar [warehouse] [table]
+ *   java -jar paimon-reader.jar [warehouse/<schema>.db] [table]
  */
 public class PaimonRead {
 
@@ -45,8 +48,8 @@ public class PaimonRead {
 
         // Strip merge-engine options and force bucket=-1 so the table is read
         // as an unordered append table regardless of how it was originally written.
-        // This handles tables written by paimon_heap which use a fixed bucket-0
-        // directory without registering a bucket-key in the schema.
+        // Fixed-bucket tables spread their files over bucket-0, bucket-1, ... and
+        // forcing -1 makes the reader take them all without a bucket key.
         Map<String, String> opts = new HashMap<>(stored.options());
         opts.put("bucket", "-1");
         for (String k : Arrays.asList("merge-engine", "changelog-producer", "sequence.field"))

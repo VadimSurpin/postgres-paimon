@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 import java.util.*;
 
 /**
- * Integration test suite for paimon_heap extension features.
+ * Integration test suite for paimon_slot / paimon-writer features.
  *
  * Tests:
  *   T1  Basic INSERT capture
@@ -236,10 +236,6 @@ public class PaimonFeatureTest {
         String tbl = "ft_fieldname_test";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            // Reset metadata fields so we don't confuse the schema
-            setGuc(conn, "paimon_heap.meta_field_xid", "");
-            setGuc(conn, "paimon_heap.meta_field_op",  "");
-            setGuc(conn, "paimon_heap.meta_field_tid", "");
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1)");
@@ -258,9 +254,6 @@ public class PaimonFeatureTest {
         String tbl = "ft_schema_test";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            setGuc(conn, "paimon_heap.meta_field_xid", "");
-            setGuc(conn, "paimon_heap.meta_field_op",  "");
-            setGuc(conn, "paimon_heap.meta_field_tid", "");
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, name TEXT, score BIGINT");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'Alice',100)");
@@ -286,9 +279,6 @@ public class PaimonFeatureTest {
         // Verifies the proxy-relation scan fix works.
         String tbl = "ft_text_test";
         try (Connection conn = connect()) {
-            setGuc(conn, "paimon_heap.meta_field_xid", "");
-            setGuc(conn, "paimon_heap.meta_field_op",  "");
-            setGuc(conn, "paimon_heap.meta_field_tid", "");
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             // TEXT column triggers TOAST table creation, which uses heap_getnext()
             String cols = "id INT PRIMARY KEY, a TEXT, b TEXT, c TEXT";
@@ -335,10 +325,6 @@ public class PaimonFeatureTest {
 
     static void exec(Connection c, String sql) throws SQLException {
         try (Statement s = c.createStatement()) { s.execute(sql); }
-    }
-
-    static void setGuc(Connection c, String name, String value) throws SQLException {
-        noGuc();
     }
 
     static void cleanup(String tbl) {
@@ -457,7 +443,7 @@ public class PaimonFeatureTest {
 
     // ── Slot-architecture setup helpers (the only thing the port changes) ─────
 
-    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    /** Creates a tracked table: CREATE TABLE, then register it with paimon.add_table(). */
     static void createTracked(Connection conn, String tbl, String columns) throws Exception {
         exec(conn, "DROP TABLE IF EXISTS " + tbl);
         exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
@@ -473,16 +459,6 @@ public class PaimonFeatureTest {
     /** These suites create every table in PG_SCHEMA. */
     static String tableDir(String tbl) {
         return tableDir(PG_SCHEMA, tbl);
-    }
-
-    static boolean gucNoteLogged = false;
-
-    /** paimon_heap.* GUCs no longer exist: metadata columns are writer-side configuration. */
-    static void noGuc() {
-        if (!gucNoteLogged) {
-            gucNoteLogged = true;
-            System.out.println("  note: paimon_heap.* GUCs are no-ops in the slot architecture");
-        }
     }
 
     static String env(String name, String dflt) {

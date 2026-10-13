@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Unit tests for Paimon schema management using LocalFileIO.
  *
  * These tests run without any external services and verify the schema
- * evolution behaviour that paimon_heap relies on: create, add-field,
+ * evolution behaviour that paimon-writer relies on: create, add-field,
  * drop-field, rename-field, and type-change.  They also document the
  * "missing column reads as NULL" behaviour that is the root cause of gap #2
  * (default values are not backfilled into historical Parquet files).
@@ -399,7 +399,7 @@ class PaimonSchemaIT {
         SchemaManager sm = schemaManager("t_gap2");
         sm.createTable(baseSchema());
 
-        // Simulate what paimon_heap bgworker does: ddlAddField writes schema-1
+        // Simulate a field being added: a new schema-1 file is written
         // with the new column, but NO default expression is stored.
         sm.commitChanges(SchemaChange.addColumn("email", DataTypes.STRING()));
 

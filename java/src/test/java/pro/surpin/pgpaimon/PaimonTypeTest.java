@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 import java.util.*;
 
 /**
- * Tests paimon_heap capture of all supported PostgreSQL column types.
+ * Tests capture of all supported PostgreSQL column types by paimon-writer.
  *
  * For each type:
  *   1. Create a table with that type as a column
@@ -96,7 +96,7 @@ public class PaimonTypeTest {
         jdbcUrl   = args.length > 1 ? args[1] : DEFAULT_JDBC;
 
         System.out.println("╔════════════════════════════════════════════════════╗");
-        System.out.println("║         paimon_heap Type Coverage Tests            ║");
+        System.out.println("║         paimon_slot Type Coverage Tests            ║");
         System.out.println("╚════════════════════════════════════════════════════╝");
         System.out.printf("  Warehouse : %s%n", warehouse);
         System.out.printf("  JDBC      : %s%n", jdbcUrl);
@@ -130,7 +130,6 @@ public class PaimonTypeTest {
         String tbl = "type_all_cols";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             StringBuilder ddl = new StringBuilder("id INT PRIMARY KEY");
             for (TypeCase tc : CASES) ddl.append(", ").append(tc.colType).append(" ").append(tc.pgType);
@@ -175,7 +174,6 @@ public class PaimonTypeTest {
         String tbl = "type_nulls";
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, c_int INT, c_text TEXT, c_date DATE");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1, NULL, NULL, NULL)");
@@ -201,7 +199,6 @@ public class PaimonTypeTest {
         String tbl = "type_" + colName;
         cleanup(tbl);
         try (Connection conn = connect()) {
-            disableMetaFields(conn);
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             createTracked(conn, tbl, "id INT PRIMARY KEY, " + colName + " " + pgType + "");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1, " + value + ")");
@@ -220,10 +217,6 @@ public class PaimonTypeTest {
 
     static void exec(Connection c, String sql) throws SQLException {
         try (Statement s = c.createStatement()) { s.execute(sql); }
-    }
-
-    static void disableMetaFields(Connection c) throws SQLException {
-        noGuc();
     }
 
     static void cleanup(String tbl) {
@@ -297,7 +290,7 @@ public class PaimonTypeTest {
 
     // ── Slot-architecture setup helpers (the only thing the port changes) ─────
 
-    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    /** Creates a tracked table: CREATE TABLE, then register it with paimon.add_table(). */
     static void createTracked(Connection conn, String tbl, String columns) throws Exception {
         exec(conn, "DROP TABLE IF EXISTS " + tbl);
         exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
@@ -313,16 +306,6 @@ public class PaimonTypeTest {
     /** These suites create every table in PG_SCHEMA. */
     static String tableDir(String tbl) {
         return tableDir(PG_SCHEMA, tbl);
-    }
-
-    static boolean gucNoteLogged = false;
-
-    /** paimon_heap.* GUCs no longer exist: metadata columns are writer-side configuration. */
-    static void noGuc() {
-        if (!gucNoteLogged) {
-            gucNoteLogged = true;
-            System.out.println("  note: paimon_heap.* GUCs are no-ops in the slot architecture");
-        }
     }
 
     static String env(String name, String dflt) {

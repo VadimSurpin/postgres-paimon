@@ -1,10 +1,3 @@
-# Build artifacts — C++ extension
-extension/*.o
-extension/*.so
-extension/*.a
-extension/*.bc
-extension/*.bc.tmp
-
 # Build artifacts — Java
 java/target/
 java/dependency-reduced-pom.xml

@@ -8,7 +8,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Paimon-Spark compaction job for paimon_heap CDC tables.
+ * Paimon-Spark compaction job for tables written by paimon-writer.
  *
  * For each table in the warehouse:
  *   1. Sets changelog-producer=input so that Paimon uses the row kind values

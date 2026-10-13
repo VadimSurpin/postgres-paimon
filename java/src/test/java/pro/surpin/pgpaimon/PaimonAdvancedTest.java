@@ -838,7 +838,7 @@ public class PaimonAdvancedTest {
         try (Statement s = c.createStatement()) { s.execute(sql); }
     }
 
-    /** Creates a tracked table.  Replaces "USING paimon_heap" from the TAM architecture. */
+    /** Creates a tracked table: CREATE TABLE, then register it with paimon.add_table(). */
     static void createTracked(Connection conn, String tbl, String columns) throws Exception {
         exec(conn, "DROP TABLE IF EXISTS " + tbl);
         exec(conn, "CREATE TABLE " + tbl + " (" + columns + ")");
