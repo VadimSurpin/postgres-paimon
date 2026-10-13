@@ -507,8 +507,15 @@ public final class Main {
                         mini.flushBuffered();
                         barrier = true;
                     }
-                    target.truncate(relid, c.commitLsn());
-                    mini.noteCommitted(relid, c.commitLsn());
+                    // Under commitLsn - 1, not commitLsn: the records this transaction made
+                    // AFTER the truncate (TxnBatcher dropped the ones before it) are committed
+                    // next, under commitLsn, and the per-table rule-4 filter drops a record whose
+                    // transaction's commit LSN is at or below the table's committed identifier.
+                    // One below is still above every earlier transaction (each commit record
+                    // has its own, lower, LSN), and a replay converges: the overwrite is
+                    // filtered at commitLsn - 1, and the records only once commitLsn is in.
+                    target.truncate(relid, c.commitLsn() - 1);
+                    mini.noteCommitted(relid, c.commitLsn() - 1);
                 }
                 pendingTruncates.clear();
             }

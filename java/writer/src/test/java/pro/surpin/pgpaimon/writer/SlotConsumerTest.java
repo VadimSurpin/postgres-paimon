@@ -92,14 +92,14 @@ class SlotConsumerTest {
     }
 
     @Test
-    void aTruncateIsBufferedAndAppliedAtCommitUnderTheCommitLsn() throws Exception {
+    void aTruncateIsBufferedAndAppliedAtCommitJustBelowTheCommitLsn() throws Exception {
         Fixture f = new Fixture();
         f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
         f.handler.onEvent(new PgEvent.Truncate(List.of(1L, 99L), false, false), 41L);
         assertEquals(List.of(), f.calls, "nothing may be applied before the Commit is known");
         f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
         // the untracked relation 99 is dropped; the truncate precedes the confirm
-        assertEquals(List.of("truncate1@50", "flush@50", "confirm@55"), f.calls);
+        assertEquals(List.of("truncate1@49", "flush@50", "confirm@55"), f.calls);
         assertEquals(List.of(55L), f.confirmed);
     }
 
@@ -146,10 +146,11 @@ class SlotConsumerTest {
     void aBatcherFailurePropagatesRatherThanBeingSwallowed() throws Exception {
         Fixture f = new Fixture();
         f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
-        f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 41L);
         f.handler.onEvent(new PgEvent.Relation(META), 0L);
-        // truncate then DML on the same table: the batcher refuses; the handler must not hide it
-        assertThrows(IllegalStateException.class, () -> f.handler.onEvent(insert(1, "1"), 42L));
+        // a DELETE with no old tuple (replica identity not FULL): the batcher refuses; the
+        // handler must not hide it
+        assertThrows(IllegalStateException.class, () -> f.handler.onEvent(
+            new PgEvent.Delete(1, new TupleData(List.of(ColumnValue.of("1"))), true), 42L));
         assertFalse(f.batcher.hasOpenTransaction());
     }
 
@@ -217,17 +218,37 @@ class SlotConsumerTest {
         f.handler.onEvent(insert(2, "5"), 292L);          // DML on ANOTHER table, same transaction
         f.handler.onEvent(new PgEvent.Commit(300, 310, 0L), 300L);
 
-        assertEquals(List.of("flush@100", "confirm@110", "truncate1@300"), f.calls,
+        assertEquals(List.of("flush@100", "confirm@110", "truncate1@299"), f.calls,
             "earlier append, then the overwrite under this transaction's commit LSN; the"
             + " remainder waits in a new buffer");
         assertTrue(f.mini.hasBuffered());
         assertEquals(List.of(110L), f.confirmed, "the truncating transaction is not confirmed yet");
 
         f.handler.onShutdown();
-        assertEquals(List.of("flush@100", "confirm@110", "truncate1@300", "flush@300", "confirm@310"),
+        assertEquals(List.of("flush@100", "confirm@110", "truncate1@299", "flush@300", "confirm@310"),
             f.calls);
         assertEquals(1, f.flushed.get(1).size());
         assertEquals(2L, f.flushed.get(1).get(0).relid());
+    }
+
+    /**
+     * BEGIN; TRUNCATE t; INSERT INTO t ...; COMMIT. The overwrite goes in one below the commit
+     * LSN, so the per-table "already committed" rule does not then drop the rows inserted after
+     * it: under the commit LSN itself they were filtered as a replay and silently lost.
+     */
+    @Test
+    void rowsInsertedAfterATruncateInTheSameTransactionAreCommittedAfterTheOverwrite()
+            throws Exception {
+        Fixture f = new Fixture();
+        f.handler.onEvent(new PgEvent.Relation(META), 0L);
+        f.handler.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        f.handler.onEvent(insert(1, "old"), 41L);
+        f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 42L);
+        f.handler.onEvent(insert(1, "new"), 43L);
+        f.handler.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L);
+        assertEquals(List.of("relation1", "truncate1@49", "flush@50", "confirm@55"), f.calls);
+        assertEquals(1, f.flushed.get(0).size(), "the row inserted after the truncate");
+        assertEquals(List.of("new"), f.flushed.get(0).get(0).values());
     }
 
     @Test
@@ -236,7 +257,7 @@ class SlotConsumerTest {
         f.handler.onEvent(new PgEvent.Begin(310, 0L, 7L), 290L);
         f.handler.onEvent(new PgEvent.Truncate(List.of(1L), false, false), 291L);
         f.handler.onEvent(new PgEvent.Commit(300, 310, 0L), 300L);
-        assertEquals(List.of("truncate1@300", "flush@300", "confirm@310"), f.calls);
+        assertEquals(List.of("truncate1@299", "flush@300", "confirm@310"), f.calls);
     }
 
     @Test

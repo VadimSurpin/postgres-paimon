@@ -205,24 +205,43 @@ class TxnBatcherTest {
         assertEquals(1110L, rec.endLsns.get(0));
     }
 
+    /**
+     * BEGIN; TRUNCATE t; INSERT INTO t ...; COMMIT -- reloading a table. It used to throw, and
+     * the transaction replayed on every restart: a poison record from ordinary SQL. The record
+     * after the truncate is kept (the caller applies the overwrite first).
+     */
     @Test
-    void recordAfterTruncateOfSameTableThrowsNamingTheTable() throws Exception {
-        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+    void aRecordAfterTruncateOfTheSameTableIsKept() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
         b.onEvent(new PgEvent.Begin(1200L, 0L, 1L), 1200L, null);
         b.onEvent(trunc(16412), 1205L, null);
-        IllegalStateException e = assertThrows(IllegalStateException.class,
-            () -> b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1210L, META));
-        assertTrue(e.getMessage().contains("16412"), e.getMessage());
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1210L, META);
+        b.onEvent(new PgEvent.Commit(1200L, 1220L, 0L), 1220L, null);
+        assertEquals(1, rec.batches.get(0).size());
+        assertEquals(List.of("1", "a"), rec.batches.get(0).get(0).values());
     }
 
+    /** INSERT, then TRUNCATE, then INSERT: only what follows the truncate survives, in order. */
     @Test
-    void truncateAfterRecordOfSameTableThrowsNamingTheTable() throws Exception {
-        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+    void aTruncateRemovesOnlyTheRecordsOfItsTableThatPrecedeIt() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+        RelationMeta other = new RelationMeta(77777, "public", "u", List.of("id", "v"),
+                                              List.of(true, false));
         b.onEvent(new PgEvent.Begin(1300L, 0L, 1L), 1300L, null);
-        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1310L, META);
-        IllegalStateException e = assertThrows(IllegalStateException.class,
-            () -> b.onEvent(trunc(16412), 1320L, null));
-        assertTrue(e.getMessage().contains("16412"), e.getMessage());
+        b.onEvent(new PgEvent.Insert(16412, row("1", "gone")), 1310L, META);
+        b.onEvent(new PgEvent.Insert(77777, row("9", "kept")), 1311L, other);
+        b.onEvent(trunc(16412), 1320L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("2", "after")), 1330L, META);
+        b.onEvent(trunc(16412), 1340L, null);                      // a second truncate
+        b.onEvent(new PgEvent.Insert(16412, row("3", "last")), 1350L, META);
+        b.onEvent(new PgEvent.Commit(1300L, 1360L, 0L), 1360L, null);
+        List<SinkRecord> got = rec.batches.get(0);
+        assertEquals(2, got.size(), got.toString());
+        assertEquals(List.of("9", "kept"), got.get(0).values());
+        assertEquals(List.of("3", "last"), got.get(1).values());
+        assertEquals(1350L, got.get(1).seq());
     }
 
     @Test
@@ -261,19 +280,6 @@ class TxnBatcherTest {
         assertThrows(IllegalStateException.class,
             () -> b.onEvent(new PgEvent.Commit(1700L, 1730L, 0L), 1730L, null));
         assertTrue(rec.batches.isEmpty(), "a partial batch must never be flushed");
-    }
-
-    @Test
-    void aTruncateConflictAlsoLeavesNothingOpen() throws Exception {
-        Recorder rec = new Recorder();
-        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
-        b.onEvent(new PgEvent.Begin(1800L, 0L, 1L), 1800L, null);
-        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1810L, META);
-        assertThrows(IllegalStateException.class, () -> b.onEvent(trunc(16412), 1820L, null));
-        assertFalse(b.hasOpenTransaction());
-        assertThrows(IllegalStateException.class,
-            () -> b.onEvent(new PgEvent.Commit(1800L, 1830L, 0L), 1830L, null));
-        assertTrue(rec.batches.isEmpty());
     }
 
     @Test
