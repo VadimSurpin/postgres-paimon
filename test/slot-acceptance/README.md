@@ -17,10 +17,10 @@ script — and runs all eight:
     SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
     PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
 
-That is **186 checks** (plus T18 not run without MinIO). It prints the list it is about to run.
+That is **238 checks** (plus T18 not run without MinIO). It prints the list it is about to run.
 `PaimonE2ETest` is deliberately not in it: it is not ported to this architecture, and naming it
 fails the run by design. The selection is never left to Surefire's default includes — doing so
-picked up only the two `*IT` suites, 24 of the 186 checks, and still printed `ALL SUITES PASSED`.
+picked up only the two `*IT` suites, 24 of the 238 checks, and still printed `ALL SUITES PASSED`.
 
 With names, it runs exactly those plus the smoke suite, which streams an insert, update and delete
 and waits for them in Paimon: `-Dtest=SlotHarnessSmokeIT,Name1,...`.

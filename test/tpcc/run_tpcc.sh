@@ -38,16 +38,17 @@ READER_JAR="$REPO/java/target/paimon-reader-1.0.jar"
 BENCHBASE_REF="${BENCHBASE_REF:-v2023}"
 WAREHOUSES="${TPCC_WAREHOUSES:-1}"
 TIME_S="${TPCC_TIME:-60}"
-# 25, not "as fast as it goes". The writer makes one Paimon snapshot per replicated
-# transaction, and both the drain and the changelog scan are linear in that count, so the
-# transaction rate -- not the row count -- is what sets this harness's runtime. 60s at 25 tps
+# 25, not "as fast as it goes". The writer commits batches of whole transactions (up to
+# PGPAIMON_BATCH_MAX_ROWS rows, _MAX_BYTES bytes or _MAX_INTERVAL_MS ms; PGPAIMON_BATCH_MAX_ROWS=1
+# restores one Paimon snapshot per transaction), and both the drain and the changelog scan are
+# linear in the snapshot count, so the transaction rate is what sets this harness's runtime. 60s at 25 tps
 # is ~1500 transactions: enough for ~650 Payments, ~675 NewOrders and ~60 Deliveries, which is
 # every update and delete path TPC-C has. Raise it if you want more; it costs time, not rigour.
 RATE="${TPCC_RATE:-25}"
 TERMINALS="${TPCC_TERMINALS:-1}"
 BATCHSIZE="${TPCC_BATCHSIZE:-1024}"
 READY_TIMEOUT="${READY_TIMEOUT:-60}"
-DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-1800}"         # the writer commits once per PostgreSQL transaction
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-1800}"         # with PGPAIMON_BATCH_MAX_ROWS=1 the writer commits once per transaction
 COMPARE_HEAP="${COMPARE_HEAP:-3g}"
 PIDFILE="$RUN/writer.pid"
 WRITER_PID=""
@@ -140,7 +141,7 @@ write_config() {
     <password></password>
     <isolation>TRANSACTION_SERIALIZABLE</isolation>
     <!-- Rows per loader batch, and so rows per PostgreSQL transaction, and so rows per Paimon
-         commit: the writer commits once per transaction and never splits one. Larger batches
+         commit: the writer never splits a transaction, and commits several together. Larger batches
          keep the snapshot count (and the run time) sane without weakening anything. -->
     <batchsize>$BATCHSIZE</batchsize>
     <scalefactor>$WAREHOUSES</scalefactor>

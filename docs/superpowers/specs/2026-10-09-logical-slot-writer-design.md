@@ -423,16 +423,22 @@ same versions. One responsibility per class; each testable without the others.
 | `SchemaRegistry` | PG relid → Paimon `Identifier`; applies evolution; owns field-id ↔ column mapping | Paimon `Catalog` |
 | `ToastResolver` | fills `u` columns in the new tuple from the old tuple; decomposes key changes into `-D` + `+I` | — |
 | `TxnBatcher` | groups by transaction, preserves LSN order, flushes on the transaction boundary **only** | — |
+| `MiniBatcher` | accumulates completed transactions and commits them together on a row, byte or interval limit; drops transactions a table already holds (§7) | — |
 | `PaimonSink` | `TableWriteImpl` writes, commit with identifier | Paimon |
 | `Backfiller` | exported-snapshot COPY → `+I` rows | PgJDBC, `PaimonSink` |
 | `OffsetStore` | last committed LSN, read back from Paimon snapshots | Paimon |
 
-**Amendment (final whole-branch review):** "or size" above was wrong and a size trigger must not
-exist. A batch is one committed transaction or nothing (section 7, "Complete transactions only"),
-so splitting on a record count would break atomicity and let the slot advance past records that
-were never written. `PGPAIMON_FLUSH_MAX_RECORDS` is therefore the chunk size of the **initial
-load** only, where each chunk is a commit of its own. A `PGPAIMON_FLUSH_MAX_INTERVAL_MS` was
-parsed and never read; it has been removed rather than implemented, for the same reason.
+**Amendment (final whole-branch review):** "or size" above was wrong *as a trigger inside
+`TxnBatcher`*. A transaction is one committed unit or nothing (section 7, "Complete transactions
+only"), so splitting one on a record count would break atomicity and let the slot advance past
+records that were never written. `PGPAIMON_FLUSH_MAX_RECORDS` is therefore the chunk size of the
+**initial load** only, where each chunk is a commit of its own.
+
+**Amendment (mini-batch commits):** the limits do exist now, one layer up, and they never split a
+transaction: `MiniBatcher` accumulates *whole, completed* transactions and commits them together
+on `PGPAIMON_BATCH_MAX_ROWS`, `PGPAIMON_BATCH_MAX_BYTES` or `PGPAIMON_BATCH_MAX_INTERVAL_MS`
+(§7, "Effectively-once"). The streaming batch limits and the backfill's
+`PGPAIMON_FLUSH_MAX_RECORDS` are different settings for different paths and do not interact.
 
 ### Slot connection
 
@@ -570,36 +576,89 @@ never contains a transaction that has not committed.
 
 ### Effectively-once
 
-1. `TxnBatcher` accumulates complete transactions only — never a partial one.
-2. `PaimonSink` commits with `commitIdentifier = commit_lsn` under a fixed `commitUser`,
-   through `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
-3. Only after the Paimon commit returns does `SlotConsumer` advance the flushed and
-   applied LSN.
-4. On restart, `OffsetStore` reads the highest committed identifier for that `commitUser`
-   from the Paimon snapshots and resumes the slot from it. `filterAndCommit` discards
-   commits whose identifier that `commitUser` has already used, so replayed transactions
-   are idempotent.
+*Amended for mini-batch commits.* The commit unit is a **batch** of whole transactions, not one
+transaction.
 
-Two details carry the whole guarantee, and both were established by measurement rather than
-from the API's shape (§12, spike 3):
+1. `TxnBatcher` accumulates complete transactions only — never a partial one — and hands each to
+   `MiniBatcher` as it completes.
+2. `MiniBatcher` buffers completed transactions and flushes when any of three limits is reached:
+   change records buffered (`PGPAIMON_BATCH_MAX_ROWS`, default 10,000), estimated text payload
+   (`PGPAIMON_BATCH_MAX_BYTES`, default 16 MiB: the character count of every non-NULL value plus
+   48 bytes per record), or time since the buffer's **first** transaction
+   (`PGPAIMON_BATCH_MAX_INTERVAL_MS`, default 2,000). A limit is checked only between whole
+   transactions, so none can split one. The time limit is checked on every event and from an idle
+   callback on the single consumer thread; there is no timer thread.
+3. A batch never spans a schema change or an overwrite. Records are built against the schema
+   current at flush time, so the buffer is flushed **before** a DDL message is applied, **before**
+   a truncate is applied (under its own transaction's commit LSN; the rest of that transaction
+   starts a new buffer) and before a changed relation description is accepted.
+4. At assembly, a transaction's records for a table are **dropped if its commit LSN is at or below
+   that table's highest committed identifier** (per table; read from Paimon once and kept current
+   in memory, re-read after any DDL). See "Why a timeout needs rule 4" below.
+5. `PaimonSink` commits the batch with `commitIdentifier` = the commit LSN of the **last**
+   transaction in it, under a fixed `commitUser`, through
+   `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
+6. Only after the Paimon commit returns does `SlotConsumer` advance the flushed and applied LSN,
+   and it advances it to the **last** transaction's end LSN. Buffered, uncommitted transactions are
+   never confirmed.
+7. On restart, `OffsetStore` reads the highest committed identifier for that `commitUser` from the
+   Paimon snapshots and resumes the slot from it (the minimum across tables). `filterAndCommit`
+   discards commits whose identifier is at or below one that `commitUser` has already used, and
+   rule 4 discards the overlapping case it cannot, so replayed transactions are idempotent.
+
+Failure handling around the buffer: an exception from the commit is fatal and nothing after it is
+confirmed; on connection loss the buffer is discarded (the transactions are complete but
+unconfirmed and replay); on a clean stop the buffer is committed and confirmed before the final
+status update. Memory is bounded by the row and byte limits plus the one transaction that crossed
+them. `PGPAIMON_BATCH_MAX_ROWS=1` reproduces one commit per transaction exactly.
+
+Three details carry the whole guarantee, established by measurement rather than from the API's
+shape (§12, spike 3, and the mini-batch experiment):
 
 - **`commit(identifier, messages)` does not deduplicate.** Replaying an already-committed
   identifier through it produces a second snapshot carrying duplicate data *and* duplicate
   changelog entries. Only `filterAndCommit` consults the committed-identifier set. The
   distinction is invisible until a crash recovery replays a transaction, which is precisely
   when it matters, so the plain `commit` overload must not appear in the writer.
+- **`filterAndCommit` discards a commit whose identifier is at or below the latest one the commit
+  user has committed, not merely an exact match.** Measured on Paimon 1.4.1, one table, one user:
+  10 committed; then 7 is discarded, 12 is committed, 12 again is discarded, 11 (below the latest
+  12) is discarded, 10 again is discarded; a different user's 3 is committed. So a replay that is
+  regrouped to end *lower* is already filtered, and only a regrouping that ends *higher* and
+  overlaps is dangerous.
 - **`commitUser` must be stable across process restarts.** Deduplication is scoped to the
   user, so a per-process UUID — the obvious default for a Paimon writer — would make every
   restart a fresh identity whose replay nothing filters. The writer derives it from the
   replication slot name, which is already unique per writer (§4) and already durable.
 
-Commit identity remains the transaction's commit LSN even though sequencing uses
-per-change LSNs: the commit is the unit of atomicity, the per-change LSN the unit of
-ordering. The two never need to agree.
+#### Why a timeout needs rule 4
+
+A size limit is a deterministic function of the stream, so a replay regroups identically. A time
+limit is not: after a crash the same transactions can be grouped differently. Suppose T1..T10
+committed under L10 and the process died before the server learned of it. On replay the timer
+fires later and produces T1..T12 under L12. L12 > L10, so `filterAndCommit` commits it, and
+T1..T10 are in the table twice. The merged table survives (`deduplicate` over `sequence.field =
+_seq,_op_seq`, both per-change, collapses identical records), but `changelog-producer = input`
+writes **every** input record, so the changelog would carry the duplicates and effectively-once
+would silently become at-least-once exactly where the exactness assertions live (`-U == +U`,
+`+I − -D == row count` in T2 and the TPC-C comparison).
+
+Rule 4 closes it, and it has the same shape as `filterAndCommit` and the DDL LSN gate, applied per
+transaction instead of per commit. It must be **per table**: the sink commits table by table, so a
+transaction touching A and B where A is already committed past it and B is not (the partly
+committed case the minimum-across-tables resume rule exists for) applies to B alone. Backfill
+identifiers (`cp - chunks + 1 .. cp`) and truncate identifiers count as committed identifiers.
+
+Commit identity is the **last transaction's** commit LSN even though sequencing uses per-change
+LSNs: the commit is the unit of atomicity, the per-change LSN the unit of ordering. The two never
+need to agree, and the several transactions in a batch share one identifier but keep distinct
+`_seq` values, so ordering is unaffected.
 
 Confirming the LSN only after the Paimon commit returns is what makes crash recovery a
 property of the code rather than best-effort, and is why `extension/paimon_wal.cpp` has no
-counterpart here.
+counterpart here. pgjdbc advances its own flushed position on a keepalive, gated on
+`explicitlyFlushedLSN >= startOfLastMessageLSN`; with a batch sitting in the buffer across idle
+keepalives that gate was re-verified live (T16c) rather than assumed.
 
 ---
 

@@ -27,9 +27,10 @@ directory, S3/HDFS offload GUCs) applies to the logical-slot architecture.
 
 Data flow: user DML hits an ordinary heap table. The publication `paimon_pub` feeds replication
 slot `paimon` (pgoutput, text mode). The writer decodes it, batches complete transactions, and
-commits them to Paimon with the transaction's commit LSN as the commit identifier. Only after a
-Paimon commit succeeds does the writer confirm that LSN to PostgreSQL, so a crash replays rather
-than loses (and replays are idempotent).
+commits them to Paimon in **batches** of several whole transactions, using the commit LSN of the
+batch's last transaction as the commit identifier. Only after a Paimon commit succeeds does the
+writer confirm that transaction's end LSN to PostgreSQL, so a crash replays rather than loses (and
+replays are idempotent, see "Commit batching").
 
 ## 2. Setup
 
@@ -41,7 +42,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 240 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 279 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -79,19 +80,93 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_COMMIT_USER` | `paimon-writer-<slot>` | **must stay stable across restarts**: replay deduplication is scoped to it |
 | `PGPAIMON_SEQ_FIELD`, `PGPAIMON_OP_SEQ_FIELD` | `_seq`, `_op_seq` | mandatory metadata columns (sequencing) |
 | `PGPAIMON_XID_FIELD` | unset (**off**) | set to e.g. `_xid` to add the transaction id column |
-| `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per commit during the **initial load** only; it is not a streaming batch size (see below) |
+| `PGPAIMON_BATCH_MAX_ROWS` | `10000` | **streaming** commit batch: change records (an UPDATE is two) buffered before a commit. See "Commit batching" |
+| `PGPAIMON_BATCH_MAX_BYTES` | `16777216` (16 MiB) | streaming commit batch: estimated size of the buffered text payload |
+| `PGPAIMON_BATCH_MAX_INTERVAL_MS` | `2000` | streaming commit batch: longest a transaction waits for its commit, counted from the batch's **first** transaction. Bounds replication latency |
+| `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per COPY chunk during the **initial load** only (each chunk is a commit of its own). **Not** the streaming batch size: that is `PGPAIMON_BATCH_MAX_ROWS`. The two do not interact |
 | `PGPAIMON_SKIP_LSN` | unset | emergency escape for a single poison record: the change LSN of the ONE record to drop. Read section 3, "A record the writer can never apply", before setting it |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 
 `_xid` is off by default because it is optional (spec section 6). The acceptance harness sets
 `PGPAIMON_XID_FIELD=_xid` because test T4 asserts the column exists; do not remove that.
 
-**There is no streaming flush interval or flush size, and there must not be one.** A batch is one
-committed PostgreSQL transaction or nothing, so a timer or a record count could only split a
-transaction — which breaks atomicity and lets the slot advance past records that were never
-written. `PGPAIMON_FLUSH_MAX_RECORDS` applies to the initial load, where each chunk is a commit of
-its own. (A `PGPAIMON_FLUSH_MAX_INTERVAL_MS` was parsed but never read; it has been removed rather
-than implemented.)
+### Commit batching
+
+A PostgreSQL transaction is **not** one Paimon commit. The writer accumulates completed
+transactions and commits them together, because a Paimon commit costs a snapshot, a manifest and
+at least one file per touched bucket however small the change: committing every transaction left
+the ten-row TPC-C `district` table with 1,664 snapshots and 12,391 files (see the measured
+before/after below). The batch is flushed when **any one** of three limits is reached:
+
+| Limit | Default | Counted |
+|---|---|---|
+| `PGPAIMON_BATCH_MAX_ROWS` | 10,000 | change records buffered (an UPDATE is a `-U` and a `+U`: two) |
+| `PGPAIMON_BATCH_MAX_BYTES` | 16 MiB | an estimate of the buffered text payload: the character count of every non-NULL value plus 48 bytes per record |
+| `PGPAIMON_BATCH_MAX_INTERVAL_MS` | 2,000 | milliseconds since the batch's **first** transaction was added; later traffic does not postpone it |
+
+**The trade-off.** Larger limits mean fewer snapshots and files (cheaper read planning, a smaller
+`manifest/` and `snapshot/`, less compaction) and a longer wait before a committed PostgreSQL
+change is visible in Paimon: replication latency is bounded by `PGPAIMON_BATCH_MAX_INTERVAL_MS`
+plus the time to commit (plus up to ten seconds before the server learns the position was
+confirmed, which only affects WAL retention, not visibility). Smaller limits mean the opposite.
+At the default, a table that is written continuously gets at most one snapshot per two seconds
+however many transactions arrive, and a row is visible within about two seconds.
+
+**Operator tuning.**
+* Need rows visible sooner: lower `PGPAIMON_BATCH_MAX_INTERVAL_MS` (it can be `0`, which commits as
+  soon as a transaction completes). The snapshot count rises with it.
+* Seeing too many small files or snapshots: raise the interval, not the row limit. On a steady
+  stream the interval is what closes batches; the row and byte limits are the memory ceiling for
+  bursts.
+* Memory: the buffer holds at most the row and byte limits **plus the one transaction that crossed
+  them**, and the transaction being assembled. A limit is checked between whole transactions and
+  never splits one, so a single huge transaction is committed whole regardless of the limits.
+* `PGPAIMON_BATCH_MAX_ROWS=1` reproduces the previous behaviour exactly, one Paimon commit per
+  PostgreSQL transaction. It is the regression switch and the A/B baseline.
+* Each limit has a minimum: rows and bytes at least 1, the interval at least 0. Anything else
+  refuses to start.
+
+**What the commit looks like.** The commit identifier is the commit LSN of the **last**
+transaction in the batch, and the position confirmed to PostgreSQL is that transaction's end LSN,
+sent only after the commit has returned. Transactions that are buffered but not yet committed are
+never confirmed. Empty transactions (DDL only, or touching only untracked tables) with nothing
+buffered are confirmed at once with no snapshot; behind buffered data they queue with it.
+
+**A batch never spans a schema change or an overwrite.** Records are built against the table's
+schema as it is when the batch is flushed, so a batch holding records from before and after an
+`ALTER TABLE` would have inconsistent shapes under one commit. So the writer flushes the buffer
+**before** it applies a DDL message, **before** it applies a `TRUNCATE` (the overwrite keeps
+today's order: after every earlier append, before every later one) and before it accepts a
+changed relation description. The remainder of a truncating transaction starts a new buffer.
+
+**Why the grouping is not deterministic, and what the writer does about it.** A size limit is a
+function of the stream: replayed, it regroups identically. The time limit is not. Suppose a batch
+of T1..T10 commits under identifier L10 and the process dies before the server learns the position
+was confirmed. After the restart the same transactions are replayed, but the timer fires at a
+different moment and produces T1..T12 under L12. Paimon's `filterAndCommit` discards a commit whose
+identifier is **at or below the highest one this commit user has committed** (measured on 1.4.1:
+with 10 committed, 7, 10 and 11 after 12 are discarded; 12 after 10 is committed). A regrouping
+that ends lower is therefore filtered, but L12 is higher than L10, so it commits, and T1..T10 are
+in the table twice. The merged table survives, since `deduplicate` on `(_seq, _op_seq)` collapses
+identical records, but `changelog-producer = input` writes **every** input record, so the changelog
+would carry the duplicates and effectively-once would silently become at-least-once exactly where
+`-U == +U` and `+I - -D == row count` are asserted.
+
+The rule that prevents it: **when a batch is assembled, a transaction's records for a table are
+dropped if the transaction's commit LSN is at or below that table's highest committed identifier.**
+It is per table because the writer commits table by table: a transaction touching A and B, where A
+is already committed past it and B is not (a crash between the two commits), applies to B alone.
+The identifier is read from Paimon once per table, kept current in memory after every commit and
+truncate, and re-read after any DDL message. Backfill and truncate identifiers count too, since
+they are snapshots of the same commit user. A test pins it against the real Paimon: without the
+rule, the T1..T10 then T1..T12 replay leaves 22 inserts in the changelog for 12 rows.
+
+**Failure behaviour is unchanged.** An exception from the commit is fatal and nothing after it is
+confirmed. On connection loss the buffer is discarded (complete but unconfirmed transactions
+replay from the last confirmed position). On a clean stop (SIGTERM) the buffer is committed and
+confirmed before the final status update. There is no timer thread: the single consumer thread
+checks the interval on every event and on an idle callback roughly every 10 ms, which keeps the
+ordering and exception rules above checkable.
 
 ### Order of operations, and why it matters
 
@@ -350,7 +425,7 @@ survivable.
    LSN, and prints the variable to set with the LSN already in it:
 
    ```
-   ... POISON RECORD in public.v (INSERT at _seq 0/1C79B718), transaction committing at 0/1C79B830: column 'amt': cannot parse DECIMAL(10, 2) from "NaN" ... set PGPAIMON_SKIP_LSN=0/1C79B718 and restart ...
+   ... POISON RECORD in public.v (INSERT at _seq 0/1C79B718), in the commit batch ending at 0/1C79B830: column 'amt': cannot parse DECIMAL(10, 2) from "NaN" ... set PGPAIMON_SKIP_LSN=0/1C79B718 and restart ...
    ```
 2. **Inspect the row in PostgreSQL** before you discard anything: `SELECT * FROM v WHERE id = 2;`.
    Correct the value if you can. That does not unblock the slot — the old record is still in it —
@@ -423,10 +498,14 @@ on retry, but a replay that can never succeed stops the writer until somebody in
 * The writer is one process per slot. Multi-writer and HA are non-goals.
 * The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
-  (pgoutput `streaming` is off on purpose), so very large transactions need heap.
-* Stopping the writer with SIGTERM is safe at any time. A hard kill mid-batch is also safe: work
-  that was not committed to Paimon is replayed from the last confirmed LSN, and replay is idempotent
-  because the commit identifier is the transaction's commit LSN under a stable `commitUser`.
+  (pgoutput `streaming` is off on purpose), so very large transactions need heap. Completed
+  transactions then wait in the commit batch (see "Commit batching") up to its row, byte and
+  interval limits.
+* Stopping the writer with SIGTERM is safe at any time, and commits and confirms whatever is
+  buffered on the way out. A hard kill is also safe, mid-buffer or between a commit and its
+  confirm: work that was not committed to Paimon is replayed from the last confirmed LSN, and
+  replay is idempotent because a transaction already committed to a table is dropped at assembly
+  (see "Commit batching") and the commit user is stable.
 
 ## 4. `REPLICA IDENTITY FULL`
 
@@ -713,7 +792,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 240 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 279 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
@@ -723,7 +802,7 @@ port 5442 (leaving a cluster on 5441 alone), installs the extension from the wor
 jar locally, runs the JDBC suites and exits with their status. With no arguments it runs **every**
 suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDdlTest`,
 `PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`, named
-explicitly in the script's `ALL_SUITES` and printed at the start of the run — which is **186
+explicitly in the script's `ALL_SUITES` and printed at the start of the run — which is **238
 checks**. Name a subset to run just those (plus the smoke suite). A named suite that matches no
 tests, or whose every test is skipped, fails the harness; that is how `PaimonE2ETest` fails.
 
@@ -814,30 +893,33 @@ covered.
 A difference fails the harness and the CI job. The job uploads the writer log, the comparison
 output and a warehouse listing whatever the outcome.
 
-**What sets the runtime is the transaction rate, not the row count.** The writer commits once per
-PostgreSQL transaction — a batch is one committed transaction or nothing — so a run leaves one
-Paimon snapshot per transaction, and both the drain and the `$audit_log` scan (one `plan()` per
-snapshot) are linear in that count. The comparison prints the snapshot count next to each table's
-row kinds so the cost is visible. The defaults, 60s at 25 tps, are about 1500 transactions: enough
-for every update and delete path TPC-C has, including roughly sixty Delivery transactions. Raising
+**What sets the runtime is the transaction rate and the commit batch.** The writer commits a batch
+of whole transactions (see "Commit batching"), so a run leaves roughly one Paimon snapshot per
+batch per touched table; the drain and the `$audit_log` scan (one `plan()` per snapshot) are linear
+in the snapshot count. The comparison prints the snapshot count next to each table's row kinds so
+the cost is visible. The defaults, 60s at 25 tps, are about 1500 transactions: enough for every
+update and delete path TPC-C has, including roughly sixty Delivery transactions. Raising
 `TPCC_RATE` or `TPCC_TIME` costs time, not rigour; the load is ~540k rows either way.
 
-**Measured, and worth knowing before running this at scale.** One run at the defaults (1 warehouse,
-60s at 25 tps, 576,779 replicated rows) left **9,467 snapshots and 71,497 files** in a **1.8 GB**
-warehouse, of which only **465 MB is data**:
+**Measured: one Paimon commit per transaction against the default commit batch.** The same local
+run (1 warehouse, 60s at 25 tps, fixed bucketing) twice: with `PGPAIMON_BATCH_MAX_ROWS=1`, which
+is the previous behaviour exactly, and with the defaults (10,000 rows, 16 MiB, 2,000 ms). Both
+passed the comparison with 0 missing, 0 extra, 0 differing and `-U == +U` on every update-driven
+table.
 
-| component | size | share |
+| | one commit per transaction | default batch |
 |---|---|---|
-| data (Parquet) | 465 MB | 25% |
-| `snapshot/` + `manifest/` | 217 MB | 12% |
-| `index/` (dynamic-bucket key index) | 1,160 MB | 63% |
+| snapshots, all tables | 9,778 | 344 |
+| files, all tables | 85,027 | 3,823 |
+| warehouse size | 1,000 MB | 166 MB |
+| `district` (10 rows): snapshots / files | 1,673 / 12,443 | 38 / 430 |
+| `order_line`: snapshots / files | 2,117 / 22,311 | 79 / 946 |
+| whole run, `run_tpcc.sh` | 759 s | 186 s |
+| the comparison (PostgreSQL scan plus every changelog) | 84 s | 16 s |
 
-The snapshot count is the design working as specified — one Paimon commit per committed PostgreSQL
-transaction, which is what makes the atomicity guarantee hold — but the metadata it implies is not
-free. The dominant term is the **dynamic-bucket index**, not the snapshots: `order_line` alone holds
-1,006 MB of index against 88 MB of data, because Paimon rewrites a bucket's key-hash index whenever
-new keys arrive and `order_line` gains keys on nearly every commit. A table that is updated but
-never grown shows the opposite — `customer` has 1,377 snapshots and 1.8 MB of index.
+The two runs are different random workloads, so row counts differ by about 0.2%; the snapshot and
+file counts are what the batch controls. The remaining snapshots are the interval at work: about
+one per table every two seconds while the table is being written.
 
 Two consequences for an operator:
 
@@ -846,9 +928,5 @@ Two consequences for an operator:
   expiry and a sustained one accumulates an hour's worth first, so `snapshot.time-retained` and
   `snapshot.num-retained.max` want deliberate values on a write-heavy table.
 * **Read planning scales with the snapshot count, not the data.** A streaming changelog scan must
-  `plan()` once per snapshot: the comparison took 120s to read 9,467 snapshots' changelogs. At 50 tps
-  the same workload left ~2,900 snapshots per table and the same comparison took about 12 minutes.
-
-The writer sets no `bucket` option, so every table gets dynamic bucketing. Exposing a per-table
-bucket count through `add_table()` would remove the dominant cost above; that is an open design
-question, not a defect, and nothing here changes it.
+  `plan()` once per snapshot, which is why the batch exists: before it, reading the changelogs of
+  9,467 snapshots took 120 s.
