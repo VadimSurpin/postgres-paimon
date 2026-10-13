@@ -364,30 +364,50 @@ public class PaimonAdvancedTest {
     // survive a crash.  Here the WRITER is killed (SIGKILL) in the middle of a load,
     // more rows are committed in PostgreSQL while it is down (the slot retains the WAL),
     // and it is restarted.  Zero loss and zero duplicates.  This rests on the slot's
-    // confirmed position advancing only after a Paimon commit returns, and on
-    // filterAndCommit dropping a replayed commitIdentifier.
+    // confirmed position advancing only after a Paimon commit returns, and on a replayed
+    // transaction never being written twice.
     //
-    // Duplicates are looked for in the raw changelog (every record as stored): a merged
-    // read collapses repeats of a key and would hide them.
+    // The writer commits several PostgreSQL transactions as ONE Paimon commit (a mini-batch),
+    // and a time-driven batch boundary is not a function of the stream: after a crash the same
+    // transactions can be regrouped, so a replay can overlap a batch that already committed.
+    // Paimon's own filter would let such an overlap through, and the merged table would hide it
+    // (deduplicate collapses identical records) -- only the raw CHANGELOG shows it, because
+    // changelog-producer = input writes every input record.  So every crash test reads the
+    // changelog and asserts it EXACTLY: one +I per inserted row, and one -U and one +U per UPDATE,
+    // never a -U without its +U.  Each transaction inserts a batch AND updates a row inserted by
+    // the previous one, so the -U/+U pairs are part of what is counted.
+    //
+    //   T16a  kill -9 mid-load (rows keep arriving while the writer is down)
+    //   T16b  kill -9 immediately after a batch COMMITS, before the server learns of it: the
+    //         replay overlaps a committed batch.  The window is real: the confirm reaches the
+    //         server only with the next status update (every 10 s), and the test asserts that the
+    //         server's confirmed position is behind the committed identifier at the kill.
+    //   T16c  kill -9 with transactions sitting in the buffer, uncommitted, across status updates
+    //         and keepalives: nothing may have been confirmed past committed data
+    //   T16d  SIGTERM with transactions buffered: a clean stop drains them
     static final int T16_BATCHES = 100, T16_PER_BATCH = 20;
 
-    static void test16_crashRecovery() throws Exception {
-        System.out.println("\n── T16: CRASH RECOVERY (writer killed mid-load) ─────");
+    /** The writer launcher and pid file the harness exports; null when there is no harness. */
+    static String[] writerControl(String test) {
         String launcher = System.getenv("PGPAIMON_WRITER_LAUNCHER");
         String pidFile = System.getenv("PGPAIMON_WRITER_PID_FILE");
         if (launcher == null || pidFile == null) {
             if ("1".equals(System.getenv("PGPAIMON_HARNESS"))) {
-                check("T16 harness exports PGPAIMON_WRITER_LAUNCHER and PGPAIMON_WRITER_PID_FILE", false);
+                check(test + " harness exports PGPAIMON_WRITER_LAUNCHER and PGPAIMON_WRITER_PID_FILE", false);
             } else {
-                System.out.println("  SKIP  T16: no writer launcher (run via test/slot-acceptance/run_acceptance.sh)");
+                System.out.println("  SKIP  " + test + ": no writer launcher (run via test/slot-acceptance/run_acceptance.sh)");
             }
-            return;
+            return null;
         }
-        String tbl = "adv_crash_recovery";
-        // Isolate this test from the DDL the earlier tests ran: after the kill the slot replays
-        // everything past its confirmed position, so first let the confirmed position catch up
-        // with the WAL written so far.  (Replay across a DDL boundary is a separate matter,
-        // reported in the Task 16 report; this test is about a kill in the middle of a load.)
+        return new String[] {launcher, pidFile};
+    }
+
+    /**
+     * After the kill the slot replays everything past its confirmed position, so first let the
+     * confirmed position catch up with the WAL written so far.  (Replay across a DDL boundary is a
+     * separate matter; these tests are about a kill in the middle of a load.)
+     */
+    static void settleSlot() throws Exception {
         String target;
         try (Connection conn = connect(); Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery("SELECT pg_current_wal_insert_lsn()::text")) {
@@ -403,31 +423,186 @@ public class PaimonAdvancedTest {
             }
             Thread.sleep(250);
         }
+    }
+
+    /**
+     * Batch b of the load, as ONE transaction: 20 inserts, and (from b = 1) one UPDATE of the
+     * first row the previous batch inserted.
+     */
+    static void insertBatch(Connection conn, String tbl, int b) throws SQLException {
+        conn.setAutoCommit(false);
+        StringBuilder sb = new StringBuilder("INSERT INTO " + tbl + " VALUES ");
+        for (int k = 0; k < T16_PER_BATCH; k++) {
+            int id = b * T16_PER_BATCH + k + 1;
+            if (k > 0) sb.append(',');
+            sb.append('(').append(id).append(",'r").append(id).append("')");
+        }
+        exec(conn, sb.toString());
+        if (b > 0) {
+            exec(conn, "UPDATE " + tbl + " SET v = 'u" + b + "' WHERE id = " + ((b - 1) * T16_PER_BATCH + 1));
+        }
+        conn.commit();
+        conn.setAutoCommit(true);
+    }
+
+    static Thread loader(String tbl, int batches, long pauseMs, AtomicReference<Throwable> err) {
+        Thread t = new Thread(() -> {
+            try (Connection conn = connect()) {
+                for (int b = 0; b < batches; b++) {
+                    insertBatch(conn, tbl, b);
+                    if (pauseMs > 0) Thread.sleep(pauseMs);
+                }
+            } catch (Throwable e) {
+                err.set(e);
+            }
+        });
+        t.start();
+        return t;
+    }
+
+    /**
+     * Waits for the changelog to be complete, lets any replayed batch show up, then asserts it is
+     * exactly what the load produced: not a record more, not one less.
+     */
+    static void assertChangelogExactlyOnce(String test, String tbl, int batches) throws Exception {
+        final int total = batches * T16_PER_BATCH, updates = batches - 1;
+        final int expected = total + 2 * updates;
+        List<int[]> recs = readIdsAndKinds(tbl);
+        long deadline = System.currentTimeMillis() + 90_000;
+        while (recs.size() < expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(500);
+            recs = readIdsAndKinds(tbl);
+        }
+        Thread.sleep(5000);   // a replayed batch would show up as extra records by now
+        recs = readIdsAndKinds(tbl);
+
+        Map<Integer, Integer> inserts = new TreeMap<>(), before = new TreeMap<>(), after = new TreeMap<>();
+        int other = 0;
+        for (int[] r : recs) {
+            switch (r[0]) {
+                case 0: inserts.merge(r[1], 1, Integer::sum); break;
+                case 1: before.merge(r[1], 1, Integer::sum); break;
+                case 2: after.merge(r[1], 1, Integer::sum); break;
+                default: other++;
+            }
+        }
+        List<Integer> lost = new ArrayList<>(), dup = new ArrayList<>();
+        for (int id = 1; id <= total; id++) {
+            int n = inserts.getOrDefault(id, 0);
+            if (n == 0) lost.add(id);
+            if (n > 1) dup.add(id);
+        }
+        List<Integer> badUpdate = new ArrayList<>();
+        for (int b = 1; b < batches; b++) {
+            int id = (b - 1) * T16_PER_BATCH + 1;
+            if (before.getOrDefault(id, 0) != 1 || after.getOrDefault(id, 0) != 1) badUpdate.add(id);
+        }
+        if (!lost.isEmpty()) System.out.println("  lost ids: " + lost);
+        if (!dup.isEmpty())  System.out.println("  duplicated ids: " + dup);
+        if (!badUpdate.isEmpty()) System.out.println("  ids whose -U/+U is not exactly one pair: " + badUpdate);
+        check(test + " zero loss (all " + total + " ids present)", lost.isEmpty());
+        check(test + " zero duplicates (each id inserted exactly once)", dup.isEmpty());
+        check(test + " changelog: +I count equals the row count (" + total + ")",
+              inserts.values().stream().mapToInt(Integer::intValue).sum() == total);
+        check(test + " changelog: every UPDATE is exactly one -U and one +U",
+              badUpdate.isEmpty());
+        check(test + " changelog: no -U without a +U (" + updates + " of each)",
+              before.values().stream().mapToInt(Integer::intValue).sum() == updates
+              && after.values().stream().mapToInt(Integer::intValue).sum() == updates);
+        check(test + " changelog: no other record kind", other == 0);
+        check(test + " changelog: exactly " + expected + " records", recs.size() == expected);
+    }
+
+    /** Starts the writer through the harness launcher; extraEnv reaches the writer unchanged. */
+    static void startWriter(String test, String launcher, Map<String, String> extraEnv) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder("bash", launcher)
+            .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        pb.environment().putAll(extraEnv);
+        check(test + " launcher exited cleanly", pb.start().waitFor() == 0);
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (!slotActive() && System.currentTimeMillis() < deadline) Thread.sleep(250);
+        check(test + " restarted writer reattached to the slot", slotActive());
+    }
+
+    static String writerPid(String pidFile) throws Exception {
+        return new String(Files.readAllBytes(new File(pidFile).toPath())).trim();
+    }
+
+    static void kill9(String test, String pid) throws Exception {
+        int killRc = new ProcessBuilder("kill", "-9", pid).inheritIO().start().waitFor();
+        check(test + " kill -9 of the writer succeeded", killRc == 0);
+        waitProcessGone(pid);
+        check(test + " writer process is gone", !processAlive(pid));
+    }
+
+    /** The commitIdentifier (a commit LSN) of a table's latest snapshot; -1 if there is none. */
+    static long latestCommitIdentifier(String tbl) {
+        try {
+            File latest = new File(tableDir(tbl) + "/snapshot/LATEST");
+            if (!latest.exists()) return -1;
+            String id = new String(Files.readAllBytes(latest.toPath())).trim();
+            String json = new String(Files.readAllBytes(
+                new File(tableDir(tbl) + "/snapshot/snapshot-" + id).toPath()));
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"commitIdentifier\"\\s*:\\s*(\\d+)").matcher(json);
+            return m.find() ? Long.parseLong(m.group(1)) : -1;
+        } catch (Exception e) {
+            return -1;      // a snapshot being written: ask again
+        }
+    }
+
+    static String latestSnapshotFile(String tbl) throws Exception {
+        File latest = new File(tableDir(tbl) + "/snapshot/LATEST");
+        return latest.exists() ? new String(Files.readAllBytes(latest.toPath())).trim() : null;
+    }
+
+    /** How far the server's confirmed position is behind an LSN given as a number; positive = behind. */
+    static boolean confirmedBehind(long lsn) throws Exception {
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                 "SELECT (confirmed_flush_lsn - '0/0'::pg_lsn) < " + lsn
+                 + " FROM pg_replication_slots WHERE slot_name = 'paimon'")) {
+            return rs.next() && rs.getBoolean(1);
+        }
+    }
+
+    static String confirmedFlush() throws Exception {
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                 "SELECT (confirmed_flush_lsn - '0/0'::pg_lsn)::text FROM pg_replication_slots WHERE slot_name = 'paimon'")) {
+            return rs.next() ? rs.getString(1) : "?";
+        }
+    }
+
+    static long walInsertLsn() throws Exception {
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::bigint")) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    static void test16_crashRecovery() throws Exception {
+        t16a_killMidLoad();
+        t16b_killBetweenCommitAndConfirm();
+        t16c_killMidBuffer();
+        t16d_cleanStopDrains();
+    }
+
+    static void t16a_killMidLoad() throws Exception {
+        System.out.println("\n── T16a: CRASH RECOVERY (writer killed mid-load) ────");
+        String[] ctl = writerControl("T16");
+        if (ctl == null) return;
+        String launcher = ctl[0], pidFile = ctl[1];
+        String tbl = "adv_crash_recovery";
+        settleSlot();
         cleanup(tbl);
         try (Connection conn = connect()) {
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");   // empty when registered
         }
-        final int total = T16_BATCHES * T16_PER_BATCH;
 
         AtomicReference<Throwable> loadError = new AtomicReference<>();
-        Thread loader = new Thread(() -> {
-            try (Connection conn = connect()) {
-                conn.setAutoCommit(true);
-                for (int b = 0; b < T16_BATCHES; b++) {
-                    StringBuilder sb = new StringBuilder("INSERT INTO " + tbl + " VALUES ");
-                    for (int k = 0; k < T16_PER_BATCH; k++) {
-                        int id = b * T16_PER_BATCH + k + 1;
-                        if (k > 0) sb.append(',');
-                        sb.append('(').append(id).append(",'r").append(id).append("')");
-                    }
-                    exec(conn, sb.toString());       // one transaction per batch
-                    Thread.sleep(60);
-                }
-            } catch (Throwable t) {
-                loadError.set(t);
-            }
-        });
-        loader.start();
+        Thread loader = loader(tbl, T16_BATCHES, 60, loadError);
 
         // Let the writer commit at least one snapshot, then kill it with the load still running.
         File latest = new File(tableDir(tbl) + "/snapshot/LATEST");
@@ -435,57 +610,157 @@ public class PaimonAdvancedTest {
         while (!latest.exists() && System.currentTimeMillis() < deadline) Thread.sleep(50);
         check("T16 recovery: writer committed a snapshot before the kill", latest.exists());
 
-        String pid = new String(Files.readAllBytes(new File(pidFile).toPath())).trim();
+        String pid = writerPid(pidFile);
         boolean loadStillRunning = loader.isAlive();
-        int killRc = new ProcessBuilder("kill", "-9", pid).inheritIO().start().waitFor();
-        check("T16 recovery: kill -9 of the writer succeeded", killRc == 0);
+        kill9("T16 recovery:", pid);
         check("T16 recovery: load was still running when the writer was killed", loadStillRunning);
-        waitProcessGone(pid);
-        check("T16 recovery: writer process is gone", !processAlive(pid));
 
         Thread.sleep(1500);   // rows keep arriving in PostgreSQL while the writer is down
         check("T16 recovery: slot is inactive while the writer is down", !slotActive());
 
         System.out.println("  Restarting the writer...");
-        Process p = new ProcessBuilder("bash", launcher)
-            .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
-        check("T16 recovery: launcher exited cleanly", p.waitFor() == 0);
-        deadline = System.currentTimeMillis() + 60_000;
-        while (!slotActive() && System.currentTimeMillis() < deadline) Thread.sleep(250);
-        check("T16 recovery: restarted writer reattached to the slot", slotActive());
+        startWriter("T16 recovery:", launcher, Map.of());
 
         loader.join();
         check("T16 recovery: load completed without error", loadError.get() == null);
         if (loadError.get() != null) loadError.get().printStackTrace();
 
-        // Wait for the changelog to reach every row.
-        List<int[]> recs = readIdsAndKinds(tbl);
-        deadline = System.currentTimeMillis() + 90_000;
-        while (recs.size() < total && System.currentTimeMillis() < deadline) {
-            Thread.sleep(500);
-            recs = readIdsAndKinds(tbl);
-        }
-        Thread.sleep(3000);   // a replayed batch would show up as extra records by now
-        recs = readIdsAndKinds(tbl);
+        assertChangelogExactlyOnce("T16 recovery:", tbl, T16_BATCHES);
+    }
 
-        Map<Integer, Integer> perId = new TreeMap<>();
-        int nonInsert = 0;
-        for (int[] r : recs) {
-            perId.merge(r[1], 1, Integer::sum);
-            if (r[0] != 0) nonInsert++;
+    static void t16b_killBetweenCommitAndConfirm() throws Exception {
+        System.out.println("\n── T16b: CRASH BETWEEN A BATCH COMMIT AND ITS CONFIRM ─");
+        String[] ctl = writerControl("T16b");
+        if (ctl == null) return;
+        String launcher = ctl[0], pidFile = ctl[1];
+        String tbl = "adv_crash_commit_confirm";
+        settleSlot();
+        cleanup(tbl);
+        try (Connection conn = connect()) {
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
         }
-        List<Integer> lost = new ArrayList<>(), dup = new ArrayList<>();
-        for (int id = 1; id <= total; id++) {
-            int n = perId.getOrDefault(id, 0);
-            if (n == 0) lost.add(id);
-            if (n > 1) dup.add(id);
+        AtomicReference<Throwable> loadError = new AtomicReference<>();
+        Thread loader = loader(tbl, T16_BATCHES, 60, loadError);
+
+        // Wait for the first batch commit, then for the NEXT one, and kill the instant it lands.
+        // The commit is on disk; the server hears of it only with the next status update.
+        String first = null;
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (first == null && System.currentTimeMillis() < deadline) {
+            first = latestSnapshotFile(tbl);
+            Thread.sleep(10);
         }
-        if (!lost.isEmpty()) System.out.println("  lost ids: " + lost);
-        if (!dup.isEmpty())  System.out.println("  duplicated ids: " + dup);
-        check("T16 recovery: zero loss (all " + total + " ids present)", lost.isEmpty());
-        check("T16 recovery: zero duplicates (each id exactly once)", dup.isEmpty());
-        check("T16 recovery: exactly " + total + " changelog records", recs.size() == total);
-        check("T16 recovery: all records are inserts", nonInsert == 0);
+        check("T16b writer committed a first batch", first != null);
+        String seen = first;
+        while (seen != null && seen.equals(latestSnapshotFile(tbl))
+               && System.currentTimeMillis() < deadline) {
+            Thread.sleep(2);
+        }
+        String pid = writerPid(pidFile);
+        kill9("T16b", pid);
+        long identifier = latestCommitIdentifier(tbl);
+        check("T16b killed right after a batch commit landed (identifier " + identifier + ")",
+              identifier > 0);
+        check("T16b the window was real: the server's confirmed position (" + confirmedFlush()
+              + ") is behind the committed identifier, so the batch will be replayed",
+              confirmedBehind(identifier));
+
+        System.out.println("  Restarting the writer...");
+        startWriter("T16b", launcher, Map.of());
+        loader.join();
+        check("T16b load completed without error", loadError.get() == null);
+        assertChangelogExactlyOnce("T16b", tbl, T16_BATCHES);
+    }
+
+    static void t16c_killMidBuffer() throws Exception {
+        System.out.println("\n── T16c: CRASH WITH TRANSACTIONS BUFFERED, UNCOMMITTED ─");
+        String[] ctl = writerControl("T16c");
+        if (ctl == null) return;
+        String launcher = ctl[0], pidFile = ctl[1];
+        String tbl = "adv_crash_mid_buffer";
+        settleSlot();
+        // A writer whose time limit will not fire during the test: what it receives stays buffered.
+        new ProcessBuilder("kill", writerPid(pidFile)).inheritIO().start().waitFor();
+        waitProcessGone(writerPid(pidFile));
+        check("T16c old writer stopped", !slotActiveSoon());
+        Map<String, String> hold = Map.of("PGPAIMON_BATCH_MAX_INTERVAL_MS", "600000",
+                                          "PGPAIMON_BATCH_MAX_ROWS", "1000000");
+        startWriter("T16c", launcher, hold);
+        cleanup(tbl);
+        try (Connection conn = connect()) {
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
+        }
+        Thread.sleep(1500);           // let the DDL flow through
+        long confirmedBefore = Long.parseLong(confirmedFlush());
+        long loadStart = walInsertLsn();
+        int batches = 30;
+        AtomicReference<Throwable> loadError = new AtomicReference<>();
+        loader(tbl, batches, 0, loadError).join();
+        check("T16c load completed without error", loadError.get() == null);
+
+        // Idle for longer than the status interval (10 s) so the writer sends status updates and
+        // the server sends keepalives while the batch sits in the buffer.  pgjdbc advances its
+        // flushed position on a keepalive when nothing is owed; it must not do so for data that
+        // is buffered but not committed.
+        Thread.sleep(14_000);
+        boolean noSnapshot = latestSnapshotFile(tbl) == null;
+        long confirmedAfter = Long.parseLong(confirmedFlush());
+        check("T16c nothing was committed while the batch sat in the buffer", noSnapshot);
+        long loadEnd = walInsertLsn();
+        check("T16c the load was large enough to mean something (" + (loadEnd - loadStart) + " bytes of WAL)",
+              loadEnd - loadStart > 10_000);
+        check("T16c the server's confirmed position did not pass the buffered data across status updates"
+              + " (before " + confirmedBefore + ", after " + confirmedAfter + ", load began at " + loadStart + ")",
+              confirmedAfter <= loadStart + 1024);
+
+        kill9("T16c", writerPid(pidFile));
+        System.out.println("  Restarting the writer (default limits)...");
+        startWriter("T16c", launcher, Map.of());
+        assertChangelogExactlyOnce("T16c", tbl, batches);
+    }
+
+    static void t16d_cleanStopDrains() throws Exception {
+        System.out.println("\n── T16d: CLEAN STOP DRAINS THE BUFFER ───────────────");
+        String[] ctl = writerControl("T16d");
+        if (ctl == null) return;
+        String launcher = ctl[0], pidFile = ctl[1];
+        String tbl = "adv_clean_stop";
+        settleSlot();
+        new ProcessBuilder("kill", writerPid(pidFile)).inheritIO().start().waitFor();
+        waitProcessGone(writerPid(pidFile));
+        Map<String, String> hold = Map.of("PGPAIMON_BATCH_MAX_INTERVAL_MS", "600000",
+                                          "PGPAIMON_BATCH_MAX_ROWS", "1000000");
+        startWriter("T16d", launcher, hold);
+        cleanup(tbl);
+        try (Connection conn = connect()) {
+            createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
+        }
+        Thread.sleep(1500);
+        int batches = 10;
+        AtomicReference<Throwable> loadError = new AtomicReference<>();
+        loader(tbl, batches, 0, loadError).join();
+        long lastLsn = walInsertLsn();
+        Thread.sleep(1000);
+        check("T16d the batch is buffered, not committed", latestSnapshotFile(tbl) == null);
+
+        String pid = writerPid(pidFile);
+        new ProcessBuilder("kill", pid).inheritIO().start().waitFor();    // SIGTERM
+        waitProcessGone(pid);
+        check("T16d writer exited on SIGTERM", !processAlive(pid));
+        check("T16d the buffered transactions were committed on the way out",
+              latestSnapshotFile(tbl) != null);
+        long pos = Long.parseLong(confirmedFlush());
+        check("T16d and confirmed to the server on the way out (confirmed " + pos
+              + ", the load ended at " + lastLsn + ")", pos >= lastLsn - 8192);
+
+        startWriter("T16d", launcher, Map.of());
+        assertChangelogExactlyOnce("T16d", tbl, batches);
+    }
+
+    static boolean slotActiveSoon() throws Exception {
+        long end = System.currentTimeMillis() + 10_000;
+        while (slotActive() && System.currentTimeMillis() < end) Thread.sleep(200);
+        return slotActive();
     }
 
     static boolean processAlive(String pid) throws Exception {
