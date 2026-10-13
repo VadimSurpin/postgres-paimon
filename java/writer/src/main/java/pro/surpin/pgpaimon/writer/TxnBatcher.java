@@ -131,6 +131,7 @@ public final class TxnBatcher {
             List<SinkRecord> batch = open;
             List<String> audit = List.copyOf(skipped);
             discardOpenTransaction();   // the transaction is closed even if flush throws
+            dropUntracked(batch);
             if (audit.isEmpty()) {
                 flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
             } else {
@@ -267,6 +268,34 @@ public final class TxnBatcher {
             sb.append(i == 0 ? "" : ", ").append(v == null ? "NULL" : "\"" + v + "\"");
         }
         return sb.append(']').toString();
+    }
+
+    /**
+     * Drops the records of a relation that stopped being tracked inside this very transaction:
+     * {@code BEGIN; INSERT INTO t ...; DROP TABLE t; COMMIT}. The drop_table message arrives
+     * between the INSERT and the Commit and purges the Paimon table, so those rows have nowhere to
+     * go and are meant to be gone. Without this the commit asked Paimon for a table it had just
+     * forgotten ("relation ... is not tracked") and the writer stopped -- measured, on an
+     * ordinary transaction PostgreSQL had committed. Records are only ever added for tracked
+     * relations, so an untracked one here can only have been dropped since.
+     */
+    private void dropUntracked(List<SinkRecord> batch) {
+        if (registry == null) {
+            return;
+        }
+        int before = batch.size();
+        Set<Long> gone = new HashSet<>();
+        batch.removeIf(r -> {
+            boolean drop = !registry.tracked(r.relid());
+            if (drop) {
+                gone.add(r.relid());
+            }
+            return drop;
+        });
+        if (batch.size() != before) {
+            LOG.info("dropped " + (before - batch.size()) + " record(s) of relation(s) " + gone
+                + ", dropped later in the same transaction (transaction " + xid + ")");
+        }
     }
 
     private IllegalStateException ambiguous(long relid, String what) {

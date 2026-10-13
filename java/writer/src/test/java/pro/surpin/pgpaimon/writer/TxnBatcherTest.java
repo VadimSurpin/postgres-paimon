@@ -135,6 +135,33 @@ class TxnBatcherTest {
         assertEquals(920L, rec.endLsns.get(0));
     }
 
+    /**
+     * BEGIN; INSERT INTO t ...; INSERT INTO u ...; DROP TABLE t; COMMIT. The drop_table message
+     * untracks t between its INSERT and the Commit. Measured on the writer before this: the
+     * commit then asked for t's Paimon table ("relation ... is not tracked") and the writer
+     * stopped. t's rows are meant to be gone with it; u's must still be committed.
+     */
+    @Test
+    void recordsOfATableDroppedLaterInTheSameTransactionAreDroppedAtCommit() throws Exception {
+        Recorder rec = new Recorder();
+        SchemaRegistry reg = new SchemaRegistry(null, null);
+        reg.register(16412, "public", "t");
+        reg.register(16413, "public", "u");
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), reg, rec);
+        RelationMeta u = new RelationMeta(16413, "public", "u", List.of("id", "v"),
+                                          List.of(true, false));
+        b.onEvent(new PgEvent.Begin(900L, 0L, 1L), 900L, null);
+        b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 910L, META);
+        b.onEvent(new PgEvent.Insert(16413, row("2", "b")), 912L, u);
+        reg.forget(16412);          // what drop_table does, before the Commit arrives
+        b.onEvent(new PgEvent.Commit(900L, 920L, 0L), 920L, null);
+        assertEquals(1, rec.batches.size());
+        assertEquals(1, rec.batches.get(0).size(), "only u's record");
+        assertEquals(16413L, rec.batches.get(0).get(0).relid());
+        assertEquals(List.of("2", "b"), rec.batches.get(0).get(0).values());
+        assertEquals(920L, rec.endLsns.get(0), "the transaction is still confirmed");
+    }
+
     @Test
     void relationAndTruncateContributeNothingAndKeepOpSeq() throws Exception {
         Recorder rec = new Recorder();
