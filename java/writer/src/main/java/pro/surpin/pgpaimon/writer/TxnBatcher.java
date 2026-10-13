@@ -48,6 +48,19 @@ public final class TxnBatcher {
          * @param endLsn    the position confirmed to the server (after the commit record)
          */
         void flush(List<SinkRecord> records, long commitLsn, long endLsn) throws Exception;
+
+        /**
+         * As {@link #flush(List, long, long)}, and runs {@code afterCommit} once these records
+         * have actually been committed to Paimon -- which, for a flusher that buffers (see
+         * {@link MiniBatcher}), is not when this method returns. Never run if the commit fails
+         * or the transaction is discarded unconfirmed. The default suits a flusher that commits
+         * before returning.
+         */
+        default void flush(List<SinkRecord> records, long commitLsn, long endLsn,
+                           Runnable afterCommit) throws Exception {
+            flush(records, commitLsn, endLsn);
+            afterCommit.run();
+        }
     }
 
     private final ToastResolver resolver;
@@ -118,18 +131,18 @@ public final class TxnBatcher {
             List<SinkRecord> batch = open;
             List<String> audit = List.copyOf(skipped);
             discardOpenTransaction();   // the transaction is closed even if flush throws
-            flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
-            // Only now: the record is really gone only once the rest of its transaction has
-            // been committed to Paimon. The commit LSN is not known before the Commit arrives,
-            // and the audit line is worthless without it.
-            for (String line : audit) {
-                LOG.warning("SKIPPED POISON RECORD (PGPAIMON_SKIP_LSN="
-                    + SlotConsumer.formatLsn(skipLsn) + "): " + line
-                    + ", in the transaction committed at " + SlotConsumer.formatLsn(c.commitLsn())
-                    + ". The rest of that transaction WAS applied. This row is now missing from"
-                    + " Paimon and nothing will replay it: reinsert it by hand from the values"
-                    + " above, with the offending column corrected. Unset PGPAIMON_SKIP_LSN"
-                    + " before the next restart.");
+            if (audit.isEmpty()) {
+                flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
+            } else {
+                // The audit is logged only once the rest of the transaction is committed to
+                // Paimon, which with commit batching is NOT when flush returns: the transaction
+                // may only have been buffered. Logged earlier, "unset PGPAIMON_SKIP_LSN" would
+                // be advice an operator could follow before the skip had taken effect, and a
+                // writer killed inside the batch interval would then replay the poison record
+                // and fail on it again. The commit LSN is not known before the Commit arrives,
+                // and the audit line is worthless without it.
+                long commitLsn = c.commitLsn();
+                flusher.flush(batch, commitLsn, c.endLsn(), () -> logSkipped(audit, commitLsn));
             }
             return;
         }
@@ -231,6 +244,18 @@ public final class TxnBatcher {
             // Any other failure at this LSN is NOT what the escape is for. Leave the record in
             // the batch so the sink raises it as it always would, fatally.
             return false;
+        }
+    }
+
+    private void logSkipped(List<String> audit, long commitLsn) {
+        for (String line : audit) {
+            LOG.warning("SKIPPED POISON RECORD (PGPAIMON_SKIP_LSN="
+                + SlotConsumer.formatLsn(skipLsn) + "): " + line
+                + ", in the transaction committed at " + SlotConsumer.formatLsn(commitLsn)
+                + ". The rest of that transaction WAS committed to Paimon. This row is now missing"
+                + " from Paimon and nothing will replay it: reinsert it by hand from the values"
+                + " above, with the offending column corrected. Unset PGPAIMON_SKIP_LSN"
+                + " before the next restart.");
         }
     }
 

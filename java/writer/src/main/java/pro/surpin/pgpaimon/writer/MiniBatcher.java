@@ -85,7 +85,9 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
         long highestCommitted(long relid) throws Exception;
     }
 
-    private record Txn(List<SinkRecord> records, long commitLsn, long endLsn) {}
+    /** {@code afterCommit} is null when there is nothing to run. */
+    private record Txn(List<SinkRecord> records, long commitLsn, long endLsn,
+                       Runnable afterCommit) {}
 
     private final TxnBatcher.Flusher downstream;
     private final CommittedLookup lookup;
@@ -117,17 +119,32 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
     /** What {@link TxnBatcher} calls at every Commit. */
     @Override
     public void flush(List<SinkRecord> records, long commitLsn, long endLsn) throws Exception {
+        add(records, commitLsn, endLsn, null);
+    }
+
+    /** As above; {@code afterCommit} runs once the batch holding this transaction commits. */
+    @Override
+    public void flush(List<SinkRecord> records, long commitLsn, long endLsn,
+                      Runnable afterCommit) throws Exception {
+        add(records, commitLsn, endLsn, afterCommit);
+    }
+
+    private void add(List<SinkRecord> records, long commitLsn, long endLsn, Runnable afterCommit)
+            throws Exception {
         if (buffer.isEmpty() && records.isEmpty()) {
             // A transaction with nothing for us (DDL only, or untracked tables) while nothing is
             // waiting: confirm it now. No records, so no snapshot. If something IS waiting it
             // must queue behind it, since confirming it would confirm the earlier data too.
             downstream.flush(records, commitLsn, endLsn);
+            if (afterCommit != null) {
+                afterCommit.run();
+            }
             return;
         }
         if (buffer.isEmpty()) {
             firstAddedNanos = nanoClock.getAsLong();
         }
-        buffer.add(new Txn(List.copyOf(records), commitLsn, endLsn));
+        buffer.add(new Txn(List.copyOf(records), commitLsn, endLsn, afterCommit));
         rows += records.size();
         bytes += estimate(records);
         if (rows >= limits.maxRows() || bytes >= limits.maxBytes() || intervalElapsed()) {
@@ -177,6 +194,11 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
         downstream.flush(assembled, last.commitLsn(), last.endLsn());
         for (SinkRecord r : assembled) {
             lastCommitted.put(r.relid(), last.commitLsn());
+        }
+        for (Txn t : txns) {
+            if (t.afterCommit() != null) {
+                t.afterCommit().run();
+            }
         }
     }
 

@@ -366,6 +366,90 @@ class TxnBatcherTest {
         assertTrue(m.contains("reinsert it by hand"), m);
     }
 
+    /**
+     * With commit batching the flusher only buffers the transaction. "Unset PGPAIMON_SKIP_LSN"
+     * must not be said until the batch holding it has been committed: a writer killed inside the
+     * interval would replay the poison record, and with the variable gone it would fail again.
+     */
+    @Test
+    void theAuditLineWaitsForTheBatchCommitNotForTheBuffer() throws Exception {
+        List<String> commits = new ArrayList<>();
+        MiniBatcher mini = new MiniBatcher((r, c, e) -> commits.add("commit@" + c), x -> 0L,
+            new MiniBatcher.Limits(1_000_000, 1L << 40, 3_600_000));
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+        Runnable poisonTxn = () -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);   // poison
+                b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        };
+
+        List<java.util.logging.LogRecord> buffered = warningsFrom(poisonTxn);
+        assertTrue(mini.hasBuffered());
+        assertTrue(buffered.isEmpty(), "only buffered: nothing is committed, nothing skipped yet");
+
+        // killed or disconnected now: the transaction replays, so it has skipped nothing
+        mini.discard();
+        assertTrue(commits.isEmpty());
+
+        List<java.util.logging.LogRecord> replayed = warningsFrom(() -> {
+            poisonTxn.run();
+            try {
+                mini.flushBuffered();
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertEquals(List.of("commit@500"), commits);
+        assertEquals(1, replayed.size(), replayed.toString());
+        assertTrue(replayed.get(0).getMessage().contains("WAS committed to Paimon"));
+        assertTrue(replayed.get(0).getMessage().contains("0/000001F4"), "the commit LSN, 500");
+    }
+
+    @Test
+    void theAuditLineIsNotLoggedWhenTheBatchCommitFails() throws Exception {
+        MiniBatcher mini = new MiniBatcher(
+            (r, c, e) -> { throw new java.io.IOException("commit failed"); }, x -> 0L,
+            new MiniBatcher.Limits(1, 1L << 40, 0));
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+        List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
+                assertThrows(java.io.IOException.class,
+                    () -> b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null));
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertTrue(logs.isEmpty(), "the commit failed: the record replays, nothing was skipped");
+    }
+
+    /** A transaction whose only record was the poison one commits at once: logged at once. */
+    @Test
+    void anAuditForATransactionLeftEmptyIsLoggedWhenItIsConfirmed() throws Exception {
+        List<String> commits = new ArrayList<>();
+        MiniBatcher mini = new MiniBatcher((r, c, e) -> commits.add("commit@" + c), x -> 0L,
+            new MiniBatcher.Limits(1_000_000, 1L << 40, 3_600_000));
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+        List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+            try {
+                b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
+                b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
+                b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertEquals(List.of("commit@500"), commits, "empty with nothing buffered: confirmed now");
+        assertEquals(1, logs.size());
+    }
+
     @Test
     void theAuditLineIsOnlyLoggedIfTheTransactionActuallyCommits() throws Exception {
         Recorder rec = new Recorder();
