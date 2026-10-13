@@ -55,8 +55,14 @@ public final class SchemaRegistry {
      * (extension/paimon_schema.cpp:131). Column names are the contract, which is why RowBuilder
      * maps by name.
      *
-     * <p>No {@code bucket} option is set, deliberately (extension/paimon_schema.cpp:219-223):
-     * a primary-key table is then in dynamic bucket mode and the sink must write(row, 0).
+     * <p>The {@code bucket} option IS set, from the count the create message carries, which
+     * {@code paimon.add_table()} resolved (its {@code buckets => N} argument, or
+     * {@code paimon.default_buckets()}). That puts the table in fixed-bucket mode, where Paimon
+     * hashes the primary key to pick the bucket and keeps no key index. Leaving it unset, as this
+     * did for layout parity with main (extension/paimon_schema.cpp:219-223), costs that index:
+     * 1.2 GB of a 1.8 GB warehouse on a measured TPC-C run, for 88 MB of data. Paimon does not
+     * redistribute existing data when the count changes, so a wrong guess costs a rewrite rather
+     * than being permanent.
      */
     public void createTable(long relid, String schema, String table, List<String> pk,
                             List<DdlMessage.Col> cols) {
@@ -102,7 +108,14 @@ public final class SchemaRegistry {
     /** As above, recording {@code ddlLsn} as the table's applied-DDL identifier. */
     public void createTable(long relid, String schema, String table, List<String> pk,
                             List<DdlMessage.Col> cols, String changelogProducer, long ddlLsn) {
-        create(relid, schema, table, pk, cols, changelogProducer, false, ddlLsn);
+        createTable(relid, schema, table, pk, cols, changelogProducer, null, ddlLsn);
+    }
+
+    /** As above with the bucket count the create message carried. */
+    public void createTable(long relid, String schema, String table, List<String> pk,
+                            List<DdlMessage.Col> cols, String changelogProducer,
+                            Integer buckets, long ddlLsn) {
+        create(relid, schema, table, pk, cols, changelogProducer, buckets, false, ddlLsn);
     }
 
     /**
@@ -119,14 +132,21 @@ public final class SchemaRegistry {
     public void bootstrapTable(long relid, String schema, String table, List<String> pk,
                                List<DdlMessage.Col> cols, String changelogProducer,
                                boolean reconcileLostDdl) {
+        bootstrapTable(relid, schema, table, pk, cols, changelogProducer, null, reconcileLostDdl);
+    }
+
+    /** As above with the bucket count {@code paimon.table_registry} recorded. */
+    public void bootstrapTable(long relid, String schema, String table, List<String> pk,
+                               List<DdlMessage.Col> cols, String changelogProducer,
+                               Integer buckets, boolean reconcileLostDdl) {
         // No LSN: the bootstrap replays a registry row, not a message, so it has none to record
         // and must not disturb whatever the table already carries.
-        create(relid, schema, table, pk, cols, changelogProducer, reconcileLostDdl, 0);
+        create(relid, schema, table, pk, cols, changelogProducer, buckets, reconcileLostDdl, 0);
     }
 
     private void create(long relid, String schema, String table, List<String> pk,
                         List<DdlMessage.Col> cols, String changelogProducer,
-                        boolean reconcileLostDdl, long ddlLsn) {
+                        Integer buckets, boolean reconcileLostDdl, long ddlLsn) {
         Schema.Builder b = Schema.newBuilder();
         for (DdlMessage.Col c : cols) {
             b.column(c.name(), parseType(c.type()));
@@ -141,6 +161,10 @@ public final class SchemaRegistry {
         b.option("changelog-producer", changelogProducer == null ? "input" : changelogProducer);
         b.option("sequence.field", config.seqField() + "," + config.opSeqField());
         b.option("ignore-update-before", "false");
+        // Fixed-bucket mode. Never left unset: dynamic mode would reject the sink's write(row)
+        // and bring back the key index this exists to remove. A create message always carries a
+        // count, so the fallback is only reached by a caller that has none.
+        b.option("bucket", String.valueOf(buckets == null ? DEFAULT_BUCKETS : buckets));
         if (ddlLsn != 0) {
             // On the table's own creation, so a create and its identifier are one atomic write.
             b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
@@ -308,6 +332,14 @@ public final class SchemaRegistry {
      * on {@code appliedDdlLsn(relid) == 0} is what keeps a tolerance needed for one case from
      * silencing a real fault in the other.
      */
+
+    /**
+     * The bucket count for a table whose caller supplied none. It matches
+     * {@code paimon.default_buckets()}'s floor, so such a table is bucketed as an empty table
+     * registered normally would be -- and never left in dynamic-bucket mode, which the sink's
+     * {@code write(row)} cannot use.
+     */
+    static final int DEFAULT_BUCKETS = 4;
 
     /**
      * Schema option holding the WAL LSN of the last DDL message applied to this table.

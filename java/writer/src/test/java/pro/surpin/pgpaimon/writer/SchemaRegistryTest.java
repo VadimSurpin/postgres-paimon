@@ -216,8 +216,10 @@ class SchemaRegistryTest {
         handler.handle(msg(CREATE_FIXTURE));
         assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq"),
             reg.table(r).schema().fieldNames());
-        assertFalse(reg.table(r).schema().options().containsKey("bucket"),
-            "no bucket option: dynamic bucket mode, the sink writes bucket 0");
+        assertEquals(String.valueOf(SchemaRegistry.DEFAULT_BUCKETS),
+            reg.table(r).schema().options().get("bucket"),
+            "fixed-bucket mode: without it Paimon keeps a key index and the sink's write(row)"
+            + " is rejected");
         assertFalse(reg.table(r).rowType().getField("id").type().isNullable());
         assertTrue(reg.table(r).rowType().getField("qty").type().isNullable());
 

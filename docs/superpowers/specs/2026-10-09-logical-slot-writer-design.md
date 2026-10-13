@@ -281,20 +281,46 @@ otherwise carry the same sequence value. §7 defines the two fields. `ignore-upd
 is set explicitly rather than left to its default: `-U` records are required by the
 acceptance suite, and `TableWriteImpl` carries a `rowKindFilter` that this option drives.
 
-No `bucket` option is written, matching `extension/paimon_schema.cpp:219-223` exactly. For a
-primary-key table that means Paimon's **dynamic bucket mode**, in which `TableWrite.write(row)`
-throws:
+The `bucket` option **is** written, so every table is in Paimon's **fixed (static) bucket
+mode** and the writer calls `TableWrite.write(row)`, letting Paimon hash the primary key to
+choose the bucket.
+
+**Amendment (replacing ruling R1).** This originally wrote no `bucket` option, matching
+`extension/paimon_schema.cpp:219-223` for layout parity with main. That put every primary-key
+table in **dynamic bucket mode**, where `write(row)` throws —
 
 ```
 Can't extract bucket from row in dynamic bucket mode, you should use
 'TableWrite.write(InternalRow row, int bucket)' method.
 ```
 
-The writer therefore always calls `write(row, 0)`. Every file lands under `bucket-0/`, which is
-where `extension/paimon_table_writer.cpp:155` puts it on main, so the layout the acceptance
-suite inspects is unchanged. A single-threaded writer gains nothing from bucket-level
-parallelism; if throughput ever demands it, moving to fixed buckets is a schema change and a
-new decision, not an implementation detail.
+— so the writer had to call `write(row, 0)` and every file landed under `bucket-0/`, as on main.
+The reasoning was that a single-threaded writer gains nothing from bucket-level parallelism, which
+is true and was not the cost. The cost is that dynamic bucket mode maintains a **key index**, to
+remember which bucket each key went to. A measured TPC-C run billed it: `order_line` held 1.1 GB
+on disk for 88 MB of data, and `index/` directories were 1.2 GB of a 1.8 GB warehouse — 63% of it.
+Fixed bucketing removes the index entirely (measured: `index=420000` of 951387 bytes under
+dynamic, absent under `bucket=4`) and makes `write(row)` work, so the forced-bucket-0 special
+case disappears with it.
+
+**The count** comes from `paimon.add_table()`, which resolves it once at registration and records
+it in `paimon.table_registry.buckets`, whence the `create` message carries it:
+
+* `buckets => N` names it explicitly, for any positive `N`;
+* otherwise `paimon.default_buckets()` guesses from the only signal available,
+  `clamp(4, ceil(pg_total_relation_size / 1 GiB), 64)`.
+
+**That guess is mostly its floor, and knowingly.** The ordinary registration path requires an
+*empty* table, so the size is 16 kB and says nothing; on the TPC-C schema at scale factor 1 even
+the *loaded* tables are 39 MB at most, so the divisor never engages there either. The floor of 4
+exists so that every new table is not a single-bucket hotspot; the ceiling of 64 because a
+single-threaded writer gains nothing beyond it but open files per commit. The size only speaks when
+a populated table is re-registered after `remove_table()`. `buckets => N` is the control that
+matters.
+
+**Tunable later, at a price.** `SchemaChange.setOption("bucket", "8")` is accepted on an existing
+table, but Paimon does not redistribute existing data, so changing the count costs a rewrite of
+the table rather than being free — and leaving it wrong is not permanent.
 
 `paimon.add_table()` issues `ALTER TABLE ... REPLICA IDENTITY FULL`. This takes a brief
 `ACCESS EXCLUSIVE` lock for the catalog update, and thereafter adds the size of the old row

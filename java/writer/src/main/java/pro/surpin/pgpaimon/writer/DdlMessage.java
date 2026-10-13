@@ -30,6 +30,20 @@ public record DdlMessage(int version, String op, long relid, String schema, Stri
     /** {@code id} is the PostgreSQL attnum: advisory only, Paimon assigns its own field ids. */
     public record Col(int id, String name, String type) {}
 
+    /** The bucket count carried by {@code create}; null when absent. */
+    public Integer buckets() {
+        String v = options == null ? null : options.get("bucket");
+        if (v == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(v.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("create message has an unusable bucket count '"
+                + v + "'", e);
+        }
+    }
+
     /** The changelog-producer option carried by {@code create}; null when absent. */
     public String changelogProducer() {
         return options == null ? null : options.get("changelog-producer");

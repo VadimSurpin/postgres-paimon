@@ -21,8 +21,10 @@ import org.apache.paimon.table.sink.TableWriteImpl;
  *       data and changelog on replay, so it is never called here;</li>
  *   <li>that set is scoped to the commit user, so {@code config.commitUser()} must be stable
  *       across restarts (it is derived from the slot name, see {@link WriterConfig});</li>
- *   <li>the table is in dynamic bucket mode (no {@code bucket} option, deliberately), so every
- *       row is written with {@code write(row, 0)}, giving the {@code bucket-0/} layout main uses.</li>
+ *   <li>the table has a fixed bucket count, so {@code write(row)} is used and Paimon hashes the
+ *       primary key to choose the bucket. Dynamic-bucket mode -- no {@code bucket} option --
+ *       required {@code write(row, 0)} instead, since dynamic mode rejects the one-argument form,
+ *       and paid for it with a key index: 1.2 GB of a 1.8 GB TPC-C warehouse.</li>
  * </ul>
  *
  * <p>A table or writer fetched before a DDL message for that relation is stale. Each cached
@@ -140,7 +142,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                             + " schema, not a value Paimon cannot represent; it will replay"
                             + " identically on restart.", other);
                     }
-                    e.write().write(row, 0);
+                    e.write().write(row);   // Paimon hashes the key into one of the buckets
                 }
                 List<CommitMessage> msgs = e.write().prepareCommit(false, commitLsn);
                 int applied = e.commit().filterAndCommit(Map.of(commitLsn, msgs));

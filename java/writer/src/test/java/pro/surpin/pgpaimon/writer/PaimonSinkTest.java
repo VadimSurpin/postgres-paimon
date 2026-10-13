@@ -145,11 +145,73 @@ class PaimonSinkTest {
     }
 
     @Test @Order(5)
-    void dataFilesLandInBucketZero() throws Exception {
+    void dataFilesAreHashedAcrossBucketsAndThereIsNoKeyIndex() throws Exception {
+        // Fixed-bucket mode is what this buys: Paimon hashes the primary key, so it needs no
+        // key index. On a measured TPC-C run that index was 1.2 GB of a 1.8 GB warehouse.
+        // Asserted as the ABSENCE of index/, not inferred from a size.
         try (Stream<java.nio.file.Path> s = Files.walk(wh.resolve("public.db/s"))) {
-            assertTrue(s.anyMatch(p -> p.getFileName().toString().equals("bucket-0")),
-                       "files must sit under bucket-0/, as main's writer lays them out");
+            assertTrue(s.noneMatch(p -> p.getFileName().toString().equals("index")),
+                       "a fixed-bucket table must have no index/ directory");
         }
+        try (Stream<java.nio.file.Path> s = Files.walk(wh.resolve("public.db/s"))) {
+            assertTrue(s.anyMatch(p -> p.getFileName().toString().startsWith("bucket-")),
+                       "data still lands under bucket-N/");
+        }
+    }
+
+    /**
+     * And the hashing really happens: enough keys must reach more than one bucket. Everything
+     * landing in bucket-0 would mean the sink was still forcing a bucket, or that the table had
+     * ended up with one bucket.
+     */
+    @Test @Order(22)
+    void severalKeysReachDifferentBuckets() throws Exception {
+        long relid = 16706L;
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16706,"schema":"public","table":"spread",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"}],
+              "options":{"changelog-producer":"input","bucket":"4"}}"""));
+        assertEquals("4", reg.table(relid).schema().options().get("bucket"));
+        try (PaimonSink s = new PaimonSink(reg, cfg)) {
+            s.setRelation(relid, new RelationMeta(relid, "public", "spread",
+                List.of("id", "v"), List.of(true, false)));
+            List<SinkRecord> rows = new ArrayList<>();
+            for (int i = 1; i <= 40; i++) {
+                rows.add(new SinkRecord(relid, RowKind.INSERT,
+                    Arrays.asList(String.valueOf(i), "v" + i), 1000L, i, 0L));
+            }
+            s.flush(rows, 1000L, 1010L);
+        }
+        Set<String> buckets = new TreeSet<>();
+        try (Stream<java.nio.file.Path> st = Files.walk(wh.resolve("public.db/spread"))) {
+            st.filter(p -> p.getFileName().toString().startsWith("bucket-"))
+              .forEach(p -> buckets.add(p.getFileName().toString()));
+        }
+        assertTrue(buckets.size() > 1,
+                   "40 keys over 4 buckets must reach more than one: " + buckets);
+        assertTrue(buckets.size() <= 4, "and never more than the bucket count: " + buckets);
+        try (Stream<java.nio.file.Path> st = Files.walk(wh.resolve("public.db/spread"))) {
+            assertTrue(st.noneMatch(p -> p.getFileName().toString().equals("index")));
+        }
+    }
+
+    /** The count from the create message is honoured, not the default. */
+    @Test @Order(23)
+    void theBucketCountFromTheMessageIsHonoured() throws Exception {
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16707,"schema":"public","table":"eight",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+              "options":{"changelog-producer":"input","bucket":"8"}}"""));
+        assertEquals("8", reg.table(16707L).schema().options().get("bucket"));
+
+        // and a message with no count at all still gets a fixed bucketing, never dynamic
+        ddl.handle(msg("""
+             {"v":1,"op":"create","relid":16708,"schema":"public","table":"nobucket",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
+              "options":{"changelog-producer":"input"}}"""));
+        assertEquals(String.valueOf(SchemaRegistry.DEFAULT_BUCKETS),
+                     reg.table(16708L).schema().options().get("bucket"));
     }
 
     @Test @Order(6)

@@ -32,7 +32,7 @@ public final class Main {
     /** One row of {@code paimon.table_registry}, as much of it as startup needs. */
     record RegistryRow(long relid, String schema, String table, List<String> pk,
                        List<DdlMessage.Col> cols, boolean backfillDue,
-                       String changelogProducer) {}
+                       String changelogProducer, int buckets) {}
 
     private static volatile boolean exiting;
 
@@ -82,7 +82,7 @@ public final class Main {
         for (RegistryRow r : rows) {
             // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
             registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
-                                    r.changelogProducer(), !slotExists);
+                                    r.changelogProducer(), r.buckets(), !slotExists);
         }
         LOG.info("registry rebuilt: " + rows.size() + " table(s), slot "
                  + (slotExists ? "exists" : "absent"));
@@ -302,7 +302,7 @@ public final class Main {
                 + " was pending in it is lost, so a column missing from Paimon is reconciled");
             for (RegistryRow r : rows) {
                 registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
-                                        r.changelogProducer(), true);
+                                        r.changelogProducer(), r.buckets(), true);
             }
         }
         try (Backfiller backfiller = new Backfiller(config, registry, sink)) {
@@ -342,14 +342,15 @@ public final class Main {
         List<RegistryRow> rows = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
                  "SELECT relid::bigint, schema_name, table_name, pk_cols, cols::text,"
-                 + " backfill_due, changelog_producer FROM paimon.table_registry"
+                 + " backfill_due, changelog_producer, buckets FROM paimon.table_registry"
                  + " ORDER BY relid");
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
                 Array pk = rs.getArray(4);
                 rows.add(new RegistryRow(rs.getLong(1), rs.getString(2), rs.getString(3),
                     Arrays.asList((String[]) pk.getArray()),
-                    DdlMessage.parseCols(rs.getString(5)), rs.getBoolean(6), rs.getString(7)));
+                    DdlMessage.parseCols(rs.getString(5)), rs.getBoolean(6), rs.getString(7),
+                    rs.getInt(8)));
             }
         }
         return rows;

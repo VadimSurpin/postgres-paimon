@@ -41,7 +41,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 238 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 240 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -132,7 +132,42 @@ for one to name; `PGPAIMON_DATABASE` was removed rather than left parsed and ign
   its tables are under `default.db`. Nothing is released, so there is no migration: start from a
   fresh warehouse, or move each `default.db/<table>` directory to `<schema>.db/<table>` yourself
   and fix the catalog's database directories. Re-bootstrapping into a new warehouse is the
-  supported route.
+  supported route. **The same applies to bucketing** (next section): a table created by an earlier
+  build has no `bucket` option and stays in dynamic mode, so it keeps its key index. Only tables
+  created from now on are fixed-bucket, and re-bootstrapping is again the remedy.
+
+### Bucketing: fixed, with a count you can set
+
+Every replicated table is created with a fixed `bucket` count, so Paimon hashes the primary key to
+choose the bucket. The alternative, leaving `bucket` unset, puts the table in Paimon's *dynamic*
+bucket mode, which maintains a **key index** to remember where each key went. A TPC-C run billed
+that index at **1.2 GB of a 1.8 GB warehouse — 63%** — with `order_line` holding 1.1 GB on disk for
+88 MB of data. Fixed bucketing removes it outright.
+
+**Setting the count.** `paimon.add_table()` resolves it once, at registration:
+
+```sql
+SELECT paimon.add_table('orders'::regclass, buckets => 8);   -- explicit, any positive integer
+SELECT paimon.add_table('orders'::regclass);                 -- guessed; see below
+```
+
+The resolved value is recorded in `paimon.table_registry.buckets` and carried to the writer, so a
+restart recreates the table with the same count.
+
+**The guess, and why it is mostly its floor.** With no `buckets` argument the count is
+`clamp(4, ceil(pg_total_relation_size / 1 GiB), 64)`. Be clear-eyed about what that gives you: the
+ordinary registration path **requires an empty table**, where the size is 16 kB and tells you
+nothing, so you get 4. The floor is there so a new table is not a single-bucket hotspot; the
+ceiling because a single-threaded writer gains nothing past it but open files per commit. The size
+only says anything when you re-register a populated table after `remove_table()`. **If you know the
+table will be large, pass `buckets => N`.** As a rough guide, aim for a few hundred MB to a GB of
+data per bucket.
+
+**Changing it afterwards** is possible — `bucket` is an ordinary table option, alterable from a
+compute engine — but **Paimon does not redistribute existing data**, so the old rows stay in the
+buckets they are in and only new writes follow the new count. Treat a change as needing a rewrite
+of the table (re-bootstrap), not as a free knob. A wrong guess is therefore recoverable, not
+permanent.
 
 An emptied database directory is left in place when its last table is dropped. That is harmless —
 Paimon re-uses it, and `createDatabase` is idempotent — and removing it would be presumptuous while
@@ -678,7 +713,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 238 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 240 unit tests, builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
