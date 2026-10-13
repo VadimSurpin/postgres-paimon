@@ -2,58 +2,78 @@
 
 ## Prerequisites
 
-The C++ extension has non-trivial native dependencies. The easiest way to get a working build environment is Docker:
+* PostgreSQL 18 with the server development files (`postgresql-server-dev-18` on Debian and Ubuntu),
+  which provide PGXS and `pg_regress` for the extension's tests.
+* JDK 17 and Maven 3.9 or later.
+* `make`. There is no C or C++ compiler requirement: the extension is pure SQL.
 
-```bash
-docker build -f docker/Dockerfile -t postgres-paimon-build .
-docker run --rm -v "$PWD":/src -w /src/extension postgres-paimon-build make
-```
-
-For a native build, see [Requirements](README.md#requirements) in the README.
+No Docker is needed for anything in this repository.
 
 ## Building
 
 ```bash
-# C++ extension
-cd extension
-make
+# The writer: a shaded jar, built together with its unit tests.
+cd java/writer && mvn -q package           # -> java/writer/target/paimon-writer.jar
 
-# Java tooling
-cd java
-mvn package
+# The Java acceptance suites and the TPC-C comparison tool.
+cd java && mvn -q package
 ```
 
-## Running the Java integration tests
+## Running the tests
 
-The test JARs connect to a live PostgreSQL instance with the extension installed. Set up the instance first:
-
-```ini
-# postgresql.conf
-shared_preload_libraries = 'paimon_heap'
-paimon_heap.warehouse = '/tmp/paimon-warehouse'
-```
-
-```sql
-CREATE EXTENSION paimon_heap;
-CREATE DATABASE testdb;
-```
-
-Then run any test JAR:
+Run all three layers before sending a change; they cover different failures.
 
 ```bash
-java -jar java/target/paimon-feature-test.jar /tmp/paimon-warehouse \
-  "jdbc:postgresql://localhost:5432/testdb?user=postgres&password="
+# 1. Writer unit tests.
+cd java/writer && mvn test
+
+# 2. The SQL extension. install-local stages it under sql/paimon_slot/_install so that no
+#    system directory is written; the test cluster must set extension_control_path to it.
+make -C sql/paimon_slot install-local
+make -C sql/paimon_slot installcheck
+
+# 3. End to end. Builds a throwaway PostgreSQL 18 cluster on port 5442, runs the writer and
+#    every acceptance suite. Needs the writer jar from step 1.
+./test/slot-acceptance/run_acceptance.sh
 ```
+
+`run_acceptance.sh` takes suite names to run a subset. It fails if a named suite matches no tests
+or if every test in it is skipped, so a mistyped name cannot pass silently. The S3 test is skipped
+unless `E2E_MINIO_BIN` points at a MinIO binary; the run reports that plainly instead of counting
+the skip as a pass.
+
+The TPC-C comparison is `./test/tpcc/run_tpcc.sh` locally, or the `tpcc` workflow on GitHub Actions
+(manual dispatch). See [docs/logical-slot-architecture.md](docs/logical-slot-architecture.md),
+section 7, for what each layer proves.
 
 ## Code style
 
-- C++: follow the surrounding code. `clang-format` with the LLVM style is a reasonable baseline.
-- Java: standard Java conventions, no framework required.
-- No new dependencies without a discussion in an issue first — the native dependency surface is already large.
+* Java: standard conventions, no framework required. Keep invariants in comments next to the code
+  that upholds them; several rules here (confirm the LSN only after the commit, never split a
+  transaction, replay must be a no-op) are easy to break and hard to notice.
+* SQL: match the surrounding style. Guardrails raise with a message, a hint and a pointer to the
+  design spec.
+* No new dependencies without a discussion in an issue first. The writer jar is already large.
+
+## Writing tests
+
+* **Assert what the system does, not that it did not crash.** This codebase has repeatedly had
+  checks that passed whether or not the behaviour was correct. Prefer comparing real output (row
+  contents, the changelog from the `$audit_log` system table, bytes captured from PostgreSQL) over
+  counts, and confirm a new test fails when the behaviour it guards is broken.
+* **Never read row kinds from a merged Paimon read**; it reports `INSERT` for every surviving row.
+  Use `$audit_log` over a streaming scan and discard the always-empty first `plan()`. `RawRead` does
+  this.
+* **Register a table while it is empty.** `add_table` decides whether a backfill is due from whether
+  the table has rows, and a non-empty table cannot be added once the slot exists.
+* A harness that reports success for work it did not do is worse than none. If you add a suite,
+  add it to `ALL_SUITES` in `run_acceptance.sh`.
 
 ## Submitting changes
 
 1. Open an issue describing the change before starting significant work.
 2. Keep commits focused; one logical change per commit.
-3. Update `README.md` if you add or change a GUC, supported DDL operation, or build step.
+3. Update the guide in `docs/` if you add or change a setting, a guardrail, a limitation or a
+   build step. State the reason for a limitation, not only the rule: a rule without its reason gets
+   "fixed" later.
 4. All source files must carry the `SPDX-License-Identifier: Apache-2.0` header.
