@@ -32,7 +32,8 @@ NOT_RUN=""                          # checks a suite will skip: reported next to
 # a visible omission here, not a silent gap in the run. (The old PaimonE2ETest was removed with the
 # C++ implementation it exercised; naming a suite that does not exist fails the run, by design.)
 ALL_SUITES=(SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
-            PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest)
+            PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
+            PaimonAdversarialTest)
 LAUNCHER="$RUN/start_writer.sh"
 PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER
