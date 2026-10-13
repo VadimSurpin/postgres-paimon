@@ -385,6 +385,11 @@ public class PaimonAdvancedTest {
     //   T16c  kill -9 with transactions sitting in the buffer, uncommitted, across status updates
     //         and keepalives: nothing may have been confirmed past committed data
     //   T16d  SIGTERM with transactions buffered: a clean stop drains them
+    //   T16e  a keepalive inside an OLDER transaction's burst while a newer one is buffered:
+    //         pgjdbc's auto-advance must not confirm the buffered one (the reviewer's loss).
+    //         The older table was already used on the connection: the guard rewinds.
+    //   T16f  the same with a table first used inside the burst, whose Relation message carries
+    //         LSN 0: the guard commits the buffer
     static final int T16_BATCHES = 100, T16_PER_BATCH = 20;
 
     /** The writer launcher and pid file the harness exports; null when there is no harness. */
@@ -587,6 +592,8 @@ public class PaimonAdvancedTest {
         t16b_killBetweenCommitAndConfirm();
         t16c_killMidBuffer();
         t16d_cleanStopDrains();
+        t16e_keepaliveInAnOlderTransactionsBurst("T16e", true);
+        t16e_keepaliveInAnOlderTransactionsBurst("T16f", false);
     }
 
     static void t16a_killMidLoad() throws Exception {
@@ -755,6 +762,174 @@ public class PaimonAdvancedTest {
 
         startWriter("T16d", launcher, Map.of());
         assertChangelogExactlyOnce("T16d", tbl, batches);
+    }
+
+    /**
+     * The data-loss sequence found in review, live. pgjdbc 42.7.3 auto-advances its flushed
+     * position on a keepalive when the flushed LSN of the last status update it SENT is at or
+     * above the WAL start of the last message received. A transaction that began before that
+     * status update arrives, in commit order, AFTER later-starting ones, with its records' original
+     * (lower) LSNs. So:
+     *
+     *   1. A: BEGIN; 200,000 rows; left open. Idle keepalives move the slot past A's rows.
+     *   2. B: one row, committed. The writer buffers it (interval 600 s), unconfirmed.
+     *   3. A commits. Its Begin and rows arrive below the confirmed position; a reply-requested
+     *      keepalive (every wal_sender_timeout / 2 = 2 s here) lands in the burst; pgjdbc
+     *      advances to the walsender's send pointer, past B's commit, and sends it at once.
+     *   4. kill -9, restart: the slot starts past B, so B's row never reaches Paimon.
+     *
+     * The fix (SlotConsumer.guardBeforeNextRead): when the last message started at or below the
+     * flushed position and something is buffered, rewind pgjdbc's flushed position below it and
+     * send that at once, or, for a Relation message (LSN 0), commit the buffer. With
+     * {@code tableUsedBefore} the older table has had a change on this connection already, so no
+     * Relation message comes in A's burst and the rewind is what protects B (T16e); without it A's
+     * first change brings a Relation message and the commit does (T16f). Both failed on 2b22ca9.
+     */
+    static void t16e_keepaliveInAnOlderTransactionsBurst(String t, boolean tableUsedBefore)
+            throws Exception {
+        System.out.println("\n── " + t + ": KEEPALIVE IN AN OLDER TRANSACTION'S BURST, NEWER ONE BUFFERED ("
+            + (tableUsedBefore ? "rewind" : "Relation message: commit") + ") ─");
+        String[] ctl = writerControl(t);
+        if (ctl == null) return;
+        String launcher = ctl[0], pidFile = ctl[1];
+        String big = "adv_ka_older_" + t.toLowerCase(), small = "adv_ka_buffered_" + t.toLowerCase();
+        final int rowsA = 200_000;
+        settleSlot();
+        new ProcessBuilder("kill", writerPid(pidFile)).inheritIO().start().waitFor();
+        waitProcessGone(writerPid(pidFile));
+        check(t + " old writer stopped", !slotActiveSoon());
+        try (Connection conn = connect()) {
+            exec(conn, "ALTER SYSTEM SET wal_sender_timeout = '4s'");
+            exec(conn, "SELECT pg_reload_conf()");
+        }
+        try {
+            Map<String, String> hold = Map.of("PGPAIMON_BATCH_MAX_INTERVAL_MS", "600000",
+                                              "PGPAIMON_BATCH_MAX_ROWS", "100000000",
+                                              "PGPAIMON_BATCH_MAX_BYTES", "1099511627776");
+            startWriter(t, launcher, hold);
+            cleanup(big);
+            cleanup(small);
+            try (Connection conn = connect()) {
+                createTracked(conn, big, "id INT PRIMARY KEY, v TEXT");
+                if (tableUsedBefore) {
+                    // A change to the older table on this connection, so its Relation message
+                    // is sent now and not in A's burst. The next DDL message (registering the
+                    // small table) is a batch barrier, so this row is committed and confirmed.
+                    exec(conn, "INSERT INTO " + big + " VALUES (0, 'before')");
+                }
+                createTracked(conn, small, "id INT PRIMARY KEY, v TEXT");
+            }
+            Thread.sleep(1500);
+            final int expectBig = rowsA + (tableUsedBefore ? 1 : 0);
+
+            try (Connection a = connect(); Connection b = connect()) {
+                // 1. A, open
+                a.setAutoCommit(false);
+                exec(a, "INSERT INTO " + big + " SELECT g, repeat('x', 20) FROM generate_series(1, "
+                     + rowsA + ") g");
+                long aRowsEnd = walInsertLsn();
+                long deadline = System.currentTimeMillis() + 30_000;
+                while (Long.parseLong(confirmedFlush()) < aRowsEnd
+                       && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(200);
+                }
+                check(t + " idle keepalives moved the confirmed position past A's open rows"
+                      + " (confirmed " + confirmedFlush() + ", A's rows end at " + aRowsEnd + ")",
+                      Long.parseLong(confirmedFlush()) >= aRowsEnd);
+
+                // 2. B, committed and buffered
+                b.setAutoCommit(false);
+                exec(b, "INSERT INTO " + small + " VALUES (1, 'Tb')");
+                long bCommit = walInsertLsn();     // B's commit record starts at or after this
+                b.commit();
+                Thread.sleep(1000);
+                check(t + " B reached the writer and sits in its buffer, uncommitted",
+                      latestSnapshotFile(small) == null);
+
+                // 3. A commits just before the next reply-requested keepalive is due, so that
+                // keepalive lands inside A's burst rather than before or after it.
+                String r0 = replyTime();
+                deadline = System.currentTimeMillis() + 10_000;
+                while (Objects.equals(r0, replyTime()) && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
+                }
+                Thread.sleep(1600);
+                String bigSnapshotBefore = latestSnapshotFile(big);
+                String beforeCommit = replyTime();
+                long committedAt = System.currentTimeMillis();
+                a.commit();
+                long aEnd = walInsertLsn();
+                boolean statusMidBurst = false;
+                deadline = System.currentTimeMillis() + 60_000;
+                while (sentLsn() < aEnd && System.currentTimeMillis() < deadline) {
+                    statusMidBurst |= !Objects.equals(beforeCommit, replyTime());
+                    Thread.sleep(20);
+                }
+                System.out.println("  A's burst took about " + (System.currentTimeMillis() - committedAt)
+                    + " ms to leave the walsender");
+                check(t + " a status update was sent while A's burst was in flight"
+                      + " (the condition the bug needs)", statusMidBurst);
+                Thread.sleep(3000);        // the writer reads the tail of A and buffers it
+
+                long confirmed = Long.parseLong(confirmedFlush());
+                boolean bCommitted = latestSnapshotFile(small) != null;
+                System.out.println("  at the kill: confirmed " + confirmed + ", B's commit record at or after "
+                    + bCommit + ", A's commit ends at " + aEnd + ", B in Paimon: " + bCommitted);
+                check(t + " A is still buffered, uncommitted, at the kill",
+                      Objects.equals(bigSnapshotBefore, latestSnapshotFile(big)));
+                check(t + " the confirmed position did not pass A's commit record", confirmed < aEnd);
+                check(t + " anything confirmed past B's commit record was committed to Paimon first"
+                      + " (confirmed " + confirmed + ", B at " + bCommit + ", B in Paimon " + bCommitted + ")",
+                      confirmed <= bCommit || bCommitted);
+
+                // 4. crash and recover
+                kill9(t, writerPid(pidFile));
+                System.out.println("  Restarting the writer (default limits)...");
+                startWriter(t, launcher, Map.of());
+
+                List<int[]> smallRows = readIdsAndKinds(small);
+                List<int[]> bigRows = readIdsAndKinds(big);
+                deadline = System.currentTimeMillis() + 120_000;
+                while ((smallRows.size() < 1 || bigRows.size() < expectBig)
+                       && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(1000);
+                    smallRows = readIdsAndKinds(small);
+                    bigRows = readIdsAndKinds(big);
+                }
+                Thread.sleep(3000);
+                smallRows = readIdsAndKinds(small);
+                bigRows = readIdsAndKinds(big);
+                check(t + " B's row is in Paimon after the crash (" + smallRows.size() + " record(s))",
+                      smallRows.size() == 1 && smallRows.get(0)[0] == 0 && smallRows.get(0)[1] == 1);
+                check(t + " A's " + rowsA + " rows are in Paimon after the crash, once each ("
+                      + bigRows.size() + " records, " + expectBig + " expected)",
+                      bigRows.size() == expectBig
+                      && bigRows.stream().mapToInt(r -> r[1]).distinct().count() == expectBig);
+            }
+        } finally {
+            try (Connection conn = connect()) {
+                exec(conn, "ALTER SYSTEM RESET wal_sender_timeout");
+                exec(conn, "SELECT pg_reload_conf()");
+            }
+        }
+    }
+
+    /** pg_stat_replication.reply_time of the writer's walsender: when it last heard from it. */
+    static String replyTime() throws Exception {
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT reply_time::text FROM pg_stat_replication"
+                 + " WHERE pid = (SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'paimon')")) {
+            return rs.next() ? rs.getString(1) : null;
+        }
+    }
+
+    /** How far the writer's walsender has sent, as a number; 0 when there is none. */
+    static long sentLsn() throws Exception {
+        try (Connection conn = connect(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT (sent_lsn - '0/0'::pg_lsn)::bigint FROM pg_stat_replication"
+                 + " WHERE pid = (SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'paimon')")) {
+            return rs.next() ? rs.getLong(1) : 0;
+        }
     }
 
     static boolean slotActiveSoon() throws Exception {
