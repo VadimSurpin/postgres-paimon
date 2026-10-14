@@ -69,7 +69,11 @@ extension_control_path = '/path/to/postgres-paimon/sql/paimon_slot/_install:$sys
 
 ```sql
 CREATE EXTENSION paimon_slot;     -- superuser; creates schema "paimon" and publication "paimon_pub"
-GRANT SELECT ON paimon.secret TO writer_role;   -- unless the writer connects as a superuser
+-- unless the writer connects as a superuser, its role needs (besides REPLICATION):
+GRANT USAGE ON SCHEMA paimon TO writer_role;
+GRANT SELECT ON paimon.secret, paimon.retained_history TO writer_role;
+GRANT SELECT, UPDATE ON paimon.table_registry TO writer_role;   -- UPDATE: mark_backfilled()
+GRANT SELECT ON orders TO writer_role;          -- each replicated table, for its initial load
 CREATE TABLE orders (id int PRIMARY KEY, customer text, amount numeric(12,2));
 SELECT paimon.add_table('orders'::regclass);
 ```
@@ -87,7 +91,7 @@ java -jar java/writer/target/paimon-writer.jar
 |---|---|---|
 | `PGPAIMON_JDBC_URL` | required | database to replicate (one writer per database) |
 | `PGPAIMON_WAREHOUSE` | required | Paimon warehouse: a local path, `hdfs://host:port/wh`, or `s3://bucket/wh` |
-| `PGPAIMON_USER`, `PGPAIMON_PASSWORD` | `postgres`, empty | needs the REPLICATION attribute (or superuser), and `SELECT` on `paimon.secret` (section 5, "DDL messages carry a credential") |
+| `PGPAIMON_USER`, `PGPAIMON_PASSWORD` | `postgres`, empty | needs the REPLICATION attribute (or superuser), and the grants above: `USAGE` on schema `paimon`, `SELECT` on `paimon.secret` (section 5, "DDL messages carry a credential") and `paimon.retained_history`, `SELECT, UPDATE` on `paimon.table_registry`, `SELECT` on each replicated table. A missing one stops the writer at startup with the whole list |
 | `PGPAIMON_SLOT` | `paimon` | |
 | `PGPAIMON_PUBLICATION`, `PGPAIMON_MESSAGE_PREFIX` | `paimon_pub`, `paimon` | accepted only with these values: the extension publishes and emits under exactly these names, and any other value replicated nothing without a word |
 | `PGPAIMON_HEALTH_INTERVAL_MS` | `60000` | how often the running writer re-runs `paimon.health()` and stops on a problem (section 3, "When a guardrail was bypassed"); `0` checks only at startup |
@@ -770,6 +774,23 @@ message reaching the writer).
 SEVERE: fatal: java.lang.IllegalStateException: paimon.health() reports 1 problem(s) while running: event trigger paimon_ddl_end is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS). ...
 ```
 
+**What the check does not stop on, and what it does.** It runs on the replication consumer's
+thread, so it is bounded: `lock_timeout = 1s`, `statement_timeout = 30s`. `health()` reads the catalog
+of every replicated table and so waits behind any `ACCESS EXCLUSIVE` lock on one; unbounded, a
+25-second lock on one table held up a row of an unrelated table for the full 25 seconds (measured),
+and a VACUUM FULL of hours would have stalled replication for hours and let `wal_sender_timeout` kill
+the walsender. A timeout, an unreachable server (SQLSTATE class 08), a server shutting down or short
+of resources means "could not check this time" and is logged; at startup a lock timeout is retried
+every 2 seconds. **Every other failure is fatal**, above all `function paimon.health() does not exist`
+(42883), a missing schema or table (3F000, 42P01) or a revoked grant (42501): the extension was
+dropped or broken under the running writer. Its event triggers and registry are then gone, DDL no
+longer reaches the writer, and logging it as "could not reach PostgreSQL" kept the writer running
+and discarding the values of every column added afterwards (measured, before this rule):
+
+```
+SEVERE: fatal: java.lang.IllegalStateException: paimon.health() could not run while running: ERROR: function paimon.health() does not exist (SQLSTATE 42883). This is not a connection problem: the paimon_slot extension, or part of it, is missing ...
+```
+
 **Why stop rather than warn.** Each problem means changes may be reaching PostgreSQL that the writer
 cannot see or cannot apply. A warning in a log nobody reads is how silent divergence happens; a
 stopped writer is noticed (and the slot keeps everything until it is fixed). Fix what it names, check
@@ -955,6 +976,20 @@ accepts `PGPAIMON_PUBLICATION` and `PGPAIMON_MESSAGE_PREFIX` only with the exten
 default state they did not fire under `replica` — a setting DBAs use for bulk loads — and every
 guardrail was silently off for that session (measured: `ADD COLUMN ... DEFAULT` and `REPLICA IDENTITY
 DEFAULT` went through).
+
+**Privileges: a pinned `search_path`, and definer-rights triggers.** Every function of the
+extension runs with `search_path = pg_catalog, pg_temp`, and the writer's own plain connections pin
+the same path. Before, none did: a role with nothing but `CREATE` on `public` planted an `=` operator
+for `(oid, integer)`, which `pg_type_to_paimon` picked up, and the next `paimon.health()` the writer
+ran (unattended, every minute, as `postgres` by default) made that role a superuser (measured). The
+three event-trigger functions are `SECURITY DEFINER`, owned by the extension's owner, and their
+helpers that emit messages or alter tables (`emit`, `sync_table`, `add_guards`, `retain_history`)
+are not executable by PUBLIC. That is what lets an ordinary role `CREATE`, `ALTER` and `DROP` its own
+replicated tables, with every message emitted and every guardrail applied, without being able to
+emit a message itself: as invoker-rights functions, a table owner got `permission denied for
+function emit` on `ALTER TABLE`, and every non-superuser's `CREATE TABLE` anywhere in the database
+failed without `USAGE` on schema `paimon`. `add_table()` and `remove_table()` stay for the extension's
+owner (they alter `paimon_pub` and the registry).
 
 **DDL messages carry a credential.** `paimon.emit()` adds a per-installation token (`paimon.secret`,
 readable only by its owner and roles granted `SELECT`, which the writer's role needs), and `emit()`

@@ -229,7 +229,7 @@ FROM (SELECT paimon.peek_messages() AS j) s;
 
 -- add_table twice is an error, not a silent no-op
 SELECT paimon.add_table('reg_t'::regclass);       -- expect ERROR
-ERROR:  paimon_slot: reg_t is already tracked
+ERROR:  paimon_slot: public.reg_t is already tracked
 -- remove_table
 SELECT paimon.remove_table('reg_t'::regclass);
  remove_table 
@@ -522,10 +522,10 @@ SELECT paimon.add_table('casc_t'::regclass);
 (1 row)
 
 ALTER TABLE casc_t ADD COLUMN dcol dd;
-WARNING:  paimon_slot: type dd has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type public.dd has no Paimon mapping, using STRING
 ALTER TABLE casc_t ADD COLUMN tcol ct;
-WARNING:  paimon_slot: type dd has no Paimon mapping, using STRING
-WARNING:  paimon_slot: type ct has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type public.dd has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type public.ct has no Paimon mapping, using STRING
 SELECT paimon.peek_messages() - 'relid';
                                                                                                                                                       ?column?                                                                                                                                                      
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -536,7 +536,7 @@ SELECT paimon.peek_messages() - 'relid';
 
 DROP DOMAIN dd CASCADE;
 NOTICE:  drop cascades to column dcol of table casc_t
-WARNING:  paimon_slot: type ct has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type public.ct has no Paimon mapping, using STRING
 SELECT paimon.peek_messages() - 'relid';
                   ?column?                  
 --------------------------------------------
@@ -562,7 +562,7 @@ WHERE relid = 'casc_t'::regclass;
 CREATE TYPE ct2 AS (f int);
 CREATE TABLE casc2_t (id int PRIMARY KEY, c ct2);
 SELECT paimon.add_table('casc2_t'::regclass);
-WARNING:  paimon_slot: type ct2 has no Paimon mapping, using STRING
+WARNING:  paimon_slot: type public.ct2 has no Paimon mapping, using STRING
  add_table 
 -----------
  
@@ -848,7 +848,7 @@ SELECT paimon.peek_messages() - 'relid';
 -- a DEFERRABLE primary key cannot be represented in a Paimon pk table
 CREATE TABLE df_t (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED);
 SELECT paimon.add_table('df_t'::regclass);                  -- expect ERROR
-ERROR:  paimon_slot: the primary key of df_t must not be DEFERRABLE
+ERROR:  paimon_slot: the primary key of public.df_t must not be DEFERRABLE
 HINT:  a deferred key permits transient duplicate keys that a Paimon primary-key table cannot represent; see design spec section 7
 SELECT count(*) FROM paimon.table_registry WHERE table_name = 'df_t';
  count 
@@ -1374,8 +1374,8 @@ SELECT paimon.peek_messages() - 'relid';
 CREATE TABLE vg_bad (id int PRIMARY KEY, n numeric(5,2));
 INSERT INTO vg_bad VALUES (1, 'NaN');
 SELECT paimon.add_table('vg_bad'::regclass);                                    -- expect ERROR
-ERROR:  paimon_slot: vg_bad already holds a value Paimon cannot represent
-HINT:  numeric NaN, or a timestamp after 294247-01-10 04:00:54.775807 ('infinity' is fine); find the rows with SELECT * FROM vg_bad WHERE NOT ((n <> 'NaN'::numeric)), correct them, and add the table again
+ERROR:  paimon_slot: public.vg_bad already holds a value Paimon cannot represent
+HINT:  numeric NaN, or a timestamp after 294247-01-10 04:00:54.775807 ('infinity' is fine); find the rows with SELECT * FROM public.vg_bad WHERE NOT ((n <> 'NaN'::numeric)), correct them, and add the table again
 SELECT count(*) FROM paimon.table_registry WHERE table_name = 'vg_bad';
  count 
 -------
@@ -1391,7 +1391,7 @@ SELECT count(*) FROM pg_constraint WHERE conrelid = 'vg_bad'::regclass AND conty
 -- a same-named constraint that is not the guard refuses add_table rather than pass for one
 CREATE TABLE vg_named (id int PRIMARY KEY, n numeric(5,2) CONSTRAINT paimon_guard_2 CHECK (n > 0));
 SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
-ERROR:  paimon_slot: constraint name "paimon_guard_2" on vg_named is reserved for paimon_slot
+ERROR:  paimon_slot: constraint name "paimon_guard_2" on public.vg_named is reserved for paimon_slot
 HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum>; rename or drop that constraint first
 -- remove_table drops the guards (and only them), after which they are ordinary DDL again
 ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
@@ -1464,10 +1464,10 @@ CREATE TABLE gc_stored (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a 
 CREATE TABLE gc_virtual (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2));
 CREATE TABLE gc_ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, a int);
 SELECT paimon.add_table('gc_stored'::regclass);                                 -- expect ERROR
-ERROR:  paimon_slot: column "g" of gc_stored is a generated column, which logical replication does not carry
+ERROR:  paimon_slot: column "g" of public.gc_stored is a generated column, which logical replication does not carry
 HINT:  paimon_pub does not publish generated columns, so Paimon would hold NULL there for every row; drop the expression (ALTER COLUMN ... DROP EXPRESSION) or leave the column out of the replicated table
 SELECT paimon.add_table('gc_virtual'::regclass);                                -- expect ERROR
-ERROR:  paimon_slot: column "g" of gc_virtual is a generated column, which logical replication does not carry
+ERROR:  paimon_slot: column "g" of public.gc_virtual is a generated column, which logical replication does not carry
 HINT:  paimon_pub does not publish generated columns, so Paimon would hold NULL there for every row; drop the expression (ALTER COLUMN ... DROP EXPRESSION) or leave the column out of the replicated table
 SELECT paimon.add_table('gc_ident'::regclass);           -- an identity column is an ordinary value
  add_table 
@@ -1481,10 +1481,10 @@ CREATE TABLE rc_arr (id int PRIMARY KEY, r rt_dom[]);
 CREATE TABLE rc_oid (id int PRIMARY KEY, r oid);
 SET client_min_messages = error;
 SELECT paimon.add_table('rc_t'::regclass);                                      -- expect ERROR
-ERROR:  paimon_slot: column "r" of rc_t has type regclass, whose text form is a catalog lookup
+ERROR:  paimon_slot: column "r" of public.rc_t has type regclass, whose text form is a catalog lookup
 HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
 SELECT paimon.add_table('rc_arr'::regclass);                                    -- expect ERROR
-ERROR:  paimon_slot: column "r" of rc_arr has type rt_dom[], whose text form is a catalog lookup
+ERROR:  paimon_slot: column "r" of public.rc_arr has type public.rt_dom[], whose text form is a catalog lookup
 HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
 SELECT paimon.add_table('rc_oid'::regclass);
  add_table 
@@ -1493,7 +1493,7 @@ SELECT paimon.add_table('rc_oid'::regclass);
 (1 row)
 
 ALTER TABLE rc_oid ADD COLUMN r2 regrole;                                       -- expect ERROR
-ERROR:  paimon_slot: column "r2" of rc_oid has type regrole, whose text form is a catalog lookup
+ERROR:  paimon_slot: column "r2" of public.rc_oid has type regrole, whose text form is a catalog lookup
 HINT:  renaming the object a value points to changes how every such value prints, with nothing in the replication stream, so Paimon would silently keep the old names; store the oid instead (an oid column, or the cast value::oid)
 RESET client_min_messages;
 SELECT j->>'op' AS op, j->>'table' AS tbl FROM (SELECT paimon.peek_messages() AS j) s ORDER BY 2;
@@ -1764,16 +1764,16 @@ SELECT paimon.add_table('ih_par'::regclass);
 (1 row)
 
 CREATE TABLE ih_child () INHERITS (ih_par);                                     -- expect ERROR
-ERROR:  paimon_slot: ih_par has inheritance child ih_child and cannot be replicated
+ERROR:  paimon_slot: public.ih_par has inheritance child public.ih_child and cannot be replicated
 HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
 CREATE TABLE ih_other (id int PRIMARY KEY, v text);
 ALTER TABLE ih_other INHERIT ih_par;                                            -- expect ERROR
-ERROR:  paimon_slot: ih_par has inheritance child ih_other and cannot be replicated
+ERROR:  paimon_slot: public.ih_par has inheritance child public.ih_other and cannot be replicated
 HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
 CREATE TABLE ih_p2 (id int PRIMARY KEY, v text);
 CREATE TABLE ih_c2 () INHERITS (ih_p2);
 SELECT paimon.add_table('ih_p2'::regclass);                                     -- expect ERROR
-ERROR:  paimon_slot: ih_p2 has inheritance child ih_c2 and cannot be replicated
+ERROR:  paimon_slot: public.ih_p2 has inheritance child public.ih_c2 and cannot be replicated
 HINT:  rows of an inheritance child belong to the child: they would not reach the parent's Paimon table although SELECT on the parent returns them; replicate each table separately (paimon.add_table on each), with no inheritance between replicated tables
 -- a replicated CHILD is fine, and its parent's ALTER now reaches its registry
 CREATE TABLE ih_rc (id int PRIMARY KEY, v text);
@@ -1848,10 +1848,10 @@ SELECT paimon.add_table('ty_t'::regclass);
 
 RESET client_min_messages;
 ALTER TYPE ty_comp ADD ATTRIBUTE b int;                                         -- expect ERROR
-ERROR:  paimon_slot: composite type ty_comp is used by replicated column ty_t.c
+ERROR:  paimon_slot: composite type public.ty_comp is used by replicated column public.ty_t.c
 HINT:  changing its attributes changes the text of every value already replicated, without any row change reaching Paimon; create a new type and migrate the column (ADD COLUMN, UPDATE, DROP COLUMN, RENAME COLUMN)
 ALTER TYPE ty_mood RENAME VALUE 'a' TO 'A';              -- expect ERROR (used inside an array)
-ERROR:  paimon_slot: cannot rename a value of enum type ty_mood while replicated column ty_t.m uses it
+ERROR:  paimon_slot: cannot rename a value of enum type public.ty_mood while replicated column public.ty_t.m uses it
 HINT:  rows already replicated keep the old label in Paimon, because a rename changes no row; add the new value (ALTER TYPE ... ADD VALUE), UPDATE the rows to it, then stop using the old one
 ALTER TYPE ty_mood ADD VALUE 'c';
 ALTER TYPE ty_mood RENAME TO ty_mood_renamed;           -- a type rename changes no value text
@@ -1881,7 +1881,7 @@ SELECT paimon.add_table('pub_t'::regclass);
 (1 row)
 
 ALTER PUBLICATION paimon_pub DROP TABLE pub_t;                                  -- expect ERROR
-ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t is not in publication paimon_pub
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table public.pub_t is not in publication paimon_pub
 HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
 ALTER PUBLICATION paimon_pub SET (publish = 'insert');                          -- expect ERROR
 ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: publication paimon_pub does not publish every action (publish must be 'insert, update, delete, truncate')
@@ -1902,10 +1902,10 @@ BEGIN
               FROM paimon.table_registry);
 END $$;
 SELECT pg_temp.restate('ONLY pub_t (id, a)');                                   -- expect ERROR
-ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t has a column list in publication paimon_pub
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table public.pub_t has a column list in publication paimon_pub
 HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
 SELECT pg_temp.restate('ONLY pub_t WHERE (a > 0)');                             -- expect ERROR
-ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table pub_t has a row filter in publication paimon_pub
+ERROR:  paimon_slot: this change to the publication would silently stop changes reaching Paimon: replicated table public.pub_t has a row filter in publication paimon_pub
 HINT:  paimon_pub is managed by paimon.add_table() and paimon.remove_table(); it must publish every action of every replicated table, with no row filter or column list. To stop replicating a table use paimon.remove_table()
 SELECT pg_temp.restate('ONLY pub_t');
  restate 
@@ -2026,8 +2026,8 @@ SELECT * FROM paimon.health();
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  event trigger paimon_ddl_end is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS)
  event trigger paimon_sql_drop is not ENABLE ALWAYS: DDL on replicated tables is not checked or replicated while it does not fire (ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS)
- replicated table srr_t does not have REPLICA IDENTITY FULL
- replicated table srr_t has changed without its DDL being replicated: paimon.table_registry.cols no longer matches the table
+ replicated table public.srr_t does not have REPLICA IDENTITY FULL
+ replicated table public.srr_t has changed without its DDL being replicated: paimon.table_registry.cols no longer matches the table
 (4 rows)
 
 ALTER TABLE srr_t REPLICA IDENTITY FULL;
@@ -2421,6 +2421,110 @@ SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
  t
 (1 row)
 
+SELECT pg_drop_replication_slot('paimon_test');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+-- (14) privileges: no function of the extension resolves through the caller's search_path, and
+-- the event triggers run with the extension owner's rights, so ordinary roles keep ordinary DDL
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+  slot_name  
+-------------
+ paimon_test
+(1 row)
+
+SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'paimon'
+   AND NOT coalesce('search_path=pg_catalog, pg_temp' = ANY (p.proconfig), false);   -- none
+      proname      
+-------------------
+ pg_type_to_paimon
+(1 row)
+
+SELECT p.proname, p.prosecdef FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'paimon' AND p.prosecdef ORDER BY 1;
+     proname      | prosecdef 
+------------------+-----------
+ on_ddl_end       | t
+ on_sql_drop      | t
+ on_table_rewrite | t
+(3 rows)
+
+CREATE ROLE paimon_app LOGIN;
+GRANT CREATE ON SCHEMA public TO paimon_app;
+-- a planted operator that would win resolution of "oid = integer" for an unpinned function
+CREATE FUNCTION public.trojan_eq(a oid, b int) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'trojan ran as %', current_user; RETURN a::bigint = b::bigint; END $$;
+CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = int, FUNCTION = public.trojan_eq);
+SELECT paimon.pg_type_to_paimon(16, -1, false) AS b;                       -- no NOTICE
+NOTICE:  trojan ran as postgres
+    b    
+---------
+ BOOLEAN
+(1 row)
+
+SELECT count(*) FROM paimon.health();                                      -- no NOTICE
+ count 
+-------
+     0
+(1 row)
+
+DROP OPERATOR public.= (oid, int);
+DROP FUNCTION public.trojan_eq(oid, int);
+-- a table owner without any privilege on schema paimon: CREATE, ALTER and DROP its own
+-- replicated table, every message still emitted (with the credential)
+SET ROLE paimon_app;
+CREATE TABLE pv_t (id int PRIMARY KEY, v text);
+RESET ROLE;
+SELECT paimon.add_table('pv_t'::regclass);
+ add_table 
+-----------
+ 
+(1 row)
+
+SET ROLE paimon_app;
+ALTER TABLE pv_t ADD COLUMN extra int;
+ALTER TABLE pv_t ADD COLUMN bad int DEFAULT 1;                               -- expect ERROR
+ERROR:  paimon_slot: ADD COLUMN with a DEFAULT is not supported (public.pv_t.bad)
+HINT:  add the column without a default, then UPDATE it
+DROP TABLE pv_t;
+RESET ROLE;
+-- the triggers' helpers stay private, also to a role with USAGE on the schema
+GRANT USAGE ON SCHEMA paimon TO paimon_app;
+SET ROLE paimon_app;
+SELECT paimon.emit('{}'::jsonb);                                            -- expect ERROR
+ERROR:  permission denied for function emit
+SELECT paimon.sync_table(1);                                                -- expect ERROR
+ERROR:  permission denied for function sync_table
+SELECT paimon.add_guards(1, '{}', false);                                   -- expect ERROR
+ERROR:  permission denied for function add_guards
+RESET ROLE;
+REVOKE USAGE ON SCHEMA paimon FROM paimon_app;
+SELECT j->>'op' AS op, j->'col'->>'name' AS col, j->>'table' AS tbl
+  FROM paimon.peek_messages() j;
+     op     |  col  | tbl  
+------------+-------+------
+ create     |       | pv_t
+ add_col    | extra | 
+ drop_table |       | pv_t
+(3 rows)
+
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'pv_t';
+ count 
+-------
+     0
+(1 row)
+
+SELECT forget_history FROM paimon.forget_history('public', 'pv_t_hist');
+ forget_history 
+----------------
+ 
+(1 row)
+
+REVOKE CREATE ON SCHEMA public FROM paimon_app;
+DROP ROLE paimon_app;
 SELECT pg_drop_replication_slot('paimon_test');
  pg_drop_replication_slot 
 --------------------------

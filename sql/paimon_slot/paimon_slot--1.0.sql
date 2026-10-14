@@ -1,6 +1,19 @@
 -- SPDX-License-Identifier: Apache-2.0
 \echo Use "CREATE EXTENSION paimon_slot" to load this file. \quit
 
+/*
+ * Every function below runs with search_path = pg_catalog, pg_temp.
+ *
+ * Their bodies use operators and functions that PostgreSQL resolves through search_path, and
+ * several run unattended with a superuser's privileges: the event triggers fire inside every
+ * superuser's DDL, and the writer runs paimon.health() every minute, by default as postgres.
+ * Without the pin, any role that can CREATE in a schema on the caller's path could plant an
+ * operator that wins resolution (measured: an "=" for (oid, integer) in public, which
+ * pg_type_to_paimon's CASE typid WHEN 16 picked up, ran ALTER ROLE ... SUPERUSER as postgres
+ * the next time health() ran). Everything of the extension's own is schema-qualified.
+ * pg_temp is named last, explicitly, because otherwise it is searched FIRST.
+ */
+
 CREATE TABLE paimon.table_registry (
     relid              oid PRIMARY KEY,
     schema_name        text        NOT NULL,
@@ -56,7 +69,8 @@ SELECT pg_catalog.pg_extension_config_dump('paimon.retained_history', '');
 -- table's columns on each call and would otherwise repeat it each time.
 CREATE FUNCTION paimon.pg_type_to_paimon(typid oid, typmod int, not_null boolean,
                                          quiet boolean DEFAULT false)
-RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+RETURNS text LANGUAGE plpgsql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     base text;
     raw  int;
@@ -107,7 +121,8 @@ END $$;
 
 -- Ordered, live columns of a relation, with attnum as the Paimon field id.
 CREATE FUNCTION paimon.table_cols(relid oid, quiet boolean DEFAULT false)
-RETURNS jsonb LANGUAGE sql STABLE AS $$
+RETURNS jsonb LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     -- typid/typmod are the PostgreSQL type, kept beside the Paimon type so that sync_table
     -- can judge a type change by what PostgreSQL does to the values (see
     -- reject_unsafe_type_change), which the Paimon type alone cannot tell: varchar(5) and
@@ -125,13 +140,15 @@ $$;
 
 -- The columns as DDL messages carry them: the PostgreSQL type is the registry's business.
 CREATE FUNCTION paimon.wire_cols(cols jsonb)
-RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+RETURNS jsonb LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT coalesce(jsonb_agg(c - 'typid' - 'typmod' ORDER BY o), '[]'::jsonb)
     FROM jsonb_array_elements(cols) WITH ORDINALITY AS x(c, o);
 $$;
 
 CREATE FUNCTION paimon.pk_cols(relid oid)
-RETURNS text[] LANGUAGE sql STABLE AS $$
+RETURNS text[] LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT coalesce(array_agg(a.attname ORDER BY k.ord), '{}'::text[])
     FROM pg_constraint c
     CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
@@ -162,7 +179,8 @@ $$;
  * changing it costs a rewrite of the table.
  */
 CREATE FUNCTION paimon.default_buckets(relid oid) RETURNS int
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT greatest(4, least(64,
         ceil(pg_total_relation_size(relid)::numeric / (1024 * 1024 * 1024))::int));
 $$;
@@ -194,7 +212,8 @@ INSERT INTO paimon.secret VALUES (gen_random_uuid()::text || gen_random_uuid()::
 REVOKE ALL ON paimon.secret FROM PUBLIC;
 
 CREATE FUNCTION paimon.emit(payload jsonb) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE sql
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT pg_logical_emit_message(true, 'paimon',
         (payload || jsonb_build_object('auth', (SELECT token FROM paimon.secret)))::text);
 $$;
@@ -210,7 +229,8 @@ REVOKE ALL ON FUNCTION paimon.emit(jsonb) FROM PUBLIC;
  * arithmetic lives in one place.
  */
 CREATE FUNCTION paimon.reject_unsafe_numeric(v_relid oid, v_attnum int) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     a    pg_attribute;
     prec int;
@@ -271,7 +291,8 @@ END $$;
  * the oid instead (the cast r::oid), which is stable.
  */
 CREATE FUNCTION paimon.reject_unsupported_column(v_relid oid, v_attnum int) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     a pg_attribute;
     t oid;
@@ -321,7 +342,8 @@ END $$;
  * replication; refusing here costs a rename.
  */
 CREATE FUNCTION paimon.reject_unsafe_identity(v_schema text, v_table text) RETURNS void
-LANGUAGE plpgsql IMMUTABLE AS $$
+LANGUAGE plpgsql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF v_table ~ '[$:/]' OR v_table IN ('.', '..') THEN
         RAISE EXCEPTION 'paimon_slot: table name "%" cannot be a Paimon table name', v_table
@@ -354,7 +376,8 @@ END $$;
  * on a replicated column; remove_table() drops them; add_guards() adds them.
  */
 CREATE FUNCTION paimon.guard_expr(v_relid oid, v_attnum int) RETURNS text
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     a pg_attribute;
     c text;
@@ -381,12 +404,14 @@ BEGIN
 END $$;
 
 CREATE FUNCTION paimon.guard_name(v_attnum int) RETURNS name
-LANGUAGE sql IMMUTABLE AS $$ SELECT ('paimon_guard_' || v_attnum)::name $$;
+LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$ SELECT ('paimon_guard_' || v_attnum)::name $$;
 
 /* Whether the column's guard is in place, by name AND by expression: a same-named
  * CHECK (true) is not a guard. */
 CREATE FUNCTION paimon.guard_present(v_relid oid, v_attnum int) RETURNS boolean
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     want text := paimon.guard_expr(v_relid, v_attnum);
 BEGIN
@@ -414,7 +439,8 @@ END $$;
  * the value either (type_change_problem allows only exact widenings).
  */
 CREATE FUNCTION paimon.add_guards(v_relid oid, attnums int[], validate boolean) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     n       int;
     clauses text[] := '{}';
@@ -473,7 +499,8 @@ END $$;
  */
 CREATE FUNCTION paimon.type_change_problem(old_typid oid, old_typmod int,
                                            new_typid oid, new_typmod int)
-RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+RETURNS text LANGUAGE plpgsql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     ints    oid[] := ARRAY['smallint'::regtype, 'integer'::regtype, 'bigint'::regtype]::oid[];
     digits  int[] := ARRAY[5, 10, 19];
@@ -538,7 +565,8 @@ END $$;
  * track.
  */
 CREATE FUNCTION paimon.publication_problems() RETURNS SETOF text
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     p   pg_publication;
     r   record;
@@ -576,7 +604,8 @@ BEGIN
 END $$;
 
 CREATE FUNCTION paimon.check_publication() RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     problems text;
 BEGIN
@@ -593,7 +622,8 @@ END $$;
  * and composite attributes, because each prints its contents' text.
  */
 CREATE FUNCTION paimon.type_used_by_replicated(v_typid oid) RETURNS text
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     WITH RECURSIVE users(typid) AS (
         SELECT v_typid
         UNION
@@ -618,7 +648,8 @@ CREATE FUNCTION paimon.add_table(rel regclass,
                                  changelog_producer text DEFAULT 'input',
                                  buckets int DEFAULT NULL,
                                  hist_buckets int DEFAULT NULL)
-RETURNS void LANGUAGE plpgsql AS $$
+RETURNS void LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     v_relid  oid  := rel::oid;
     v_nsp    text;
@@ -741,7 +772,8 @@ BEGIN
 END $$;
 
 CREATE FUNCTION paimon.remove_table(rel regclass) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     g name;
 BEGIN
@@ -767,14 +799,16 @@ END $$;
 
 -- Called by the writer once a table's initial load has committed.
 CREATE FUNCTION paimon.mark_backfilled(rel regclass) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE sql
+    SET search_path = pg_catalog, pg_temp AS $$
     UPDATE paimon.table_registry SET backfill_due = false WHERE relid = rel::oid;
 $$;
 
 -- Test helper: decode paimon-prefixed logical messages through a private
 -- test_decoding slot.  Not used by the writer.
 CREATE FUNCTION paimon.peek_messages() RETURNS SETOF jsonb
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     r record;
 BEGIN
@@ -800,7 +834,8 @@ REVOKE ALL ON FUNCTION paimon.peek_messages() FROM PUBLIC;
  * rule: add_table() and the ddl_command_end trigger both call it.
  */
 CREATE FUNCTION paimon.reject_reserved_name(col_name text)
-RETURNS void LANGUAGE plpgsql IMMUTABLE AS $$
+RETURNS void LANGUAGE plpgsql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF lower(col_name) = ANY (ARRAY['_value_kind', '_row_id', 'rowkind',
                                     '_level', '_sequence_number']) THEN
@@ -841,7 +876,8 @@ END $$;
 
 /* The history table of a table registered as `name`. One place, so every check agrees. */
 CREATE FUNCTION paimon.hist_name(name text) RETURNS text
-LANGUAGE sql IMMUTABLE AS $$ SELECT name || '_hist' $$;
+LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$ SELECT name || '_hist' $$;
 
 /*
  * Whether `candidate` is one of the Paimon tables of the history `hist` (= T_hist): the current
@@ -849,7 +885,8 @@ LANGUAGE sql IMMUTABLE AS $$ SELECT name || '_hist' $$;
  * DDL message's LSN>.
  */
 CREATE FUNCTION paimon.is_history_of(candidate text, hist text) RETURNS boolean
-LANGUAGE sql IMMUTABLE AS $$
+LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT candidate = hist
         OR (length(candidate) = length(hist) + 17
             AND left(candidate, length(hist) + 1) = hist || '_'
@@ -866,7 +903,8 @@ $$;
  * (HistBuckets) when it re-sizes a history table at a DDL rotation; keep the two in step.
  */
 CREATE FUNCTION paimon.hist_buckets_for(bytes_per_day numeric) RETURNS int
-LANGUAGE sql IMMUTABLE AS $$
+LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT greatest(1, least(64, ceil(coalesce(bytes_per_day, 0) / (1024::numeric * 1024 * 1024))::int))
 $$;
 
@@ -876,7 +914,8 @@ $$;
  */
 CREATE FUNCTION paimon.hist_bytes_per_day(n_ins bigint, n_upd bigint, n_del bigint,
                                           days numeric, row_bytes numeric) RETURNS numeric
-LANGUAGE sql IMMUTABLE AS $$
+LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT (n_ins + 2 * n_upd + n_del) / days * row_bytes
 $$;
 
@@ -888,7 +927,8 @@ $$;
  * reset or less than a day old, or no row width to measure.
  */
 CREATE FUNCTION paimon.estimate_hist_buckets(v_relid oid) RETURNS int
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     st    pg_stat_user_tables;
     since timestamptz;
@@ -919,7 +959,8 @@ END $$;
  * here; the writer refuses to adopt a history table carrying another registration (or none).
  */
 CREATE FUNCTION paimon.reject_name_collision(v_schema text, v_table text) RETURNS void
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     other text;
     kept  paimon.retained_history;
@@ -953,7 +994,8 @@ END $$;
 
 /* Records that a table's history table stays behind (remove_table, DROP TABLE). */
 CREATE FUNCTION paimon.retain_history(v_relid oid, why text) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE sql
+    SET search_path = pg_catalog, pg_temp AS $$
     INSERT INTO paimon.retained_history (schema_name, hist_table, relid, table_name, registration, reason)
     SELECT schema_name, hist_table, relid, table_name, registration, why
       FROM paimon.table_registry WHERE relid = v_relid
@@ -969,7 +1011,8 @@ $$;
  * refuses to adopt a history table carrying another registration.
  */
 CREATE FUNCTION paimon.forget_history(schema_name text, hist_table text) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     DELETE FROM paimon.retained_history h
      WHERE h.schema_name = forget_history.schema_name AND h.hist_table = forget_history.hist_table;
@@ -987,7 +1030,8 @@ END $$;
  * child or a partition; on_ddl_end keeps it in step when its parent's ALTER reaches it.
  */
 CREATE FUNCTION paimon.reject_inheritance(v_relid oid) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     child oid;
 BEGIN
@@ -1015,7 +1059,8 @@ END $$;
  * same transaction.  A no-op for untracked tables.
  */
 CREATE FUNCTION paimon.sync_table(v_relid oid) RETURNS void
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     reg       paimon.table_registry;
     new_cols  jsonb;
@@ -1234,7 +1279,8 @@ BEGIN
 END $$;
 
 CREATE FUNCTION paimon.on_ddl_end() RETURNS event_trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     obj   record;
     t     oid;
@@ -1332,7 +1378,8 @@ CREATE EVENT TRIGGER paimon_ddl_end ON ddl_command_end
  * statement in EXECUTE from fragments, is not caught (documented residual risk).
  */
 CREATE FUNCTION paimon.on_table_rewrite() RETURNS event_trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     reg paimon.table_registry;
 BEGIN
@@ -1361,7 +1408,8 @@ CREATE EVENT TRIGGER paimon_table_rewrite ON table_rewrite
  * the original name (tracking is keyed on relid, so it survives the rename).
  */
 CREATE FUNCTION paimon.on_sql_drop() RETURNS event_trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     obj     record;
     reg     paimon.table_registry;
@@ -1417,6 +1465,26 @@ ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS;
 ALTER EVENT TRIGGER paimon_table_rewrite ENABLE ALWAYS;
 
 /*
+ * The three event-trigger functions are SECURITY DEFINER (owned by the extension's owner, a
+ * superuser), and the helpers that change state on their behalf are not executable by PUBLIC.
+ *
+ * Why. The triggers fire inside DDL run by ANY role. As invoker they ran with that role's
+ * privileges, so once emit() stopped being PUBLIC (it must not be: it carries the credential),
+ * a table's own owner could no longer ALTER or DROP it ("permission denied for function emit"),
+ * and without USAGE on schema paimon every CREATE TABLE by a non-superuser anywhere in the
+ * database failed ("permission denied for schema paimon"). Definer rights restore ordinary DDL
+ * for ordinary roles without granting any of them emit() or the registry. The functions decide
+ * nothing from their caller: they read pg_event_trigger_*(), the catalog and the registry, and
+ * their search_path is pinned (top of this file), which is what makes definer rights safe.
+ *
+ * sync_table and add_guards, which emit messages and ALTER tables, and retain_history, which
+ * writes the retained-history list, are then the triggers' private helpers.
+ */
+REVOKE ALL ON FUNCTION paimon.sync_table(oid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION paimon.add_guards(oid, int[], boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION paimon.retain_history(oid, text) FROM PUBLIC;
+
+/*
  * Everything the guardrails above are meant to keep true, checked from the catalog. Returns
  * one row per problem; none means healthy. For monitoring, and the writer runs it at startup
  * and periodically and stops on any problem (design spec section 8): each one means changes
@@ -1425,7 +1493,8 @@ ALTER EVENT TRIGGER paimon_table_rewrite ENABLE ALWAYS;
  * a catalog edited by hand.
  */
 CREATE FUNCTION paimon.health() RETURNS SETOF text
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     e   text;
     r   paimon.table_registry;

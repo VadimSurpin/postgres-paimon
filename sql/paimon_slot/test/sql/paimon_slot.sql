@@ -848,3 +848,48 @@ SELECT j->'options'->>'hist-bucket' AS hb, j->'options'->>'hist-bucket-user' AS 
 DROP TABLE arc_hist_0000000000000001, "arc2_hist_00000000000000FF", arc2, hb_t, hb_u;
 SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- (14) privileges: no function of the extension resolves through the caller's search_path, and
+-- the event triggers run with the extension owner's rights, so ordinary roles keep ordinary DDL
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'paimon'
+   AND NOT coalesce('search_path=pg_catalog, pg_temp' = ANY (p.proconfig), false);   -- none
+SELECT p.proname, p.prosecdef FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'paimon' AND p.prosecdef ORDER BY 1;
+CREATE ROLE paimon_app LOGIN;
+GRANT CREATE ON SCHEMA public TO paimon_app;
+-- a planted operator that would win resolution of "oid = integer" for an unpinned function
+CREATE FUNCTION public.trojan_eq(a oid, b int) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'trojan ran as %', current_user; RETURN a::bigint = b::bigint; END $$;
+CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = int, FUNCTION = public.trojan_eq);
+SELECT paimon.pg_type_to_paimon(16, -1, false) AS b;                       -- no NOTICE
+SELECT count(*) FROM paimon.health();                                      -- no NOTICE
+DROP OPERATOR public.= (oid, int);
+DROP FUNCTION public.trojan_eq(oid, int);
+-- a table owner without any privilege on schema paimon: CREATE, ALTER and DROP its own
+-- replicated table, every message still emitted (with the credential)
+SET ROLE paimon_app;
+CREATE TABLE pv_t (id int PRIMARY KEY, v text);
+RESET ROLE;
+SELECT paimon.add_table('pv_t'::regclass);
+SET ROLE paimon_app;
+ALTER TABLE pv_t ADD COLUMN extra int;
+ALTER TABLE pv_t ADD COLUMN bad int DEFAULT 1;                               -- expect ERROR
+DROP TABLE pv_t;
+RESET ROLE;
+-- the triggers' helpers stay private, also to a role with USAGE on the schema
+GRANT USAGE ON SCHEMA paimon TO paimon_app;
+SET ROLE paimon_app;
+SELECT paimon.emit('{}'::jsonb);                                            -- expect ERROR
+SELECT paimon.sync_table(1);                                                -- expect ERROR
+SELECT paimon.add_guards(1, '{}', false);                                   -- expect ERROR
+RESET ROLE;
+REVOKE USAGE ON SCHEMA paimon FROM paimon_app;
+SELECT j->>'op' AS op, j->'col'->>'name' AS col, j->>'table' AS tbl
+  FROM paimon.peek_messages() j;
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'pv_t';
+SELECT forget_history FROM paimon.forget_history('public', 'pv_t_hist');
+REVOKE CREATE ON SCHEMA public FROM paimon_app;
+DROP ROLE paimon_app;
+SELECT pg_drop_replication_slot('paimon_test');
