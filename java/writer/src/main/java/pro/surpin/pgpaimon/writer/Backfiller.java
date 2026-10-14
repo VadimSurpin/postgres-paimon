@@ -40,6 +40,14 @@ import org.postgresql.replication.LogSequenceNumber;
  * can collide with a streaming commit (those carry a commit LSN after it). Subtracting is safe;
  * adding would put an identifier past WAL the stream has not replayed, and a restart would then
  * resume beyond it.
+ *
+ * <p><b>Operation records.</b> Each loaded row is also an {@code R} row in the table's history
+ * table and, for a table with no primary key, in its main table (an operation log), with
+ * {@code _commit_lsn = _lsn = consistentPoint}, {@code _xid = 0} (no transaction made it) and
+ * {@code _ts} the moment the load began. Those two tables are append-only, so the overwrite that
+ * clears an interrupted earlier attempt is applied to them only while they hold nothing but
+ * {@code R} rows; once they hold streamed history (a re-bootstrap) that history is kept, and the
+ * reload's {@code R} rows are appended after it.
  */
 public final class Backfiller implements AutoCloseable {
 
@@ -144,11 +152,21 @@ public final class Backfiller implements AutoCloseable {
                 }
                 long chunks = (rows + chunk - 1) / chunk;
                 long truncId = truncateIdentifier(plan.consistentPoint(), chunks);
-                requireApplied(sink.truncate(relid, truncId), qualified, truncId);
+                boolean log = registry.keyless(relid);
+                boolean hist = registry.hasHistory(relid);
+                long hk = HistoryKeys.histKey(relid);
+                if (!log || onlyLoads(relid)) {
+                    requireApplied(sink.truncate(relid, truncId), qualified, truncId);
+                }
+                if (hist && onlyLoads(hk)) {
+                    requireApplied(sink.truncate(hk, truncId), qualified + " (history)", truncId);
+                }
+                long loadMicros = System.currentTimeMillis() * 1000L;
 
                 CopyOut copy = conn.unwrap(PGConnection.class).getCopyAPI().copyOut(
                     "COPY " + qualified + " (" + cols + ") TO STDOUT");
                 List<SinkRecord> batch = new ArrayList<>(Math.min(chunk, 1 << 16));
+                long inChunk = 0;
                 long opSeq = 0;
                 long chunkIndex = 0;
                 long loaded = 0;
@@ -166,11 +184,22 @@ public final class Backfiller implements AutoCloseable {
                     }
                     // opSeq is only an ordering within one _seq and primary keys are unique in
                     // a snapshot, so wrapping past Integer.MAX_VALUE (2 billion rows) is harmless.
-                    batch.add(new SinkRecord(relid, RowKind.INSERT, values,
-                        plan.consistentPoint(), (int) (opSeq++ & Integer.MAX_VALUE), 0L));
+                    int seq = (int) (opSeq++ & Integer.MAX_VALUE);
+                    long cp = plan.consistentPoint();
+                    if (log) {
+                        batch.add(SinkRecord.op(relid, 'R', null, values, cp, seq, 0L,
+                                                loadMicros, null).withCommitLsn(cp));
+                    } else {
+                        batch.add(new SinkRecord(relid, RowKind.INSERT, values, cp, seq, 0L));
+                    }
+                    if (hist) {
+                        batch.add(SinkRecord.op(hk, 'R', null, values, cp, seq, 0L, loadMicros,
+                                                null).withCommitLsn(cp));
+                    }
                     loaded++;
-                    if (batch.size() == chunk) {
+                    if (++inChunk == chunk) {
                         flushChunk(batch, qualified, plan, chunks, chunkIndex++);
+                        inChunk = 0;
                     }
                 }
                 if (!batch.isEmpty()) {
@@ -189,6 +218,34 @@ public final class Backfiller implements AutoCloseable {
             }
         }
         LOG.info("backfilled " + qualified + " (paimon " + schema + "." + table + ") at " + plan.consistentPoint());
+    }
+
+    /**
+     * Whether an append-only table (a history table, or a key-less table's log) holds nothing
+     * but rows of an initial load ({@code _op = 'R'}), so that overwriting it can only remove
+     * what an interrupted earlier load left. Files whose statistics say every row is {@code R}
+     * are skipped by the filter, so this reads little.
+     */
+    private boolean onlyLoads(long key) throws Exception {
+        org.apache.paimon.table.FileStoreTable t = registry.table(key);
+        int op = t.rowType().getFieldNames().indexOf(LogRowBuilder.OP);
+        if (op < 0) {
+            throw new IllegalStateException(t.fullName() + " has no " + LogRowBuilder.OP);
+        }
+        org.apache.paimon.data.BinaryString r = org.apache.paimon.data.BinaryString.fromString("R");
+        var rb = t.newReadBuilder()
+            .withFilter(new org.apache.paimon.predicate.PredicateBuilder(t.rowType())
+                .notEqual(op, r))
+            .withProjection(new int[] {op});
+        try (var reader = rb.newRead().createReader(rb.newScan().plan());
+             var it = reader.toCloseableIterator()) {
+            while (it.hasNext()) {
+                if (!r.equals(it.next().getString(0))) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** The table's present, quoted, schema-qualified name; looked up before the transaction. */

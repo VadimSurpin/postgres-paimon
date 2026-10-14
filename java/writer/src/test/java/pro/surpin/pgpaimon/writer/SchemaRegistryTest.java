@@ -280,7 +280,7 @@ class SchemaRegistryTest {
         long r = 30001L;
         RelationMeta m1 = new RelationMeta(r, "public", "reuse_t",
             List.of("id", "qty", "price", "note"), List.of(true, false, false, false));
-        RowBuilder a = reg.rowBuilder(r, m1);
+        RowMaker a = reg.rowBuilder(r, m1);
         assertSame(a, reg.rowBuilder(r, m1));
         assertSame(a, reg.rowBuilder(r, new RelationMeta(r, "public", "reuse_t",
             List.of("id", "qty", "price", "note"), List.of(true, false, false, false))));
@@ -294,7 +294,7 @@ class SchemaRegistryTest {
         long r = 30001L;
         RelationMeta m = new RelationMeta(r, "public", "reuse_t",
             List.of("id", "qty", "price"), List.of(true, false, false));
-        RowBuilder before = reg.rowBuilder(r, m);
+        RowMaker before = reg.rowBuilder(r, m);
         reg.forget(r);
         assertFalse(reg.tracked(r));
         assertThrows(IllegalStateException.class, () -> reg.table(r));
@@ -326,11 +326,20 @@ class SchemaRegistryTest {
                      SchemaRegistry.parseType("DECIMAL(10, 2)"));
     }
 
+    /**
+     * What the registry logs about MAIN tables while {@code r} runs. Lines about a history table
+     * (they say "history table") are left out: the same DDL is fanned out to it and logs its own
+     * lines, which SchemaRegistryHistoryTest asserts.
+     */
     private static List<LogRecord> captureWarnings(Class<?> c, Runnable r) {
         List<LogRecord> logged = new ArrayList<>();
         Logger log = Logger.getLogger(c.getName());
         Handler h = new Handler() {
-            public void publish(LogRecord x) { logged.add(x); }
+            public void publish(LogRecord x) {
+                if (!x.getMessage().contains("history table")) {
+                    logged.add(x);
+                }
+            }
             public void flush() {}
             public void close() {}
         };
@@ -996,7 +1005,7 @@ class SchemaRegistryTest {
                         "two tables, not one");
         assertTrue(java.nio.file.Files.isDirectory(warehouse.resolve("public.db").resolve("f")));
         assertTrue(java.nio.file.Files.isDirectory(warehouse.resolve("s2.db").resolve("f")));
-        assertEquals(List.of("f"), catalog.listTables("s2"));
+        assertEquals(List.of("f", "f_hist"), catalog.listTables("s2"));
         assertTrue(catalog.listDatabases().containsAll(List.of("public", "s2")));
 
         // each carries its OWN applied-DDL identifier, where they previously shared one

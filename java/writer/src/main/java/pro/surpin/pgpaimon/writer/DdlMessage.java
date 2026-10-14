@@ -47,6 +47,16 @@ public record DdlMessage(int version, String op, long relid, String schema, Stri
         }
     }
 
+    /** The history table's name carried by {@code create}; null when absent. */
+    public String histTable() {
+        return options == null ? null : options.get("hist-table");
+    }
+
+    /** The registration id carried by {@code create}; null when absent. */
+    public String registration() {
+        return options == null ? null : options.get("registration");
+    }
+
     /** The changelog-producer option carried by {@code create}; null when absent. */
     public String changelogProducer() {
         return options == null ? null : options.get("changelog-producer");

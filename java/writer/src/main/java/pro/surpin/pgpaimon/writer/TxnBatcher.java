@@ -30,6 +30,18 @@ import java.util.logging.Logger;
  * (This used to throw for any mix of the two, and since the transaction was already committed
  * the throw replayed on every restart: BEGIN; TRUNCATE t; INSERT INTO t ...; COMMIT -- the usual
  * way to reload a table -- stopped replication for good. Measured on PostgreSQL 18.)
+ *
+ * <p><b>Operation records</b> (spec 2026-10-14). Besides the changelog records of a primary-key
+ * table, every change of a tracked relation also yields ONE operation record for its history
+ * table, and -- for a relation with no primary key -- one for its main table, which is an
+ * operation log. An operation record is the change as it happened: {@code I}, {@code U},
+ * {@code D} or {@code T}, with the old row and the new row, its own change LSN and {@code _op_seq}
+ * (the ordinal of the change's first record in the transaction), the transaction's xid and
+ * commit time, and, stamped at the Commit, the commit LSN. Nothing about it is ever merged: two
+ * updates of one row in one transaction are two operation records. A TRUNCATE is one {@code T}
+ * record, and it removes nothing from the history or from a log: the records before it stay,
+ * because they happened. (Only a primary-key table's changelog records before a truncate are
+ * dropped, as described above, since the overwrite would delete them anyway.)
  */
 public final class TxnBatcher {
 
@@ -66,18 +78,19 @@ public final class TxnBatcher {
     }
 
     private final ToastResolver resolver;
-    private final SchemaRegistry registry;   // null means every relation is tracked
+    private final TableTracker registry;     // null: every relation is tracked, no history
     private final Flusher flusher;
     private final long skipLsn;              // 0 = no escape configured
     private final RowCheck rowCheck;         // null = cannot check, so never skip
 
     private List<SinkRecord> open;
     private long xid;
+    private long commitMicros;               // the open transaction's commit time, Unix epoch
     private int opSeq;
     private final Set<Long> buffered = new HashSet<>();    // relids with records this txn
     private final List<String> skipped = new ArrayList<>();  // audit lines for this txn
 
-    public TxnBatcher(ToastResolver resolver, SchemaRegistry registry, Flusher flusher) {
+    public TxnBatcher(ToastResolver resolver, TableTracker registry, Flusher flusher) {
         this(resolver, registry, flusher, 0, null);
     }
 
@@ -86,7 +99,7 @@ public final class TxnBatcher {
      * the POISON RECORD error printed; {@code rowCheck} decides whether the record at that LSN
      * really is unrepresentable.
      */
-    public TxnBatcher(ToastResolver resolver, SchemaRegistry registry, Flusher flusher,
+    public TxnBatcher(ToastResolver resolver, TableTracker registry, Flusher flusher,
                       long skipLsn, RowCheck rowCheck) {
         this.resolver = resolver;
         this.registry = registry;
@@ -123,6 +136,7 @@ public final class TxnBatcher {
             }
             open = new ArrayList<>();
             xid = b.xid();
+            commitMicros = LogRowBuilder.pgToUnixMicros(b.commitTimestamp());
             opSeq = 0;
             return;
         }
@@ -132,6 +146,8 @@ public final class TxnBatcher {
             List<String> audit = List.copyOf(skipped);
             discardOpenTransaction();   // the transaction is closed even if flush throws
             dropUntracked(batch);
+            // Operation records learn their transaction's commit LSN only now.
+            batch.replaceAll(r -> r.withCommitLsn(c.commitLsn()));
             if (audit.isEmpty()) {
                 flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
             } else {
@@ -163,14 +179,20 @@ public final class TxnBatcher {
                     if (registry != null && !registry.tracked(relid)) {
                         continue;
                     }
-                    if (buffered.remove(relid)) {
+                    boolean log = registry != null && registry.keyless(relid);
+                    if (!log && buffered.remove(relid)) {
                         // Wiped by this truncate in PostgreSQL; the overwrite is applied before
                         // the transaction's appends, so keeping them would resurrect them.
                         int before = open.size();
-                        open.removeIf(r -> r.relid() == relid);
+                        open.removeIf(r -> r.relid() == relid && r.op() == null);
                         LOG.fine("transaction " + xid + ": TRUNCATE of relation " + relid
                             + " removes the " + (before - open.size()) + " record(s) it made"
                             + " earlier in the same transaction");
+                    }
+                    // One T operation record: the history keeps the truncate as an event, and a
+                    // key-less table's log is not erased by it (it is an audit log).
+                    if (addOps(relid, 'T', null, null, changeLsn, opSeq, null)) {
+                        opSeq++;
                     }
                 }
                 return;
@@ -181,19 +203,69 @@ public final class TxnBatcher {
             if (registry != null && !registry.tracked(relid)) {
                 return;    // traffic for a table this writer does not replicate
             }
-            for (PartialRecord p : resolver.resolve(event, meta)) {
-                SinkRecord record =
-                    new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn, opSeq++, xid, meta);
-                if (skipLsn != 0 && changeLsn == skipLsn && skip(record, meta)) {
-                    continue;   // see skip(): the transaction stays open, deliberately
+            List<PartialRecord> parts = resolver.resolve(event, meta);
+            boolean log = registry != null && registry.keyless(relid);
+            int changeOpSeq = opSeq;
+            if (!log) {
+                for (PartialRecord p : parts) {
+                    SinkRecord record = new SinkRecord(p.relid(), p.kind(), p.values(), changeLsn,
+                                                       opSeq++, xid, meta);
+                    if (skipLsn != 0 && changeLsn == skipLsn && skip(record, meta)) {
+                        continue;   // see skip(): the transaction stays open, deliberately
+                    }
+                    open.add(record);
+                    buffered.add(p.relid());
                 }
-                open.add(record);
-                buffered.add(p.relid());
+            } else {
+                opSeq++;            // an operation log has one record per change
+            }
+            // The change itself, once, with both images. An UPDATE resolves to the old row and
+            // the new one (-U/+U, or -D/+I when a key moved): before is the first, after the
+            // second, so a key move is still one U here.
+            if (event instanceof PgEvent.Insert) {
+                addOps(relid, 'I', null, parts.get(0).values(), changeLsn, changeOpSeq, meta);
+            } else if (event instanceof PgEvent.Update) {
+                addOps(relid, 'U', parts.get(0).values(), parts.get(1).values(), changeLsn,
+                       changeOpSeq, meta);
+            } else if (event instanceof PgEvent.Delete) {
+                addOps(relid, 'D', parts.get(0).values(), null, changeLsn, changeOpSeq, meta);
             }
         } catch (Throwable t) {
             discardOpenTransaction();
             throw t;
         }
+    }
+
+    /**
+     * Adds a change's operation records: one for the relation's history table, and one for its
+     * main table when that is an operation log (no primary key). Each goes through the same
+     * poison-record escape as a changelog record.
+     */
+    private boolean addOps(long relid, char code, List<String> before, List<String> after,
+                           long changeLsn, int seq, RelationMeta meta) {
+        if (registry == null) {
+            return false;   // no registry, no history: the unit-test configuration
+        }
+        boolean any = false;
+        if (registry.keyless(relid)) {
+            addOp(SinkRecord.op(relid, code, before, after, changeLsn, seq, xid, commitMicros,
+                                meta), meta);
+            any = true;
+        }
+        if (registry.hasHistory(relid)) {
+            addOp(SinkRecord.op(HistoryKeys.histKey(relid), code, before, after, changeLsn, seq,
+                                xid, commitMicros, meta), meta);
+            any = true;
+        }
+        return any;
+    }
+
+    private void addOp(SinkRecord record, RelationMeta meta) {
+        if (skipLsn != 0 && record.seq() == skipLsn && record.op().code() != 'T'
+            && skip(record.withCommitLsn(Long.MAX_VALUE), meta)) {
+            return;
+        }
+        open.add(record);
     }
 
     /**

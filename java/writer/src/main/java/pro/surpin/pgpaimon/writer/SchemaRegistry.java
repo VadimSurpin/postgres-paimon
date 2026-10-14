@@ -4,6 +4,7 @@ package pro.surpin.pgpaimon.writer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.apache.paimon.catalog.Catalog;
@@ -28,8 +29,14 @@ import org.apache.paimon.types.TimestampType;
  * relid to Paimon identifier is learned from {@code create} messages, which the writer re-issues
  * for every row of {@code paimon.table_registry} at startup; a relid never created in this
  * process is untracked.
+ *
+ * <p>Every tracked relation has two Paimon tables in the same database: its main table, keyed
+ * by the relid, and its history table ({@code <table>_hist}), keyed by
+ * {@link HistoryKeys#histKey}. The main table is a primary-key table, or, for a relation with no
+ * primary key, an append-only operation log; the history table is always append-only. Every
+ * lookup below takes either key. Spec: docs/superpowers/specs/2026-10-14-operation-history-design.md.
  */
-public final class SchemaRegistry {
+public final class SchemaRegistry implements TableTracker {
 
     private static final Logger LOG = Logger.getLogger(SchemaRegistry.class.getName());
 
@@ -38,8 +45,20 @@ public final class SchemaRegistry {
     private final Map<Long, Identifier> identifiers = new ConcurrentHashMap<>();
     private final Map<Long, FileStoreTable> tables = new ConcurrentHashMap<>();
     private final Map<Long, CachedBuilder> builders = new ConcurrentHashMap<>();
+    private final Set<Long> keyless = ConcurrentHashMap.newKeySet();
 
-    private record CachedBuilder(List<String> columns, FileStoreTable table, RowBuilder builder) {}
+    private record CachedBuilder(List<String> columns, FileStoreTable table, RowMaker builder) {}
+
+    /**
+     * Schema option on a history table: the {@code paimon.table_registry.registration} it was
+     * created for. A history table is an audit trail; a different registration -- a table dropped
+     * and re-created under the same name, or one registered again after remove_table() -- must
+     * not continue it, and a table carrying none was not made by this writer.
+     */
+    static final String REGISTRATION_OPTION = "pgpaimon.registration";
+
+    /** Schema option on a history table naming the table it records, for people reading it. */
+    static final String HISTORY_OF_OPTION = "pgpaimon.history-of";
 
     public SchemaRegistry(Catalog catalog, WriterConfig config) {
         this.catalog = catalog;
@@ -115,7 +134,20 @@ public final class SchemaRegistry {
     public void createTable(long relid, String schema, String table, List<String> pk,
                             List<DdlMessage.Col> cols, String changelogProducer,
                             Integer buckets, long ddlLsn) {
-        create(relid, schema, table, pk, cols, changelogProducer, buckets, false, ddlLsn);
+        createTable(relid, schema, table, pk, cols, changelogProducer, buckets, ddlLsn,
+                    null, null);
+    }
+
+    /**
+     * As above with the history table's name and the registration id the create message
+     * carries ({@code null}: {@code <table>_hist}, and no ownership check).
+     */
+    public void createTable(long relid, String schema, String table, List<String> pk,
+                            List<DdlMessage.Col> cols, String changelogProducer,
+                            Integer buckets, long ddlLsn, String histTable,
+                            String registration) {
+        create(relid, schema, table, pk, cols, changelogProducer, buckets, false, ddlLsn,
+               histTable, registration);
     }
 
     /**
@@ -139,35 +171,119 @@ public final class SchemaRegistry {
     public void bootstrapTable(long relid, String schema, String table, List<String> pk,
                                List<DdlMessage.Col> cols, String changelogProducer,
                                Integer buckets, boolean reconcileLostDdl) {
+        bootstrapTable(relid, schema, table, pk, cols, changelogProducer, buckets,
+                       reconcileLostDdl, null, null);
+    }
+
+    /** As above with the registry row's history table name and registration id. */
+    public void bootstrapTable(long relid, String schema, String table, List<String> pk,
+                               List<DdlMessage.Col> cols, String changelogProducer,
+                               Integer buckets, boolean reconcileLostDdl, String histTable,
+                               String registration) {
         // No LSN: the bootstrap replays a registry row, not a message, so it has none to record
         // and must not disturb whatever the table already carries.
-        create(relid, schema, table, pk, cols, changelogProducer, buckets, reconcileLostDdl, 0);
+        create(relid, schema, table, pk, cols, changelogProducer, buckets, reconcileLostDdl, 0,
+               histTable, registration);
+    }
+
+    /**
+     * The main table of a relation with no primary key: an append-only operation log. The user
+     * columns come first, unprefixed and all nullable (a {@code T} row is NULL in every one, and
+     * a log never rewrites a column's nullability), then the operation metadata.
+     *
+     * <p>Bucketing, measured on Paimon 1.4.1 (60 commits of 20 rows each): an unaware-bucket
+     * table ({@code bucket = -1}) gets no compaction from the writer and held 60 live files; a
+     * fixed-bucket table compacts in the writer and held 16. The bucket key must be a column no
+     * DDL can touch: with a user column in {@code bucket-key}, {@code DROP COLUMN} of it fails
+     * ("Field names [...] should contains all bucket keys"), which would be a DDL message the
+     * writer can never apply. So: the registry's fixed bucket count, keyed on {@code _lsn}, which
+     * every row has, differs per change, and is never altered.
+     */
+    private Schema logSchema(List<DdlMessage.Col> cols, Integer buckets, long ddlLsn) {
+        Schema.Builder b = Schema.newBuilder();
+        for (DdlMessage.Col c : cols) {
+            b.column(c.name(), parseType(c.type()).copy(true));
+        }
+        appendMeta(b);
+        appendOptions(b, buckets, ddlLsn);
+        return b.build();
+    }
+
+    /**
+     * A history table: the operation metadata, then {@code before_<col>} for every column, then
+     * {@code after_<col>}. Every user column is prefixed, so none can collide with a metadata
+     * column, and all are nullable: {@code before_*} is NULL for an insert, {@code after_*} for a
+     * delete. Append-only, bucketed like {@link #logSchema}.
+     */
+    private Schema histSchema(List<DdlMessage.Col> cols, Integer buckets, long ddlLsn,
+                              String schema, String table, String registration) {
+        Schema.Builder b = Schema.newBuilder();
+        appendMeta(b);
+        for (DdlMessage.Col c : cols) {
+            b.column(LogRowBuilder.BEFORE + c.name(), parseType(c.type()).copy(true));
+        }
+        for (DdlMessage.Col c : cols) {
+            b.column(LogRowBuilder.AFTER + c.name(), parseType(c.type()).copy(true));
+        }
+        appendOptions(b, buckets, ddlLsn);
+        b.option(HISTORY_OF_OPTION, schema + "." + table);
+        if (registration != null) {
+            b.option(REGISTRATION_OPTION, registration);
+        }
+        return b.build();
+    }
+
+    private static void appendMeta(Schema.Builder b) {
+        b.column(LogRowBuilder.OP, DataTypes.STRING().notNull());
+        b.column(LogRowBuilder.COMMIT_LSN, DataTypes.BIGINT().notNull());
+        b.column(LogRowBuilder.LSN, DataTypes.BIGINT().notNull());
+        b.column(LogRowBuilder.OP_SEQ, DataTypes.INT().notNull());
+        b.column(LogRowBuilder.XID, DataTypes.BIGINT().notNull());
+        b.column(LogRowBuilder.TS, DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6).notNull());
+    }
+
+    private static void appendOptions(Schema.Builder b, Integer buckets, long ddlLsn) {
+        b.option("bucket", String.valueOf(buckets == null ? DEFAULT_BUCKETS : buckets));
+        b.option("bucket-key", LogRowBuilder.LSN);
+        if (ddlLsn != 0) {
+            b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
+        }
     }
 
     private void create(long relid, String schema, String table, List<String> pk,
                         List<DdlMessage.Col> cols, String changelogProducer,
-                        Integer buckets, boolean reconcileLostDdl, long ddlLsn) {
-        Schema.Builder b = Schema.newBuilder();
-        for (DdlMessage.Col c : cols) {
-            b.column(c.name(), parseType(c.type()));
-        }
-        b.column(config.seqField(), DataTypes.BIGINT().notNull());
-        b.column(config.opSeqField(), DataTypes.INT().notNull());
-        if (config.xidField() != null) {
-            b.column(config.xidField(), DataTypes.BIGINT());
-        }
-        b.primaryKey(pk);
-        b.option("merge-engine", "deduplicate");
-        b.option("changelog-producer", changelogProducer == null ? "input" : changelogProducer);
-        b.option("sequence.field", config.seqField() + "," + config.opSeqField());
-        b.option("ignore-update-before", "false");
-        // Fixed-bucket mode. Never left unset: dynamic mode would reject the sink's write(row)
-        // and bring back the key index this exists to remove. A create message always carries a
-        // count, so the fallback is only reached by a caller that has none.
-        b.option("bucket", String.valueOf(buckets == null ? DEFAULT_BUCKETS : buckets));
-        if (ddlLsn != 0) {
-            // On the table's own creation, so a create and its identifier are one atomic write.
-            b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
+                        Integer buckets, boolean reconcileLostDdl, long ddlLsn,
+                        String histTable, String registration) {
+        boolean isLog = pk.isEmpty();
+        Schema wanted;
+        if (isLog) {
+            wanted = logSchema(cols, buckets, ddlLsn);
+        } else {
+            Schema.Builder b = Schema.newBuilder();
+            for (DdlMessage.Col c : cols) {
+                b.column(c.name(), parseType(c.type()));
+            }
+            b.column(config.seqField(), DataTypes.BIGINT().notNull());
+            b.column(config.opSeqField(), DataTypes.INT().notNull());
+            if (config.xidField() != null) {
+                b.column(config.xidField(), DataTypes.BIGINT());
+            }
+            b.primaryKey(pk);
+            b.option("merge-engine", "deduplicate");
+            b.option("changelog-producer",
+                     changelogProducer == null ? "input" : changelogProducer);
+            b.option("sequence.field", config.seqField() + "," + config.opSeqField());
+            b.option("ignore-update-before", "false");
+            // Fixed-bucket mode. Never left unset: dynamic mode would reject the sink's
+            // write(row) and bring back the key index this exists to remove. A create message
+            // always carries a count, so the fallback is only reached by a caller that has none.
+            b.option("bucket", String.valueOf(buckets == null ? DEFAULT_BUCKETS : buckets));
+            if (ddlLsn != 0) {
+                // On the table's own creation, so a create and its identifier are one atomic
+                // write.
+                b.option(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn));
+            }
+            wanted = b.build();
         }
 
         Identifier id = identifierOf(schema, table);
@@ -175,7 +291,6 @@ public final class SchemaRegistry {
         try {
             // One Paimon database per PostgreSQL schema, created on demand. Idempotent.
             catalog.createDatabase(schema, true);
-            Schema wanted = b.build();
             try {
                 existing = catalog.getTable(id);
             } catch (Catalog.TableNotExistException e) {
@@ -186,6 +301,11 @@ public final class SchemaRegistry {
             throw new IllegalStateException("cannot create Paimon table " + id, e);
         }
         identifiers.put(relid, id);
+        if (isLog) {
+            keyless.add(relid);
+        } else {
+            keyless.remove(relid);
+        }
         forget0(relid);
         if (existing != null) {
             // Deliberately NOT carrying the identifier forward onto a table that already
@@ -197,6 +317,108 @@ public final class SchemaRegistry {
             // identifier forward for a table that was never dropped. Leaving the older LSN in
             // place also fails safe: the gate is then less likely to skip, not more.
             reconcileOrWarn(relid, id, existing, pk, cols, reconcileLostDdl);
+        }
+        createHistory(relid, schema, table, histTable == null ? table + "_hist" : histTable,
+                      cols, buckets, ddlLsn, registration, reconcileLostDdl);
+    }
+
+    /**
+     * Creates the relation's history table, or adopts the existing one if it is this
+     * registration's. Refuses one that belongs to another registration, or to none: appending a
+     * different table's changes to an audit trail is the corruption the history exists to
+     * prevent, and {@code paimon.add_table()} already refuses every collision it can see
+     * (paimon.retained_history). Reaching the refusal here means a history table it could not
+     * see -- made by hand, or kept when paimon.forget_history() was run without renaming it.
+     * The writer stops on it; renaming that Paimon table and restarting resolves it, so it is
+     * an outage with an exact remedy, never silent mixing.
+     */
+    private void createHistory(long relid, String schema, String table, String histTable,
+                               List<DdlMessage.Col> cols, Integer buckets, long ddlLsn,
+                               String registration, boolean reconcileLostDdl) {
+        long hk = HistoryKeys.histKey(relid);
+        Identifier hid = identifierOf(schema, histTable);
+        Table existing = null;
+        try {
+            try {
+                existing = catalog.getTable(hid);
+            } catch (Catalog.TableNotExistException e) {
+                // normal first-time case
+            }
+            if (existing == null) {
+                catalog.createTable(hid, histSchema(cols, buckets, ddlLsn, schema, table,
+                                                    registration), true);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot create Paimon history table " + hid, e);
+        }
+        if (existing != null && registration != null) {
+            String owner = existing.options().get(REGISTRATION_OPTION);
+            if (!registration.equals(owner)) {
+                throw new IllegalStateException("Paimon table " + hid + " exists but is not the"
+                    + " history table of this registration of " + schema + "." + table
+                    + (owner == null ? " (it carries no " + REGISTRATION_OPTION
+                                       + "; this writer did not create it)"
+                                     : " (it belongs to registration " + owner
+                                       + ", an earlier table of the same name)")
+                    + ". A history table is an audit trail and is never continued by a"
+                    + " different table. Rename or drop " + hid + " from a compute engine (or"
+                    + " move its directory out of the warehouse), then restart the writer: it"
+                    + " creates a new, empty history table. Nothing has been written to it.");
+            }
+        }
+        identifiers.put(hk, hid);
+        forget0(hk);
+        if (existing != null) {
+            reconcileHistory(hk, hid, existing, cols, reconcileLostDdl);
+        }
+    }
+
+    /**
+     * The history-table counterpart of {@link #reconcileOrWarn}: a {@code before_}/{@code after_}
+     * pair the registry has and Paimon lacks is added only when the slot is absent (its message
+     * is then lost, not pending); a type difference is a warning. A pair Paimon has and the
+     * registry does not is NOT reported: that is a dropped column's history, kept by design.
+     */
+    private void reconcileHistory(long hk, Identifier hid, Table existing,
+                                  List<DdlMessage.Col> cols, boolean reconcileLostDdl) {
+        Map<String, DataType> have = new java.util.LinkedHashMap<>();
+        for (DataField f : existing.rowType().getFields()) {
+            have.put(f.name(), f.type());
+        }
+        List<String> diffs = new ArrayList<>();
+        List<SchemaChange> add = new ArrayList<>();
+        for (DdlMessage.Col c : cols) {
+            DataType t = parseType(c.type()).copy(true);
+            for (String name : List.of(LogRowBuilder.BEFORE + c.name(),
+                                       LogRowBuilder.AFTER + c.name())) {
+                DataType got = have.get(name);
+                if (got == null) {
+                    if (reconcileLostDdl) {
+                        add.add(SchemaChange.addColumn(name, t));
+                    } else {
+                        diffs.add("column '" + name + "' is missing; its DDL message should still"
+                            + " be in the slot and is left to it");
+                    }
+                } else if (!got.equals(t)) {
+                    diffs.add("column '" + name + "' is " + got.asSQLString() + " in Paimon but "
+                        + t.asSQLString() + " in the registry");
+                }
+            }
+        }
+        if (!add.isEmpty()) {
+            try {
+                catalog.alterTable(hid, add, false);
+                forget0(hk);
+                LOG.warning("history table " + hid + ": added " + add.size() + " column(s) the"
+                    + " registry declares and Paimon lacked (the slot is absent, so their DDL"
+                    + " messages are lost, not pending; earlier rows hold NULL there)");
+            } catch (Exception e) {
+                diffs.add("missing columns could not be added: " + e);
+            }
+        }
+        if (!diffs.isEmpty()) {
+            LOG.warning("history table " + hid + " differs from the registry: "
+                + String.join("; ", diffs));
         }
     }
 
@@ -240,16 +462,20 @@ public final class SchemaRegistry {
             DataType t = have.remove(c.name());
             if (t == null) {
                 missing.add(c);
-            } else if (!t.equals(parseType(c.type()))) {
+            } else if (!t.equals(mainType(relid, c.type()))) {
                 diffs.add("column '" + c.name() + "' is " + t.asSQLString()
-                    + " in Paimon but " + parseType(c.type()).asSQLString()
+                    + " in Paimon but " + mainType(relid, c.type()).asSQLString()
                     + " in the create message");
             }
         }
-        have.remove(config.seqField());
-        have.remove(config.opSeqField());
-        if (config.xidField() != null) {
-            have.remove(config.xidField());
+        if (keyless(relid)) {
+            LogRowBuilder.META.forEach(have::remove);
+        } else {
+            have.remove(config.seqField());
+            have.remove(config.opSeqField());
+            if (config.xidField() != null) {
+                have.remove(config.xidField());
+            }
         }
         for (String extra : have.keySet()) {
             // Its own WARNING, not a clause in a list. This column is NULL for every row, and
@@ -278,7 +504,7 @@ public final class SchemaRegistry {
                     + " table");
                 continue;
             }
-            DataType t = parseType(c.type());
+            DataType t = mainType(relid, c.type());
             try {
                 catalog.alterTable(id, List.of(SchemaChange.addColumn(c.name(), t)), false);
                 forget0(relid);
@@ -351,11 +577,80 @@ public final class SchemaRegistry {
      */
     static final String DDL_LSN_OPTION = "pgpaimon.applied-ddl-lsn";
 
+    /*
+     * DDL fan-out to the history table (spec 2026-10-14 section 3, rule 3). Each DDL message is
+     * applied to the main table and then to the history table, each gated by ITS OWN recorded DDL
+     * LSN, so a crash between the two leaves one applied and the other to be applied on replay,
+     * and the gate sorts out which. add_col adds before_x/after_x; drop_col KEEPS them (history
+     * is not rewritten; they read NULL for later rows) and only records the LSN; rename_col
+     * renames both; alter_col changes both types.
+     *
+     * A kept pair is why re-adding a dropped column's name needs care: before_x still holds the
+     * old column's history. It is renamed aside to before_x_retired_<lsn> in the same atomic
+     * schema change that adds the new pair, so history keeps the old values under a name that
+     * says what they are, and the new column starts empty. How a kept pair is told apart from a
+     * replay: a drop_col records the LSN on the history table, so a history table carrying no
+     * recorded LSN has never had a column dropped and its before_x can only be the create's own
+     * (built by the startup bootstrap from the registry while the add_col was still in the slot):
+     * that case is "already applied".
+     */
     public void addColumn(long relid, DdlMessage.Col col, long ddlLsn) {
+        addColumnMain(relid, col, ddlLsn);
+        if (hasHistory(relid)) {
+            addColumnHist(HistoryKeys.histKey(relid), col, ddlLsn);
+        }
+    }
+
+    private void addColumnHist(long hk, DdlMessage.Col col, long ddlLsn) {
+        if (replayed(hk, ddlLsn, "add_col '" + col.name() + "'")) {
+            return;
+        }
+        DataType t = parseType(col.type()).copy(true);
+        String b = LogRowBuilder.BEFORE + col.name();
+        String a = LogRowBuilder.AFTER + col.name();
+        List<SchemaChange> changes = new ArrayList<>();
+        if (field(hk, b) != null || field(hk, a) != null) {
+            if (appliedDdlLsn(hk) == 0) {
+                LOG.info("add_col '" + col.name() + "' on history table " + identifiers.get(hk)
+                    + " is already applied (its columns were created with the table): no-op");
+                return;
+            }
+            changes.addAll(retire(hk, col.name(), ddlLsn));
+        }
+        changes.add(SchemaChange.addColumn(b, t));
+        changes.add(SchemaChange.addColumn(a, t));
+        alter(hk, changes, ddlLsn);
+    }
+
+    /**
+     * Renames a kept before_/after_ pair aside, to {@code <prefix><col>_retired_<lsn>}, where the
+     * LSN is that of the DDL message reusing the name: the kept values are the history of a
+     * column of this name dropped before that point.
+     */
+    private List<SchemaChange> retire(long hk, String col, long ddlLsn) {
+        String suffix = "_retired_" + Long.toUnsignedString(ddlLsn);
+        List<SchemaChange> out = new ArrayList<>();
+        for (String prefix : List.of(LogRowBuilder.BEFORE, LogRowBuilder.AFTER)) {
+            if (field(hk, prefix + col) == null) {
+                continue;
+            }
+            String to = prefix + col + suffix;
+            for (int n = 2; field(hk, to) != null; n++) {
+                to = prefix + col + suffix + "_" + n;
+            }
+            out.add(SchemaChange.renameColumn(prefix + col, to));
+            LOG.info("history table " + identifiers.get(hk) + ": column '" + prefix + col
+                + "' holds the history of a dropped column of that name; renamed to '" + to
+                + "' so the column added now starts empty");
+        }
+        return out;
+    }
+
+    private void addColumnMain(long relid, DdlMessage.Col col, long ddlLsn) {
         if (replayed(relid, ddlLsn, "add_col '" + col.name() + "'")) {
             return;
         }
-        DataType wanted = parseType(col.type());
+        DataType wanted = mainType(relid, col.type());
         DataField existing = field(relid, col.name());
         if (existing != null) {
             if (existing.type().equals(wanted)) {
@@ -375,10 +670,25 @@ public final class SchemaRegistry {
                 + " cannot be ruled out: leaving the stored type alone");
             return;
         }
-        alter(relid, SchemaChange.addColumn(col.name(), wanted), ddlLsn);
+        alter(relid, List.of(SchemaChange.addColumn(col.name(), wanted)), ddlLsn);
     }
 
     public void dropColumn(long relid, String name, long ddlLsn) {
+        dropColumnMain(relid, name, ddlLsn);
+        if (hasHistory(relid)) {
+            long hk = HistoryKeys.histKey(relid);
+            if (!replayed(hk, ddlLsn, "drop_col '" + name + "'") && ddlLsn != 0) {
+                // The columns stay: history is not rewritten. Only the LSN is recorded, which is
+                // what tells a later add_col of the same name that before_x is a kept pair.
+                alter(hk, List.of(), ddlLsn);
+                LOG.info("drop_col '" + name + "': history table " + identifiers.get(hk)
+                    + " keeps " + LogRowBuilder.BEFORE + name + "/" + LogRowBuilder.AFTER + name
+                    + " (NULL from now on)");
+            }
+        }
+    }
+
+    private void dropColumnMain(long relid, String name, long ddlLsn) {
         if (replayed(relid, ddlLsn, "drop_col '" + name + "'")) {
             return;
         }
@@ -387,11 +697,48 @@ public final class SchemaRegistry {
                 + " is already applied (no such column): no-op");
             return;
         }
-        alter(relid, SchemaChange.dropColumn(name), ddlLsn);
+        alter(relid, List.of(SchemaChange.dropColumn(name)), ddlLsn);
     }
 
     /** A rename is already applied when the source is gone and the target is there. */
     public void renameColumn(long relid, String from, String to, long ddlLsn) {
+        renameColumnMain(relid, from, to, ddlLsn);
+        if (hasHistory(relid)) {
+            renameColumnHist(HistoryKeys.histKey(relid), from, to, ddlLsn);
+        }
+    }
+
+    private void renameColumnHist(long hk, String from, String to, long ddlLsn) {
+        String what = "rename_col '" + from + "' -> '" + to + "'";
+        if (replayed(hk, ddlLsn, what)) {
+            return;
+        }
+        String bf = LogRowBuilder.BEFORE + from;
+        String bt = LogRowBuilder.BEFORE + to;
+        if (field(hk, bf) == null) {
+            if (field(hk, bt) != null) {
+                LOG.info(what + " on history table " + identifiers.get(hk)
+                    + " is already applied: no-op");
+                return;
+            }
+            String msg = what + " on history table " + identifiers.get(hk)
+                + ": no column '" + bf + "'";
+            requireNoRecordedLsn(hk, msg);
+            LOG.warning(msg + "; no recorded DDL LSN, so a later message may have renamed or"
+                + " dropped it already: skipped");
+            return;
+        }
+        List<SchemaChange> changes = new ArrayList<>();
+        if (field(hk, bt) != null || field(hk, LogRowBuilder.AFTER + to) != null) {
+            changes.addAll(retire(hk, to, ddlLsn));    // a dropped column's kept pair
+        }
+        changes.add(SchemaChange.renameColumn(bf, bt));
+        changes.add(SchemaChange.renameColumn(LogRowBuilder.AFTER + from,
+                                              LogRowBuilder.AFTER + to));
+        alter(hk, changes, ddlLsn);
+    }
+
+    private void renameColumnMain(long relid, String from, String to, long ddlLsn) {
         if (replayed(relid, ddlLsn, "rename_col '" + from + "' -> '" + to + "'")) {
             return;
         }
@@ -400,12 +747,12 @@ public final class SchemaRegistry {
                 + " is already applied: no-op");
             return;
         }
-        alter(relid, SchemaChange.renameColumn(from, to), ddlLsn);
+        alter(relid, List.of(SchemaChange.renameColumn(from, to)), ddlLsn);
     }
 
-    /** One field of the relation's Paimon schema by name, or null if there is none. */
-    private DataField field(long relid, String name) {
-        for (DataField f : table(relid).schema().fields()) {
+    /** One field of the table's Paimon schema by name, or null if there is none. */
+    private DataField field(long key, String name) {
+        for (DataField f : table(key).schema().fields()) {
             if (f.name().equals(name)) {
                 return f;
             }
@@ -419,10 +766,40 @@ public final class SchemaRegistry {
      * thrown: in a replayed sequence the column may since have been renamed or dropped.
      */
     public void alterColumn(long relid, String name, String type, long ddlLsn) {
+        alterColumnMain(relid, name, type, ddlLsn);
+        if (!hasHistory(relid)) {
+            return;
+        }
+        long hk = HistoryKeys.histKey(relid);
+        if (replayed(hk, ddlLsn, "alter_col '" + name + "'")) {
+            return;
+        }
+        DataType wanted = parseType(type).copy(true);
+        DataField b = field(hk, LogRowBuilder.BEFORE + name);
+        DataField a = field(hk, LogRowBuilder.AFTER + name);
+        if (b == null || a == null) {
+            String what = "alter_col '" + name + "' on history table " + identifiers.get(hk)
+                + ": no " + LogRowBuilder.BEFORE + "/" + LogRowBuilder.AFTER + " pair";
+            requireNoRecordedLsn(hk, what);
+            LOG.warning(what + "; no recorded DDL LSN: skipped");
+            return;
+        }
+        List<SchemaChange> changes = new ArrayList<>();
+        for (DataField f : List.of(b, a)) {
+            if (!f.type().equals(wanted)) {
+                changes.add(SchemaChange.updateColumnType(f.name(), wanted));
+            }
+        }
+        if (!changes.isEmpty()) {
+            alter(hk, changes, ddlLsn);
+        }
+    }
+
+    private void alterColumnMain(long relid, String name, String type, long ddlLsn) {
         if (replayed(relid, ddlLsn, "alter_col '" + name + "'")) {
             return;
         }
-        DataType wanted = parseType(type);
+        DataType wanted = mainType(relid, type);
         DataField current = field(relid, name);
         if (current == null) {
             String what = "alter_col '" + name + "' on " + identifiers.get(relid)
@@ -435,7 +812,16 @@ public final class SchemaRegistry {
         if (current.type().equals(wanted)) {
             return;
         }
-        alter(relid, SchemaChange.updateColumnType(name, wanted), ddlLsn);
+        alter(relid, List.of(SchemaChange.updateColumnType(name, wanted)), ddlLsn);
+    }
+
+    /**
+     * A column's Paimon type in the relation's main table: as declared for a primary-key table;
+     * always nullable in an operation log, whose {@code T} rows are NULL in every user column.
+     */
+    private DataType mainType(long relid, String sql) {
+        DataType t = parseType(sql);
+        return keyless(relid) ? t.copy(true) : t;
     }
 
     /**
@@ -542,13 +928,23 @@ public final class SchemaRegistry {
         } catch (Exception e) {
             throw new IllegalStateException("cannot drop Paimon table " + id, e);
         }
+        Identifier hist = identifiers.get(HistoryKeys.histKey(relid));
+        if (hist != null) {
+            // Deliberately left standing: the history table is the retained audit trail of a
+            // dropped table (paimon.retained_history records it in PostgreSQL).
+            LOG.info("dropped Paimon table " + id + "; its history table " + hist
+                + " is kept as the audit trail and no longer written");
+        }
         forget(relid);
     }
 
+    /** The Paimon table a key names: a relation's main table, or its history table. */
     public FileStoreTable table(long relid) {
         Identifier id = identifiers.get(relid);
         if (id == null) {
-            throw new IllegalStateException("relation " + relid + " is not tracked");
+            throw new IllegalStateException((HistoryKeys.isHist(relid)
+                ? "the history table of relation " + HistoryKeys.relidOf(relid)
+                : "relation " + relid) + " is not tracked");
         }
         return tables.computeIfAbsent(relid, r -> {
             try {
@@ -568,27 +964,60 @@ public final class SchemaRegistry {
         return table(relid).primaryKeys();
     }
 
-    /** Cached per (relid, column list); a changed list or a reloaded table rebuilds it. */
-    public RowBuilder rowBuilder(long relid, RelationMeta meta) {
+    /**
+     * Cached per (key, column list); a changed list or a reloaded table rebuilds it. The key is a
+     * relid (the main table) or a history key; the builder matches the table's shape.
+     */
+    public RowMaker rowBuilder(long relid, RelationMeta meta) {
         FileStoreTable t = table(relid);
         CachedBuilder cb = builders.get(relid);
         if (cb != null && cb.table() == t && cb.columns().equals(meta.columnNames())) {
             return cb.builder();
         }
-        RowBuilder rb = new RowBuilder(meta.namespace() + "." + meta.relName(), t.rowType(), meta.columnNames(), config.seqField(),
-                                       config.opSeqField(), config.xidField());
+        String name = meta.namespace() + "." + meta.relName();
+        RowMaker rb;
+        if (HistoryKeys.isHist(relid)) {
+            rb = new LogRowBuilder(name + " (history)", LogRowBuilder.Layout.HISTORY,
+                                   t.rowType(), meta.columnNames());
+        } else if (keyless(relid)) {
+            rb = new LogRowBuilder(name, LogRowBuilder.Layout.LOG, t.rowType(),
+                                   meta.columnNames());
+        } else {
+            rb = new RowBuilder(name, t.rowType(), meta.columnNames(), config.seqField(),
+                                config.opSeqField(), config.xidField());
+        }
         builders.put(relid, new CachedBuilder(List.copyOf(meta.columnNames()), t, rb));
         return rb;
     }
 
-    /** Drops cached state (and tracking) so the next access reloads or re-creates. */
+    /**
+     * Drops cached state (and tracking) so the next access reloads or re-creates. Forgets the
+     * relation's history table too: it is written only while the relation is tracked.
+     */
     public void forget(long relid) {
         identifiers.remove(relid);
         forget0(relid);
+        if (!HistoryKeys.isHist(relid)) {
+            long hk = HistoryKeys.histKey(relid);
+            identifiers.remove(hk);
+            forget0(hk);
+            keyless.remove(relid);
+        }
     }
 
+    @Override
     public boolean tracked(long relid) {
         return identifiers.containsKey(relid);
+    }
+
+    @Override
+    public boolean keyless(long relid) {
+        return keyless.contains(relid);
+    }
+
+    @Override
+    public boolean hasHistory(long relid) {
+        return relid >= 0 && identifiers.containsKey(HistoryKeys.histKey(relid));
     }
 
     private void forget0(long relid) {
@@ -602,15 +1031,18 @@ public final class SchemaRegistry {
      * LSN land together or not at all; recording the LSN in a second call would leave a window in
      * which a crash makes the change replay.
      */
-    private void alter(long relid, SchemaChange change, long ddlLsn) {
+    private void alter(long relid, List<SchemaChange> change, long ddlLsn) {
         Identifier id = identifiers.get(relid);
         if (id == null) {
             throw new IllegalStateException("relation " + relid + " is not tracked");
         }
-        List<SchemaChange> changes = ddlLsn == 0
-            ? List.of(change)
-            : List.of(change, SchemaChange.setOption(DDL_LSN_OPTION,
-                                                     Long.toUnsignedString(ddlLsn)));
+        List<SchemaChange> changes = new ArrayList<>(change);
+        if (ddlLsn != 0) {
+            changes.add(SchemaChange.setOption(DDL_LSN_OPTION, Long.toUnsignedString(ddlLsn)));
+        }
+        if (changes.isEmpty()) {
+            return;
+        }
         try {
             catalog.alterTable(id, changes, false);
         } catch (Exception e) {

@@ -71,10 +71,16 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
     private final WriterConfig config;
     private final Map<Long, Entry> entries = new LinkedHashMap<>();
     private final Map<Long, RelationMeta> relations = new LinkedHashMap<>();
+    private final CrashHook hook;
 
     public PaimonSink(SchemaRegistry registry, WriterConfig config) {
+        this(registry, config, CrashHook.fromEnv(System.getenv()));
+    }
+
+    PaimonSink(SchemaRegistry registry, WriterConfig config, CrashHook hook) {
         this.registry = registry;
         this.config = config;
+        this.hook = hook;
     }
 
     /** Supplies the PostgreSQL column order RowBuilder needs; replaces any earlier one. */
@@ -104,25 +110,36 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         if (records.isEmpty()) {
             return true;    // a DDL-only transaction: nothing to commit, no empty snapshot
         }
+        // One commit per Paimon table: a relation's main table and its history table are two
+        // tables with two identifier streams, committed one after the other and NOT atomically
+        // (spec 2026-10-14, rule 2). A crash between them leaves one ahead; the replay is then
+        // filtered per table (the commit-identifier filter here, rule 4 in MiniBatcher), so each
+        // ends up with every change exactly once.
         Map<Long, List<SinkRecord>> byRelid = new LinkedHashMap<>();
         for (SinkRecord r : records) {
             byRelid.computeIfAbsent(r.relid(), k -> new java.util.ArrayList<>()).add(r);
         }
-        for (Map.Entry<Long, List<SinkRecord>> g : byRelid.entrySet()) {
+        for (Map.Entry<Long, List<SinkRecord>> g : hook.order(byRelid).entrySet()) {
             long relid = g.getKey();
-            RelationMeta meta = relations.get(relid);
-            if (meta == null) {
-                throw new IllegalStateException("no RelationMeta for relation " + relid);
+            RelationMeta meta = relations.get(HistoryKeys.relidOf(relid));
+            if (meta == null && !allTruncates(g.getValue())) {
+                throw new IllegalStateException("no RelationMeta for relation "
+                    + HistoryKeys.relidOf(relid));
             }
             Entry e = entry(relid);
             try {
                 RelationMeta builtFor = null;
-                RowBuilder rb = null;
+                RowMaker rb = null;
                 for (SinkRecord r : g.getValue()) {
                     // Each record is built against the description it was decoded under: an
                     // ALTER inside the transaction leaves earlier records with fewer columns
                     // than the current relation. The registry caches by column list.
                     RelationMeta m = r.meta() != null ? r.meta() : meta;
+                    if (m == null) {
+                        // A T operation record carries no values, so no description is needed.
+                        m = new RelationMeta(HistoryKeys.relidOf(relid), "?", "?", List.of(),
+                                             List.of());
+                    }
                     if (rb == null || m != builtFor) {
                         rb = registry.rowBuilder(relid, m);
                         builtFor = m;
@@ -133,13 +150,13 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     } catch (TextDecoder.UnrepresentableValueException bad) {
                         // The only poison record: a value PostgreSQL holds and Paimon cannot.
                         // This is the one failure PGPAIMON_SKIP_LSN can step over.
-                        throw undecodable(meta, r, commitLsn, fromTheSlot, bad);
+                        throw undecodable(m, r, commitLsn, fromTheSlot, bad);
                     } catch (IllegalArgumentException malformed) {
                         // The text did not parse as the Paimon type at all. Not a poison record
                         // and NOT skippable: the cause is systematic -- a drifted column type, or
                         // a session setting such as bytea_output = 'escape' -- so it would
                         // mis-handle every row of that column, and skipping one would hide it.
-                        throw new IllegalStateException("cannot decode " + where(meta, r) + ": "
+                        throw new IllegalStateException("cannot decode " + where(m, r) + ": "
                             + malformed.getMessage()
                             + ". The text did not parse as this Paimon type at all, so this is"
                             + " not one unrepresentable value but a systematic mismatch: compare"
@@ -148,7 +165,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                             + " bytea_output). It will replay identically on restart.", malformed);
                     } catch (RuntimeException other) {
                         throw new IllegalStateException("cannot build a Paimon row for "
-                            + where(meta, r) + ": " + other.getMessage()
+                            + where(m, r) + ": " + other.getMessage()
                             + ". This is a structural mismatch between the record and the Paimon"
                             + " schema, not a value Paimon cannot represent; it will replay"
                             + " identically on restart.", other);
@@ -176,6 +193,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                     // possible silent loss.
                     dropEntry(relid);
                 }
+                hook.afterCommit(e.table());
             } catch (Exception | Error ex) {
                 dropEntry(relid);   // never reuse a writer holding half-written buffers
                 throw ex;
@@ -200,8 +218,21 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
      * the slot, and fixing the row does help -- so it is diagnosed differently.
      */
     private static String where(RelationMeta meta, SinkRecord r) {
-        return meta.namespace() + "." + meta.relName()
-            + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+        String table = meta.namespace() + "." + meta.relName();
+        if (r.op() != null) {
+            return table + (HistoryKeys.isHist(r.relid()) ? " history table" : " operation log")
+                + " (" + r.op().code() + " at _lsn " + SlotConsumer.formatLsn(r.seq()) + ")";
+        }
+        return table + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
+    }
+
+    private static boolean allTruncates(List<SinkRecord> records) {
+        for (SinkRecord r : records) {
+            if (r.op() == null || r.op().code() != 'T') {
+                return false;
+            }
+        }
+        return true;
     }
 
     private IllegalStateException undecodable(RelationMeta meta, SinkRecord r, long commitLsn,

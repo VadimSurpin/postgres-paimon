@@ -33,7 +33,15 @@ public final class Main {
     /** One row of {@code paimon.table_registry}, as much of it as startup needs. */
     record RegistryRow(long relid, String schema, String table, List<String> pk,
                        List<DdlMessage.Col> cols, boolean backfillDue,
-                       String changelogProducer, int buckets) {}
+                       String changelogProducer, int buckets, String histTable,
+                       String registration) {
+        RegistryRow(long relid, String schema, String table, List<String> pk,
+                    List<DdlMessage.Col> cols, boolean backfillDue,
+                    String changelogProducer, int buckets) {
+            this(relid, schema, table, pk, cols, backfillDue, changelogProducer, buckets, null,
+                 null);
+        }
+    }
 
     private static volatile boolean exiting;
 
@@ -89,15 +97,19 @@ public final class Main {
         for (RegistryRow r : rows) {
             // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
             registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
-                                    r.changelogProducer(), r.buckets(), !slotExists);
+                                    r.changelogProducer(), r.buckets(), !slotExists,
+                                    r.histTable(), r.registration());
         }
         LOG.info("registry rebuilt: " + rows.size() + " table(s), slot "
                  + (slotExists ? "exists" : "absent"));
 
-        // 4. where to resume; 0 means "the slot's own position", an ordinary value
+        // 4. where to resume; 0 means "the slot's own position", an ordinary value. The MIN is
+        //    over every Paimon table the writer commits to: each main table AND each history
+        //    table, since the two are committed separately and a crash can leave either behind.
         List<Long> relids = new ArrayList<>();
         for (RegistryRow r : rows) {
             relids.add(r.relid());
+            relids.add(HistoryKeys.histKey(r.relid()));
         }
         long resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
@@ -138,6 +150,11 @@ public final class Main {
                 }
                 @Override public void truncate(long relid, long commitLsn) throws Exception {
                     sink.truncate(relid, commitLsn);
+                }
+                @Override public boolean overwrites(long relid) {
+                    // A key-less table's main table is an operation log: a TRUNCATE is a T row
+                    // in it (TxnBatcher), never an overwrite. The log is an audit trail.
+                    return !registry.keyless(relid);
                 }
             }, batcher, mini, health::maybeCheck);
         SlotConsumer consumer = new SlotConsumer(config, decoder, handler);
@@ -321,7 +338,8 @@ public final class Main {
                 + " was pending in it is lost, so a column missing from Paimon is reconciled");
             for (RegistryRow r : rows) {
                 registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
-                                        r.changelogProducer(), r.buckets(), true);
+                                        r.changelogProducer(), r.buckets(), true,
+                                        r.histTable(), r.registration());
             }
         }
         try (Backfiller backfiller = new Backfiller(config, registry, sink)) {
@@ -380,15 +398,15 @@ public final class Main {
         List<RegistryRow> rows = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
                  "SELECT relid::bigint, schema_name, table_name, pk_cols, cols::text,"
-                 + " backfill_due, changelog_producer, buckets FROM paimon.table_registry"
-                 + " ORDER BY relid");
+                 + " backfill_due, changelog_producer, buckets, hist_table, registration::text"
+                 + " FROM paimon.table_registry ORDER BY relid");
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
                 Array pk = rs.getArray(4);
                 rows.add(new RegistryRow(rs.getLong(1), rs.getString(2), rs.getString(3),
                     Arrays.asList((String[]) pk.getArray()),
                     DdlMessage.parseCols(rs.getString(5)), rs.getBoolean(6), rs.getString(7),
-                    rs.getInt(8)));
+                    rs.getInt(8), rs.getString(9), rs.getString(10)));
             }
         }
         return rows;
@@ -416,6 +434,11 @@ public final class Main {
         interface Target {
             void setRelation(long relid, RelationMeta meta);
             void truncate(long relid, long commitLsn) throws Exception;
+
+            /** Whether a TRUNCATE empties the relation's main table (false: an operation log). */
+            default boolean overwrites(long relid) {
+                return true;
+            }
         }
 
         private final LongPredicate tracked;
@@ -506,6 +529,9 @@ public final class Main {
                     if (!barrier) {
                         mini.flushBuffered();
                         barrier = true;
+                    }
+                    if (!target.overwrites(relid)) {
+                        continue;   // an operation log: the T row travels with the records
                     }
                     // Under commitLsn - 1, not commitLsn: the records this transaction made
                     // AFTER the truncate (TxnBatcher dropped the ones before it) are committed

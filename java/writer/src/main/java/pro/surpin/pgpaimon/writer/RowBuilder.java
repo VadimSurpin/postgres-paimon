@@ -15,7 +15,7 @@ import org.apache.paimon.types.RowType;
  * live columns in attnum order, while the Paimon schema also carries _seq, _op_seq
  * and optionally _xid, and a DROP COLUMN shifts positions on one side only.
  */
-public final class RowBuilder {
+public final class RowBuilder implements RowMaker {
 
     private static final Logger LOG = Logger.getLogger(RowBuilder.class.getName());
 
@@ -80,6 +80,7 @@ public final class RowBuilder {
         }
     }
 
+    @Override
     public GenericRow build(SinkRecord r) {
         if (r.values().size() != paimonIndexForPgColumn.length) {
             throw new IllegalStateException("record has " + r.values().size()
