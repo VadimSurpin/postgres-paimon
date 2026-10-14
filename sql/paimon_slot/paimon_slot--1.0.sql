@@ -199,17 +199,36 @@ CREATE PUBLICATION paimon_pub
  * message with the 'paimon' prefix into the writer's stream: measured, one
  * SELECT pg_logical_emit_message(true, 'paimon', 'not json') by a role with no privileges
  * at all stopped the writer permanently (it replays on every restart), and a well-formed
- * forged {"op":"drop_table",...} would have purged a Paimon table. The writer therefore acts
- * only on messages carrying this token, which it reads at startup, and ignores (with a
- * WARNING) everything else under the prefix. Only roles that can read this table can emit a
- * message the writer accepts: the extension owner, and whoever is granted SELECT -- the
- * writer's own role must be.
+ * forged {"op":"drop_table",...} would have purged a Paimon table. The writer therefore applies
+ * only DDL messages carrying this token; text that is not a DDL message it ignores, and a DDL
+ * message without the token stops it (a legitimate one emitted under an earlier value looks the
+ * same, and ignoring that loses the DDL for good).
+ *
+ * Who can forge one: every role that can read this table. That is the extension owner, roles
+ * granted SELECT (the writer's own must be), superusers, AND every member of pg_read_all_data
+ * (PostgreSQL 14+), which backup, BI and analytics roles are commonly given and which reads
+ * every table without a grant. paimon.secret_readers() lists them. A known residual risk:
+ * nothing a SQL table holds can be kept from pg_read_all_data (docs, section 5).
+ *
+ * Exactly one row: the unique index on a constant refuses a second (with two, every emit()
+ * failed with "more than one row returned by a subquery", and so did all DDL on replicated
+ * tables).
  */
 CREATE TABLE paimon.secret (
     token text NOT NULL
 );
+CREATE UNIQUE INDEX secret_one_row ON paimon.secret ((true));
 INSERT INTO paimon.secret VALUES (gen_random_uuid()::text || gen_random_uuid()::text);
 REVOKE ALL ON paimon.secret FROM PUBLIC;
+
+/* Every role that can read paimon.secret, and so can forge a DDL message the writer applies. */
+CREATE FUNCTION paimon.secret_readers() RETURNS SETOF name
+LANGUAGE sql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
+    SELECT rolname FROM pg_roles
+     WHERE has_table_privilege(oid, 'paimon.secret', 'SELECT')
+     ORDER BY rolname;
+$$;
 
 CREATE FUNCTION paimon.emit(payload jsonb) RETURNS void
 LANGUAGE sql

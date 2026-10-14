@@ -88,6 +88,10 @@ Each is deliberate and explained, with its reason, in section 5 of the guide:
   and call `paimon.forget_history()`; the seven history field names (`_op`, `_commit_lsn`, `_lsn`,
   `_op_seq`, `_xid`, `_ts`, `_dt`) are reserved column names;
 * `numeric` columns need an explicit precision of at most 38;
+* any role that can read `paimon.secret`, **including members of `pg_read_all_data`**, can forge a
+  DDL message the writer applies (`paimon.secret_readers()` lists them), and a DDL message without
+  the credential stops the writer rather than being ignored; do not change the secret while the
+  slot holds unconsumed DDL;
 * `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET NOT NULL` are refused;
 * a **non-empty** table cannot be added once the writer's slot exists;
 * PostgreSQL `infinity` / `-infinity` are stored as the finite extremes of the Paimon type, which is

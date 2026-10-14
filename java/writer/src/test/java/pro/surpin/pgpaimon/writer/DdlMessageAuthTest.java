@@ -92,22 +92,81 @@ class DdlMessageAuthTest {
     }
 
     @Test
-    void aForgedDropTableWithoutTheCredentialPurgesNothing() throws Exception {
-        handler.handle(message(raw("""
-            {"v":1,"op":"drop_table","relid":"17001","schema":"public","table":"victim"}""")));
-        assertIgnoredWithWarning("carries no credential");
+    void aJsonObjectWithoutAnOpIsNotADdlMessageAndIsIgnored() {
+        assertDoesNotThrow(() -> handler.handle(message(raw("{\"hello\":\"world\"}"))));
+        assertIgnoredWithWarning("no \"op\"");
+    }
+
+    /**
+     * Review finding B2. A DDL message without the credential may be forged -- or legitimate,
+     * emitted under another value of paimon.secret. Ignoring it silently lost a column for good,
+     * so it stops the writer, applying nothing, and says what to check.
+     */
+    @Test
+    void aDropTableWithoutTheCredentialStopsTheWriterAndPurgesNothing() throws Exception {
+        PgEvent.Message m = message(raw("""
+            {"v":1,"op":"drop_table","relid":"17001","schema":"public","table":"victim"}"""));
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> handler.handle(m));
+        assertTrue(e.getMessage().startsWith("REJECTED DDL MESSAGE"), e.getMessage());
+        assertTrue(e.getMessage().contains("carries no credential"), e.getMessage());
+        assertTrue(e.getMessage().contains("paimon.secret"), e.getMessage());
+        assertTrue(e.getMessage().contains("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(m.lsn())),
+            e.getMessage());
         assertTrue(reg.tracked(RELID), "still tracked");
         assertNotNull(catalog.getTable(Identifier.create("public", "victim")), "Paimon table kept");
     }
 
+    /** The rotation case of B2: a legitimate add_col under an old token is not silently lost. */
     @Test
-    void aWrongCredentialIsIgnoredToo() {
-        handler.handle(message(raw("""
-            {"v":1,"auth":"guess","op":"add_col","relid":"17001",
-             "col":{"id":2,"name":"injected","type":"INT"}}""")));
-        assertIgnoredWithWarning("not this installation's");
+    void aWrongCredentialStopsTheWriterAndAddsNothing() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> handler.handle(message(raw("""
+                {"v":1,"auth":"an-older-token","op":"add_col","relid":"17001",
+                 "col":{"id":2,"name":"c","type":"INT"}}"""))));
+        assertTrue(e.getMessage().contains("not this installation's paimon.secret"), e.getMessage());
+        assertTrue(e.getMessage().contains("(op 'add_col', relation 17001)"), e.getMessage());
         assertTrue(reg.table(RELID).rowType().getFieldNames().stream()
-            .noneMatch("injected"::equals), "no column added");
+            .noneMatch("c"::equals), "no column added");
+        assertTrue(logged.isEmpty(), "not a warning: " + logged);
+    }
+
+    /** PGPAIMON_SKIP_LSN at exactly the message's LSN skips it, applying nothing, said loudly. */
+    @Test
+    void theSkipLsnSkipsExactlyThatRejectedMessage() throws Exception {
+        long next = lsn + 0x10;
+        DdlMessageHandler armed = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN, next, null);
+        String forged = """
+            {"v":1,"op":"drop_table","relid":"17001","schema":"public","table":"victim"}""";
+        assertDoesNotThrow(() -> armed.handle(message(raw(forged))));
+        assertEquals(1, logged.size());
+        assertTrue(logged.get(0).getMessage().startsWith("SKIPPED DDL MESSAGE (PGPAIMON_SKIP_LSN="),
+            logged.get(0).getMessage());
+        assertTrue(reg.tracked(RELID), "still tracked");
+        assertNotNull(catalog.getTable(Identifier.create("public", "victim")), "Paimon table kept");
+        // any other LSN stays fatal
+        assertThrows(IllegalStateException.class, () -> armed.handle(message(raw(forged))));
+    }
+
+    /**
+     * A secret rotated while the writer runs: the next DDL carries the NEW value. The handler
+     * re-reads paimon.secret, finds it equal, applies the message and keeps the new value.
+     */
+    @Test
+    void aSecretRotatedWhileRunningIsFollowed() {
+        int[] reads = {0};
+        DdlMessageHandler h = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN, 0,
+            () -> { reads[0]++; return "rotated"; });
+        h.handle(message(raw("""
+            {"v":1,"auth":"rotated","op":"add_col","relid":"17001",
+             "col":{"id":2,"name":"after_rotation","type":"INT"}}""")));
+        assertTrue(reg.table(RELID).rowType().getFieldNames().contains("after_rotation"));
+        h.handle(message(raw("""
+            {"v":1,"auth":"rotated","op":"add_col","relid":"17001",
+             "col":{"id":3,"name":"again","type":"INT"}}""")));
+        assertEquals(1, reads[0], "re-read once, then the new value is the one in hand");
+        // the old value, still in the slot after the rotation, is now the anomaly
+        assertThrows(IllegalStateException.class, () -> h.handle(message(TestAuth.authed("""
+            {"v":1,"op":"add_col","relid":"17001","col":{"id":4,"name":"old","type":"INT"}}"""))));
     }
 
     @Test

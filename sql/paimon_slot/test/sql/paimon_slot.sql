@@ -791,6 +791,14 @@ SELECT length(token) >= 64 AS long_token FROM paimon.secret;
 CREATE ROLE paimon_nobody;
 SELECT has_table_privilege('paimon_nobody', 'paimon.secret', 'SELECT') AS can_read_secret,
        has_function_privilege('paimon_nobody', 'paimon.emit(jsonb)', 'EXECUTE') AS can_emit;
+-- who CAN forge one: every reader of the secret, pg_read_all_data members included (residual risk)
+CREATE ROLE paimon_analyst;
+GRANT pg_read_all_data TO paimon_analyst;
+SELECT r FROM paimon.secret_readers() r
+ WHERE r IN ('paimon_nobody', 'paimon_analyst', 'pg_read_all_data') ORDER BY 1;
+DROP ROLE paimon_analyst;
+-- exactly one secret: a second row would make every emit(), and so all DDL, fail
+INSERT INTO paimon.secret VALUES ('second');                                    -- expect ERROR
 DROP ROLE paimon_nobody;
 DROP TABLE au_t;
 SELECT count(*) FROM paimon.peek_messages();

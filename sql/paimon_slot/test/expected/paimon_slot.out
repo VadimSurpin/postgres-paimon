@@ -2171,6 +2171,22 @@ SELECT has_table_privilege('paimon_nobody', 'paimon.secret', 'SELECT') AS can_re
  f               | f
 (1 row)
 
+-- who CAN forge one: every reader of the secret, pg_read_all_data members included (residual risk)
+CREATE ROLE paimon_analyst;
+GRANT pg_read_all_data TO paimon_analyst;
+SELECT r FROM paimon.secret_readers() r
+ WHERE r IN ('paimon_nobody', 'paimon_analyst', 'pg_read_all_data') ORDER BY 1;
+        r         
+------------------
+ paimon_analyst
+ pg_read_all_data
+(2 rows)
+
+DROP ROLE paimon_analyst;
+-- exactly one secret: a second row would make every emit(), and so all DDL, fail
+INSERT INTO paimon.secret VALUES ('second');                                    -- expect ERROR
+ERROR:  duplicate key value violates unique constraint "secret_one_row"
+DETAIL:  Key ((true))=(t) already exists.
 DROP ROLE paimon_nobody;
 DROP TABLE au_t;
 SELECT count(*) FROM paimon.peek_messages();

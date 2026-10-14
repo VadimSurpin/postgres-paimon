@@ -102,7 +102,7 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_BATCH_MAX_BYTES` | `16777216` (16 MiB) | streaming commit batch: estimated size of the buffered text payload |
 | `PGPAIMON_BATCH_MAX_INTERVAL_MS` | `2000` | streaming commit batch: longest a transaction waits for its commit, counted from the batch's **first** transaction. Bounds replication latency |
 | `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per COPY chunk during the **initial load** only (each chunk is a commit of its own). **Not** the streaming batch size: that is `PGPAIMON_BATCH_MAX_ROWS`. The two do not interact |
-| `PGPAIMON_SKIP_LSN` | unset | break-glass for a single poison record: the change LSN of the ONE record to drop. Every known way to create one is now refused before commit; read section 3, "A record the writer can never apply", before setting it |
+| `PGPAIMON_SKIP_LSN` | unset | break-glass for a single poison record: the change LSN of the ONE record to drop. Every known way to create one is now refused before commit; read section 3, "A record the writer can never apply", before setting it. Also skips the ONE DDL message at that LSN if it is rejected for its credential (section 5, "DDL messages carry a credential") |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 | `PGPAIMON_TEST_HALT_AFTER_COMMIT` | unset | **test only, never in production**: `<schema>.<table>`; the writer halts (as `kill -9` would) right after its first commit to that Paimon table. Used by the crash tests of history tables (section 2, "History tables") |
 | `PGPAIMON_TEST_HALT_AT_STEP` | unset | **test only, never in production**: `rotate-renamed`, `rotate-created` or `rotate-altered`; the writer halts right after that step of its first history rotation |
@@ -673,8 +673,10 @@ what is refused, and why"), each measured on PostgreSQL 18 against the real writ
   changes"). It is now applied: the overwrite first, then the rows inserted after it.
 * A logical message under the `paimon` prefix from any role (`pg_logical_emit_message` is
   executable by PUBLIC) used to be one too: `SELECT pg_logical_emit_message(true, 'paimon', 'not
-  json')` by a role with no privileges at all stopped the writer for good. The writer now acts only
-  on messages carrying the installation's credential, and logs and ignores the rest.
+  json')` by a role with no privileges at all stopped the writer for good. Text that is not a DDL
+  message is now logged and ignored. A DDL message without the installation's credential stops the
+  writer instead, deliberately, because it may be a legitimate one emitted under an earlier secret
+  (section 5, "DDL messages carry a credential"); `PGPAIMON_SKIP_LSN` at its LSN skips it.
 
 What can still produce one is a value class nobody has found yet, or a guardrail that was bypassed
 (an event trigger disabled, a constraint dropped with the triggers off). The writer refuses such a
@@ -1012,13 +1014,51 @@ function emit` on `ALTER TABLE`, and every non-superuser's `CREATE TABLE` anywhe
 failed without `USAGE` on schema `paimon`. `add_table()` and `remove_table()` stay for the extension's
 owner (they alter `paimon_pub` and the registry).
 
-**DDL messages carry a credential.** `paimon.emit()` adds a per-installation token (`paimon.secret`,
-readable only by its owner and roles granted `SELECT`, which the writer's role needs), and `emit()`
-itself is no longer executable by PUBLIC. The writer ignores, with a WARNING, any message under the
-`paimon` prefix that does not parse or lacks the token. Without it, any role that can connect could
-stop the writer for good with one `pg_logical_emit_message()`, or forge a `drop_table` that purges a
-Paimon table. **Residual risk:** a role with `SELECT` on `paimon.secret` can still forge messages;
-grant it to the writer's role only.
+**DDL messages carry a credential.** `paimon.emit()` adds a per-installation token
+(`paimon.secret`, one row) to every DDL message, and `emit()` itself is not executable by PUBLIC.
+`pg_logical_emit_message()` is, so any role that can connect can put a message under the `paimon`
+prefix into the writer's stream. The writer treats what arrives there in three ways:
+
+* **Not a DDL message** (not a JSON object, or one without `op`): logged as `IGNORED a logical
+  message ...` and skipped. Before, one `SELECT pg_logical_emit_message(true, 'paimon', 'not
+  json')` by a role with no privileges stopped the writer for good.
+* **A DDL message with this installation's token**: applied.
+* **A DDL message without it, or with another value: the writer STOPS** (`REJECTED DDL MESSAGE`),
+  having applied nothing, and names what to check. It used to ignore it with a warning, which is
+  wrong in the case that matters: a *legitimate* message emitted under an earlier value of the
+  secret looks exactly like a forged one. Measured: after `UPDATE paimon.secret SET token = ...`,
+  the next `ALTER TABLE t2 ADD COLUMN c` was ignored, every value of `c` was discarded, and that
+  stayed true after a restart. Guessing either way loses data (ignore a legitimate message) or
+  destroys it (apply a forged `drop_table`), so the writer does neither.
+
+**Rotating the secret.** The writer reads the secret at startup, and when a DDL message carries a
+different value it reads it again: a message carrying the *current* value is accepted, and that value
+is used from then on. So rotating while the writer runs and is caught up is safe. What is not safe
+is rotating while the slot still holds DDL messages emitted under the old value (the writer stopped
+or behind, or after `DROP EXTENSION` / `CREATE EXTENSION`, which makes a new secret): the writer
+then stops on the first of them. To rotate: let the writer catch up (its slot's
+`confirmed_flush_lsn` at or past `pg_current_wal_lsn()` taken after the last DDL), then
+`UPDATE paimon.secret SET token = <new random value>`. **Recovery when it stops anyway:**
+
+1. If the message is legitimate (a rotation or re-creation while it was in the slot), put back the
+   value it was emitted under (`UPDATE paimon.secret SET token = '<old value>'`) and restart; the
+   writer applies it, and later messages under the newer value are followed as above. If the old
+   value is lost, skip the message (step 2) and re-register the table it names (section 3,
+   "Re-bootstrapping"), because its DDL is then missing from Paimon.
+2. If it is forged, find who emitted it, then restart with `PGPAIMON_SKIP_LSN` set to the LSN in
+   the error. That skips exactly that one message, logged as `SKIPPED DDL MESSAGE`; any other LSN,
+   and every other failure at that LSN, stays fatal. Unset it afterwards.
+
+**Residual risks.** (a) Any role that can read `paimon.secret` can forge a DDL message the writer
+applies, including a `drop_table` that purges a Paimon table. That is the extension's owner,
+superusers, roles granted `SELECT` (the writer's own), **and every member of `pg_read_all_data`**
+(PostgreSQL 14+), which reads every table without a grant and is commonly given to backup, BI and
+analytics roles. A token in a SQL table cannot be kept from it. `SELECT * FROM
+paimon.secret_readers()` lists every such role; keep that list to the writer and administrators.
+(b) The token also leaves the cluster through any publication that includes `paimon.secret` (`FOR
+ALL TABLES`, `FOR TABLES IN SCHEMA paimon`). (c) Any role that can connect can stop the writer with
+a forged DDL message that lacks the token (it applies nothing; recovery is step 2 above). Stopping
+is the price of never ignoring a legitimate message.
 
 **What is not refused, and why.** `UNLOGGED` and temporary tables cannot be added (PostgreSQL refuses
 them in a publication), and PostgreSQL refuses `ALTER TABLE ... SET UNLOGGED` on a published table, so

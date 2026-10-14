@@ -854,7 +854,7 @@ representable (the evidence is in the review report; `docs/logical-slot-architec
 | enum `RENAME VALUE`, composite `ALTER TYPE` on a used type | every value's text changes, no row change | refused |
 | publication: drop table, `publish` subset, row filter, column list, via-root, rename, drop | silent loss | refused (`ddl_command_end` and `sql_drop` on publications) |
 | `session_replication_role = replica` | every event trigger off | triggers `ENABLE ALWAYS` |
-| `pg_logical_emit_message(true, 'paimon', ...)` by any role | permanent stop, or a forged `drop_table` | messages carry a per-installation credential; others ignored |
+| `pg_logical_emit_message(true, 'paimon', ...)` by any role | permanent stop, or a forged `drop_table` | messages carry a per-installation credential; text that is no DDL message is ignored; a DDL message without the credential stops the writer (it may be a legitimate one under an earlier secret), skippable by `PGPAIMON_SKIP_LSN` |
 | `BEGIN; TRUNCATE t; INSERT INTO t; COMMIT` | "mixes TRUNCATE and row changes": permanent stop | applied (overwrite at `commitLsn - 1`, records at `commitLsn`) |
 | `BEGIN; INSERT INTO t; DROP TABLE t; COMMIT` | "relation is not tracked": writer stopped | the dropped table's rows are dropped |
 
@@ -871,8 +871,11 @@ sequence are in `docs/logical-slot-architecture.md`, "A record the writer can ne
 Residual risks (class 3, loud but not prevented): a transaction larger than the writer's heap fails
 with `OutOfMemoryError` on every replay (the recourse is heap); `USING` and `RENAME VALUE` are
 recognised from the statement text, so a statement assembled in `EXECUTE` to hide the word is not
-caught; a role granted `SELECT` on `paimon.secret` can forge DDL messages; and a guardrail bypassed
-by a superuser is detected only at the next health check.
+caught (and an `ALTER COLUMN TYPE` or an enum `ALTER TYPE` run inside a function or procedure is
+refused outright, because there the statement text is only the `CALL`); any role that can read
+`paimon.secret` can forge DDL messages, which includes every member of `pg_read_all_data`; any role
+can stop the writer with a DDL message lacking the credential; and a guardrail bypassed by a
+superuser is detected only at the next health check.
 
 ### Registry bootstrap on startup
 

@@ -146,7 +146,14 @@ public final class Main {
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry, mini,
             config.skipLsn(),
             (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record));
-        DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix(), token);
+        DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix(), token,
+            config.skipLsn(), () -> {
+                try (Connection conn = plainConnection(config)) {
+                    return readToken(conn);
+                } catch (java.sql.SQLException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
         HealthCheck health = new HealthCheck(() -> plainConnection(config), config.healthIntervalMs());
         SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle, ddl::isDdl,
             new PipelineHandler.Target() {
@@ -209,7 +216,8 @@ public final class Main {
         }
         LOG.warning("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn) + " is armed: the ONE"
             + " record at that change LSN will be dropped, and logged in full, if and only if it"
-            + " fails because a value has no Paimon representation. Every other failure there,"
+            + " fails because a value has no Paimon representation; or the ONE DDL message at that"
+            + " LSN, if and only if it is rejected for its credential. Every other failure there,"
             + " and every other LSN, stays fatal. Unset it once the skip has happened.");
     }
 

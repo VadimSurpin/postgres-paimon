@@ -92,6 +92,7 @@ public class PaimonAdversarialTest {
         run("A12", PaimonAdversarialTest::a12_truncateThenInsert);
         run("A13", PaimonAdversarialTest::a13_insertThenDropTable);
         run("A14", PaimonAdversarialTest::a14_otherPublications);
+        run("A16", PaimonAdversarialTest::a16_secretRotation);
         run("A15", PaimonAdversarialTest::a15_healthStopsTheWriter);
 
         System.out.println();
@@ -304,10 +305,17 @@ public class PaimonAdversarialTest {
     }
 
     // ── A11: logical messages forged under the 'paimon' prefix ─────────────────────────────
-    // Before: one SELECT by a role with no privileges stopped the writer on every restart.
+    // Before the credential: one SELECT by a role with no privileges stopped the writer on every
+    // restart, and a forged drop_table would have purged a table. Now: text that is no DDL
+    // message is ignored; a DDL message without the credential STOPS the writer (review finding
+    // B2: a legitimate one emitted under another secret looks the same, and ignoring that lost a
+    // column for good), applies nothing, and PGPAIMON_SKIP_LSN at its LSN steps over it.
     static void a11_forgedMessages() throws Exception {
         System.out.println("\n── A11: forged DDL messages ────────────────────────");
+        String launcher = System.getenv("PGPAIMON_WRITER_LAUNCHER");
+        String pidFile = System.getenv("PGPAIMON_WRITER_PID_FILE");
         String t = "dba_victim";
+        int before = writerLog().length();
         try (Connection c = connect()) {
             createTracked(c, t, "id int PRIMARY KEY, v text");
             exec(c, "INSERT INTO " + t + " VALUES (1, 'kept')");
@@ -315,17 +323,99 @@ public class PaimonAdversarialTest {
             exec(c, "CREATE ROLE dba_nobody");
             exec(c, "SET ROLE dba_nobody");
             exec(c, "SELECT pg_logical_emit_message(true, 'paimon', 'not json')");
-            exec(c, "SELECT pg_logical_emit_message(true, 'paimon', '{\"v\":1,\"op\":\"drop_table\",\"relid\":\""
-                + oid(c, t) + "\",\"schema\":\"public\",\"table\":\"" + t + "\"}')");
             refused("A11 an unprivileged role cannot call paimon.emit", c,
                 "SELECT paimon.emit('{}'::jsonb)", "permission denied");
             exec(c, "RESET ROLE");
+        }
+        writerKeepsUp("A11 after text that is no DDL message");
+        check("A11 the writer logged the text as ignored",
+              writerLog().substring(before).contains("IGNORED a logical message with prefix 'paimon'"));
+        String pid = writerPid(pidFile);
+        try (Connection c = connect()) {
+            exec(c, "SET ROLE dba_nobody");
+            exec(c, "SELECT pg_logical_emit_message(true, 'paimon', '{\"v\":1,\"op\":\"drop_table\",\"relid\":\""
+                + oid(c, t) + "\",\"schema\":\"public\",\"table\":\"" + t + "\"}')");
+            exec(c, "RESET ROLE");
             exec(c, "INSERT INTO " + t + " VALUES (2, 'after')");
         }
-        writerKeepsUp("A11");
-        sameRows("A11 the forged drop_table purged nothing", t, "id");
-        check("A11 the writer logged the forged messages as ignored",
-              writerLog().contains("IGNORED a logical message with prefix 'paimon'"));
+        check("A11 a DDL message without the credential stops the writer", waitProcessGone(pid, 30_000));
+        String log = writerLog().substring(before);
+        check("A11 and says why, with the LSN to skip",
+              log.contains("REJECTED DDL MESSAGE") && log.contains("carries no credential")
+              && log.contains("PGPAIMON_SKIP_LSN="));
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("set PGPAIMON_SKIP_LSN=([0-9A-F]+/[0-9A-F]+)").matcher(log);
+        boolean found = m.find();
+        check("A11 the error names the LSN", found);
+        if (!found) return;
+        startWriter("A11 with PGPAIMON_SKIP_LSN", launcher, Map.of("PGPAIMON_SKIP_LSN", m.group(1)), true);
+        writerKeepsUp("A11 after the skip");
+        sameRows("A11 the forged drop_table purged nothing, and the row after it replicated", t, "id");
+        check("A11 the skip is logged", writerLog().substring(before).contains("SKIPPED DDL MESSAGE"));
+        // restart without the variable, so no later case runs with it armed
+        stopWriter(pidFile);
+        startWriter("A11 restart", launcher, Map.of(), true);
+        writerKeepsUp("A11 after the restart");
+    }
+
+    // ── A16: paimon.secret rotated ─────────────────────────────────────────────────────────
+    // Review finding B2: a DBA rotating the secret (the natural answer to "a role that can read
+    // it can forge") made the writer IGNORE the next ADD COLUMN, and the column's values were
+    // discarded for good. Now: a rotation while the writer runs is followed (the writer re-reads
+    // the secret when a message carries another value); a DDL message emitted under the OLD
+    // value and still in the slot stops the writer, and putting the old value back recovers.
+    static void a16_secretRotation() throws Exception {
+        System.out.println("\n── A16: paimon.secret rotated ──────────────────────");
+        String launcher = System.getenv("PGPAIMON_WRITER_LAUNCHER");
+        String pidFile = System.getenv("PGPAIMON_WRITER_PID_FILE");
+        String t = "dba_rot";
+        String original;
+        try (Connection c = connect()) {
+            createTracked(c, t, "id int PRIMARY KEY, v text");
+            exec(c, "INSERT INTO " + t + " VALUES (1, 'x')");
+            original = scalar(c, "SELECT token FROM paimon.secret");
+            exec(c, "UPDATE paimon.secret SET token = md5(random()::text) || md5(random()::text)");
+            exec(c, "ALTER TABLE " + t + " ADD COLUMN c int");
+            exec(c, "INSERT INTO " + t + " VALUES (2, 'y', 42)");
+        }
+        writerKeepsUp("A16 after a rotation while running");
+        sameRows("A16 the column added after the rotation replicates with its values", t, "id");
+
+        // An ADD COLUMN emitted under the current secret, then the secret changes while the
+        // message is still unconsumed (the writer is stopped).
+        stopWriter(pidFile);
+        int before = writerLog().length();
+        String underOld;
+        try (Connection c = connect()) {
+            underOld = scalar(c, "SELECT token FROM paimon.secret");
+            exec(c, "ALTER TABLE " + t + " ADD COLUMN d int");
+            exec(c, "INSERT INTO " + t + " VALUES (3, 'z', 43, 44)");
+            exec(c, "UPDATE paimon.secret SET token = md5(random()::text) || md5(random()::text)");
+        }
+        startWriter("A16 after a rotation with DDL in the slot", launcher, Map.of(), false);
+        check("A16 a DDL message under the old secret stops the writer",
+              waitProcessGone(writerPid(pidFile), 60_000));
+        String log = writerLog().substring(before);
+        check("A16 and says to check for a rotation",
+              log.contains("REJECTED DDL MESSAGE") && log.contains("was paimon.secret changed"));
+        try (Connection c = connect()) {
+            exec(c, "UPDATE paimon.secret SET token = '" + underOld + "'");
+        }
+        startWriter("A16 with the old secret back", launcher, Map.of(), true);
+        writerKeepsUp("A16 after the recovery");
+        sameRows("A16 the column added before the rotation replicates with its values", t, "id");
+        try (Connection c = connect()) {
+            exec(c, "UPDATE paimon.secret SET token = '" + original + "'");   // later cases: as set up
+        }
+        stopWriter(pidFile);
+        startWriter("A16 restart", launcher, Map.of(), true);
+    }
+
+    static String scalar(Connection c, String sql) throws SQLException {
+        try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            rs.next();
+            return rs.getString(1);
+        }
     }
 
     // ── A12: TRUNCATE and INSERT in one transaction ────────────────────────────────────────
@@ -637,7 +727,7 @@ public class PaimonAdversarialTest {
     static void stopWriter(String pidFile) throws Exception {
         String pid = writerPid(pidFile);
         new ProcessBuilder("kill", pid).start().waitFor();
-        check("A15 the writer stops cleanly on SIGTERM", waitProcessGone(pid, 30_000));
+        check("the writer stops cleanly on SIGTERM", waitProcessGone(pid, 30_000));
     }
 
     /** Starts the writer through the harness launcher; waits for the slot when {@code attach}. */
