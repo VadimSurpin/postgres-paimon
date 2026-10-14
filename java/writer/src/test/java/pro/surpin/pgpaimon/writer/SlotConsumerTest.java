@@ -91,6 +91,34 @@ class SlotConsumerTest {
         return new PgEvent.Insert(relid, new TupleData(List.of(ColumnValue.of(id))));
     }
 
+    /**
+     * The running health check is wired through the handler's periodic hook, which must run on
+     * every event AND every idle tick: a writer that only checked while traffic flowed would never
+     * notice a bypassed guardrail on a quiet database, and one that only checked when idle would
+     * never check under load. (Review finding I5, mutation M1: removing both calls passed every
+     * unit test.) A problem it raises must propagate out of the handler, which stops the writer.
+     */
+    @Test
+    void theHealthCheckRunsOnEveryEventAndIdleTickAndItsVerdictPropagates() throws Exception {
+        Fixture f = new Fixture();
+        java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
+        Main.PipelineHandler h = new Main.PipelineHandler(f.tracked::contains, r -> List.of("id"),
+            m -> { }, m -> true, f, f.batcher, f.mini, runs::incrementAndGet);
+        h.onIdle();
+        assertEquals(1, runs.get(), "an idle tick runs it");
+        h.onEvent(new PgEvent.Relation(META), 0L);
+        h.onEvent(new PgEvent.Begin(50L, 0L, 7L), 40L);
+        assertEquals(3, runs.get(), "every event runs it");
+
+        Main.PipelineHandler failing = new Main.PipelineHandler(f.tracked::contains,
+            r -> List.of("id"), m -> { }, m -> true, f, f.batcher, f.mini, () -> {
+                throw new IllegalStateException("paimon.health() reports 1 problem(s)");
+            });
+        assertThrows(IllegalStateException.class, failing::onIdle);
+        assertThrows(IllegalStateException.class,
+            () -> failing.onEvent(new PgEvent.Commit(50L, 55L, 0L), 50L));
+    }
+
     @Test
     void aTruncateIsBufferedAndAppliedAtCommitJustBelowTheCommitLsn() throws Exception {
         Fixture f = new Fixture();

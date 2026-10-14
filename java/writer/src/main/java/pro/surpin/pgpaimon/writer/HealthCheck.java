@@ -24,8 +24,21 @@ import java.util.logging.Logger;
  * while it runs: loud and early, rather than a Paimon table that quietly diverges.
  *
  * <p>The periodic check runs on the consumer's own thread from the idle and event callbacks, at
- * most once per interval. A failure to <em>reach</em> PostgreSQL for the check is not a problem
- * report and is only logged: the replication connection has its own, stricter handling.
+ * most once per interval, so it must never wait long: {@code health()} reads the catalog of every
+ * replicated table and blocks behind any ACCESS EXCLUSIVE lock on one (VACUUM FULL, CLUSTER, a
+ * long ALTER, an open TRUNCATE). Measured: a 25 s lock on one table held up a row of an UNRELATED
+ * table for the whole 25 s, and a multi-hour VACUUM FULL would stall replication for hours and get
+ * the walsender killed by wal_sender_timeout. So the check runs with a {@link #LOCK_TIMEOUT} and a
+ * {@link #STATEMENT_TIMEOUT}, and a timeout means "could not check this time", not a problem.
+ *
+ * <p>What a failure to run the check means is decided by its SQLSTATE ({@link #transientFailure}).
+ * Not reaching PostgreSQL (class 08), a lock or statement timeout, a server shutting down or out of
+ * resources is transient and only logged: the replication connection has its own, stricter
+ * handling. Anything else is fatal. In particular {@code function paimon.health() does not exist}
+ * (42883), a missing schema (3F000) or table (42P01) mean the extension was dropped under a
+ * running writer: its event triggers and registry are gone, DDL no longer reaches the writer, and
+ * treating that as "could not reach PostgreSQL" kept the writer running and discarding the
+ * values of every column added afterwards (measured).
  */
 public final class HealthCheck {
 
@@ -53,8 +66,21 @@ public final class HealthCheck {
         this.lastCheck = nanoClock.getAsLong();
     }
 
-    /** The problems {@code paimon.health()} reports, in order; empty when healthy. */
+    /** How long one check waits for a lock before giving up for this interval. */
+    static final String LOCK_TIMEOUT = "1s";
+    /** How long one check may run at all. */
+    static final String STATEMENT_TIMEOUT = "30s";
+
+    /**
+     * The problems {@code paimon.health()} reports, in order; empty when healthy. Bounded by
+     * {@link #LOCK_TIMEOUT} and {@link #STATEMENT_TIMEOUT}, set for this session (the
+     * connection is the check's own).
+     */
     static List<String> problems(Connection conn) throws SQLException {
+        try (java.sql.Statement st = conn.createStatement()) {
+            st.execute("SET lock_timeout = '" + LOCK_TIMEOUT + "'");
+            st.execute("SET statement_timeout = '" + STATEMENT_TIMEOUT + "'");
+        }
         List<String> out = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM paimon.health()");
              ResultSet rs = ps.executeQuery()) {
@@ -62,7 +88,72 @@ public final class HealthCheck {
                 out.add(rs.getString(1));
             }
         }
+        try (java.sql.Statement st = conn.createStatement()) {
+            st.execute("RESET lock_timeout");
+            st.execute("RESET statement_timeout");
+        }
         return out;
+    }
+
+    /**
+     * Whether a failure to run the check says nothing about the extension: PostgreSQL could not be
+     * reached (class 08, or no SQLSTATE at all, an I/O failure in the driver), a lock or statement
+     * timeout (55P03, 57014), the server shutting down (57P01-57P05) or short of resources (53).
+     * Everything else -- above all 42883, 3F000, 42P01: the extension is gone -- is fatal.
+     */
+    static boolean transientFailure(SQLException e) {
+        String state = e.getSQLState();
+        if (state == null || state.length() != 5) {
+            return true;
+        }
+        return state.startsWith("08") || state.startsWith("53") || state.startsWith("57P")
+            || state.equals("55P03") || state.equals("57014");
+    }
+
+    /** Thrown for a failure of the check that is not transient. */
+    static IllegalStateException checkFailed(SQLException e, String when) {
+        return new IllegalStateException("paimon.health() could not run " + when + ": "
+            + e.getMessage() + " (SQLSTATE " + e.getSQLState() + "). This is not a connection"
+            + " problem: the paimon_slot extension, or part of it, is missing or not usable by the"
+            + " writer's role (DROP EXTENSION, a dropped schema or function, a revoked grant)."
+            + " Without it DDL on replicated tables no longer reaches the writer, so it stops"
+            + " rather than replicate on blind. Restore the extension (and re-register its tables,"
+            + " section 3 'Re-bootstrapping', if it was dropped), or the grants, then restart", e);
+    }
+
+    /** Waits between startup attempts that hit a lock; replaceable in tests. */
+    interface Sleeper {
+        void sleep(long ms) throws InterruptedException;
+    }
+
+    /**
+     * The startup check. A lock or statement timeout is retried (with a WARNING each time): the
+     * writer cannot start without a verdict, and before the stream opens waiting costs nothing
+     * but time. Any other failure propagates.
+     */
+    static List<String> problemsAtStartup(Connection conn) throws SQLException {
+        return problemsAtStartup(conn, Thread::sleep);
+    }
+
+    static List<String> problemsAtStartup(Connection conn, Sleeper sleeper) throws SQLException {
+        while (true) {
+            try {
+                return problems(conn);
+            } catch (SQLException e) {
+                if (!"55P03".equals(e.getSQLState()) && !"57014".equals(e.getSQLState())) {
+                    throw e;
+                }
+                LOG.warning("paimon.health() timed out at startup (" + e.getMessage() + "): a"
+                    + " replicated table is locked (VACUUM FULL, CLUSTER, a long ALTER?); retrying"
+                    + " in 2 s");
+                try {
+                    sleeper.sleep(2_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
     }
 
     /** Throws, naming every problem, unless the extension reports itself healthy. */
@@ -94,6 +185,9 @@ public final class HealthCheck {
         try (Connection conn = connections.open()) {
             found = problems(conn);
         } catch (SQLException e) {
+            if (!transientFailure(e)) {
+                throw checkFailed(e, "while running");
+            }
             LOG.warning("could not run paimon.health(): " + e + "; will try again in "
                 + intervalNanos / 1_000_000L + " ms");
             return;

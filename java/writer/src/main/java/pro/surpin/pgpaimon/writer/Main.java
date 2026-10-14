@@ -63,9 +63,8 @@ public final class Main {
         try (Connection conn = plainConnection(config)) {
             // 1a. the guardrails are still in force: refuse to start if any was bypassed
             //     (HealthCheck says why) -- before anything is read or written.
-            HealthCheck.requireHealthy(HealthCheck.problems(conn), "at startup");
             // 1b. the credential every DDL message carries (DdlMessageHandler says why).
-            token = readToken(conn);
+            token = preflight(conn);
             // 2. CHECK that the slot exists. Main never creates it: the initial backfill must
             //    read the snapshot exported by the slot's own creation (Backfiller, Task 13).
             slotExists = slotExists(conn, config.slotName());
@@ -73,6 +72,8 @@ public final class Main {
             //    'create' message is emitted once and consumed once; without this a restarted
             //    writer knows no tables and silently discards every replicated row.
             rows = readRegistry(conn);
+        } catch (java.sql.SQLException e) {
+            throw missingGrant(e);
         }
         // 3a. the relid to Paimon identity mapping only. No catalog call, no warehouse write:
         //     step 3b may refuse to start, and "the writer refused to start, so nothing
@@ -362,11 +363,63 @@ public final class Main {
         }
     }
 
+    /**
+     * A plain (non-replication) connection, with {@code search_path} pinned to
+     * {@code pg_catalog, pg_temp}. Every name the writer uses is schema-qualified, and the writer
+     * usually runs as a superuser: with the default path, an operator or function planted in
+     * {@code public} by any role with CREATE there could win resolution inside the writer's own
+     * queries, which it runs unattended (the periodic {@code paimon.health()}). The extension's
+     * functions pin their own path as well (paimon_slot--1.0.sql, top).
+     */
     static Connection plainConnection(WriterConfig config) throws java.sql.SQLException {
+        return DriverManager.getConnection(config.jdbcUrl(), plainProperties(config));
+    }
+
+    static Properties plainProperties(WriterConfig config) {
         Properties p = new Properties();
         p.setProperty("user", config.user());
         p.setProperty("password", config.password());
-        return DriverManager.getConnection(config.jdbcUrl(), p);
+        p.setProperty("options", "-c search_path=pg_catalog,pg_temp");
+        return p;
+    }
+
+    /**
+     * Steps 1a and 1b: refuses to start unless {@code paimon.health()} reports nothing, then
+     * returns the DDL message credential. In this order, deliberately: nothing is read from the
+     * registry or written anywhere while a guardrail is known to be bypassed.
+     */
+    static String preflight(Connection conn) throws java.sql.SQLException {
+        List<String> problems;
+        try {
+            problems = HealthCheck.problemsAtStartup(conn);
+        } catch (java.sql.SQLException e) {
+            if (HealthCheck.transientFailure(e) || "42501".equals(e.getSQLState())) {
+                throw e;    // not reached, or a grant: missingGrant() names them all
+            }
+            throw HealthCheck.checkFailed(e, "at startup");
+        }
+        HealthCheck.requireHealthy(problems, "at startup");
+        return readToken(conn);
+    }
+
+    /** What the writer's role needs when it is not a superuser (docs, section 2). */
+    static final String WRITER_GRANTS = "GRANT USAGE ON SCHEMA paimon TO <role>;"
+        + " GRANT SELECT ON paimon.secret, paimon.retained_history TO <role>;"
+        + " GRANT SELECT, UPDATE ON paimon.table_registry TO <role>;"
+        + " and SELECT on every replicated table, besides the REPLICATION attribute";
+
+    /**
+     * A permission error at startup names every grant the writer needs, not only the object the
+     * first failing query happened to touch (it used to be a raw "permission denied for schema
+     * paimon" from the health check).
+     */
+    static RuntimeException missingGrant(java.sql.SQLException e) {
+        if ("42501".equals(e.getSQLState())) {
+            return new IllegalStateException("the writer's role lacks a privilege it needs ("
+                + e.getMessage() + "). A writer that does not connect as a superuser needs: "
+                + WRITER_GRANTS, e);
+        }
+        return new IllegalStateException("startup query failed: " + e.getMessage(), e);
     }
 
     /** The installation's DDL message credential; the writer's role must be able to read it. */
@@ -381,8 +434,8 @@ public final class Main {
         } catch (java.sql.SQLException e) {
             if ("42501".equals(e.getSQLState())) {
                 throw new IllegalStateException("the writer's role cannot read paimon.secret, the"
-                    + " credential every DDL message carries: GRANT SELECT ON paimon.secret TO "
-                    + "<the writer's role>", e);
+                    + " credential every DDL message carries. A writer that does not connect as a"
+                    + " superuser needs: " + WRITER_GRANTS, e);
             }
             throw e;
         }

@@ -3,7 +3,6 @@ package pro.surpin.pgpaimon.writer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -73,40 +72,91 @@ class HealthCheckTest {
     @Test
     void aProblemFoundWhileRunningIsFatal() throws Exception {
         AtomicLong now = new AtomicLong(0);
-        Connection conn = (Connection) java.lang.reflect.Proxy.newProxyInstance(
-            getClass().getClassLoader(), new Class<?>[] {Connection.class}, (p, m, a) -> {
-                switch (m.getName()) {
-                    case "prepareStatement":
-                        return statementReturning("event trigger paimon_ddl_end is missing");
-                    case "close":
-                        return null;
-                    default:
-                        throw new UnsupportedOperationException(m.getName());
-                }
-            });
-        HealthCheck h = new HealthCheck(() -> conn, 1, now::get);
+        FakeJdbc db = new FakeJdbc(sql -> sql.contains("paimon.health()")
+            ? List.of("event trigger paimon_ddl_end is missing") : null);
+        HealthCheck h = new HealthCheck(db::connection, 1, now::get);
         now.set(10_000_000L);
         IllegalStateException e = assertThrows(IllegalStateException.class, h::maybeCheck);
         assertTrue(e.getMessage().contains("while running"));
         assertTrue(e.getMessage().contains("paimon_ddl_end is missing"));
     }
 
-    private static Object statementReturning(String problem) {
-        boolean[] served = {false};
-        java.sql.ResultSet rs = (java.sql.ResultSet) java.lang.reflect.Proxy.newProxyInstance(
-            HealthCheckTest.class.getClassLoader(), new Class<?>[] {java.sql.ResultSet.class},
-            (p, m, a) -> switch (m.getName()) {
-                case "next" -> { boolean r = !served[0]; served[0] = true; yield r; }
-                case "getString" -> problem;
-                case "close" -> null;
-                default -> throw new UnsupportedOperationException(m.getName());
-            });
-        return java.lang.reflect.Proxy.newProxyInstance(
-            HealthCheckTest.class.getClassLoader(), new Class<?>[] {java.sql.PreparedStatement.class},
-            (p, m, a) -> switch (m.getName()) {
-                case "executeQuery" -> rs;
-                case "close" -> null;
-                default -> throw new UnsupportedOperationException(m.getName());
-            });
+    /**
+     * Review finding I1: the check runs on the consumer's thread, and health() blocks behind any
+     * ACCESS EXCLUSIVE lock on a replicated table. It must be bounded, and the bounds must be set
+     * BEFORE the query on the same session.
+     */
+    @Test
+    void theCheckIsBoundedByALockTimeoutSetBeforeTheQuery() throws Exception {
+        FakeJdbc db = new FakeJdbc(sql -> null);
+        HealthCheck.problems(db.connection());
+        int lock = db.executed.indexOf("SET lock_timeout = '1s'");
+        int stmt = db.executed.indexOf("SET statement_timeout = '30s'");
+        int query = db.executed.indexOf("SELECT * FROM paimon.health()");
+        assertTrue(lock >= 0 && stmt >= 0 && query >= 0, db.executed.toString());
+        assertTrue(lock < query && stmt < query, db.executed.toString());
+    }
+
+    /** A lock or statement timeout means "could not check this time": not fatal, not a report. */
+    @Test
+    void aLockTimeoutIsNotAProblemReport() {
+        for (String state : List.of("55P03", "57014")) {
+            AtomicLong now = new AtomicLong(0);
+            FakeJdbc db = new FakeJdbc(sql -> sql.contains("paimon.health()")
+                ? new SQLException("canceling statement due to lock timeout", state) : null);
+            HealthCheck h = new HealthCheck(db::connection, 1, now::get);
+            now.set(10_000_000L);
+            assertDoesNotThrow(h::maybeCheck, state);
+        }
+    }
+
+    /**
+     * Review finding I2: DROP EXTENSION under a running writer made every check fail with
+     * "function paimon.health() does not exist", which was logged as "could not reach" while
+     * the writer went on discarding the values of every column added afterwards.
+     */
+    @Test
+    void aMissingExtensionIsFatal() {
+        for (String state : List.of("42883", "3F000", "42P01", "42501")) {
+            AtomicLong now = new AtomicLong(0);
+            FakeJdbc db = new FakeJdbc(sql -> sql.contains("paimon.health()")
+                ? new SQLException("function paimon.health() does not exist", state) : null);
+            HealthCheck h = new HealthCheck(db::connection, 1, now::get);
+            now.set(10_000_000L);
+            IllegalStateException e = assertThrows(IllegalStateException.class, h::maybeCheck,
+                state);
+            assertTrue(e.getMessage().contains("could not run while running"), e.getMessage());
+            assertTrue(e.getMessage().contains("not a connection problem"), e.getMessage());
+        }
+    }
+
+    @Test
+    void whichFailuresAreTransient() {
+        for (String s : List.of("08001", "08006", "08P01", "55P03", "57014", "57P01", "53300")) {
+            assertTrue(HealthCheck.transientFailure(new SQLException("x", s)), s);
+        }
+        assertTrue(HealthCheck.transientFailure(new SQLException("io")), "no SQLSTATE: I/O");
+        for (String s : List.of("42883", "3F000", "42P01", "42501", "XX000", "22012")) {
+            assertFalse(HealthCheck.transientFailure(new SQLException("x", s)), s);
+        }
+    }
+
+    /** At startup a lock timeout is waited out (there is no stream to hold up yet). */
+    @Test
+    void theStartupCheckRetriesALockTimeout() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        FakeJdbc db = new FakeJdbc(sql -> !sql.contains("paimon.health()") ? null
+            : calls.incrementAndGet() < 3 ? new SQLException("lock timeout", "55P03")
+            : List.of("a problem"));
+        List<Long> slept = new java.util.ArrayList<>();
+        assertEquals(List.of("a problem"),
+            HealthCheck.problemsAtStartup(db.connection(), slept::add));
+        assertEquals(List.of(2_000L, 2_000L), slept);
+
+        FakeJdbc gone = new FakeJdbc(sql -> sql.contains("paimon.health()")
+            ? new SQLException("function paimon.health() does not exist", "42883") : null);
+        SQLException e = assertThrows(SQLException.class,
+            () -> HealthCheck.problemsAtStartup(gone.connection(), ms -> fail("no retry")));
+        assertEquals("42883", e.getSQLState());
     }
 }
