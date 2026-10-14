@@ -698,4 +698,73 @@ class PaimonSinkTest {
             assertEquals(List.of("1|a|null", "2|b|7"), got);
         }
     }
+
+    /**
+     * Review finding I4: BEGIN; INSERT; ALTER TABLE RENAME COLUMN v TO w; INSERT; COMMIT. Both
+     * records are built at the commit, against the renamed schema, by name: the first one's value
+     * was discarded and Paimon held NULL where PostgreSQL held it. And with a drop and a re-add of
+     * the same name, the dropped column's value must NOT land in the new column.
+     */
+    @Test
+    void aRecordDecodedBeforeARenameOrDropInItsTransactionIsBuiltWithTodaysNames(
+            @TempDir java.nio.file.Path ownWh) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", ownWh.toString());
+        Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
+        WriterConfig c = WriterConfig.fromEnv(Map.of(
+            "PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+            "PGPAIMON_WAREHOUSE", ownWh.toString()));
+        SchemaRegistry r = new SchemaRegistry(cat, c);
+        DdlMessageHandler h = new DdlMessageHandler(r, "paimon", TestAuth.TOKEN);
+        h.handle(msg("""
+             {"v":1,"op":"create","relid":16800,"schema":"public","table":"ren",
+              "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"},
+                                  {"id":2,"name":"v","type":"STRING"},
+                                  {"id":3,"name":"x","type":"STRING"}],
+              "options":{"changelog-producer":"input"}}"""));
+        RelationMeta before = new RelationMeta(16800, "public", "ren",
+            List.of("id", "v", "x"), List.of(true, false, false));
+        RelationMeta after = new RelationMeta(16800, "public", "ren",
+            List.of("id", "w", "x"), List.of(true, false, false));
+        try (PaimonSink s = new PaimonSink(r, c)) {
+            s.setRelation(16800, before);
+            long first = NEXT_LSN.get() + 1;             // decoded before the DDL below
+            h.handle(msg("""
+                {"v":1,"op":"rename_col","relid":"16800","id":2,"from":"v","to":"w"}"""));
+            h.handle(msg("""
+                {"v":1,"op":"drop_col","relid":"16800","name":"x"}"""));
+            h.handle(msg("""
+                {"v":1,"op":"add_col","relid":"16800","col":{"id":4,"name":"x","type":"INT"}}"""));
+            RelationMeta now = new RelationMeta(16800, "public", "ren",
+                List.of("id", "w", "x"), List.of(true, false, false));
+            long later = NEXT_LSN.get() + 1;
+            s.setRelation(16800, now);
+            s.flush(List.of(
+                new SinkRecord(16800, RowKind.INSERT, Arrays.asList("20", "before rename", "old x"),
+                               first, 0, 1L, before),
+                new SinkRecord(16800, RowKind.INSERT, Arrays.asList("21", "after rename", "5"),
+                               later, 1, 1L, now)), later + 1, later + 2);
+
+            FileStoreTable t = r.table(16800);
+            ReadBuilder rb = t.newReadBuilder();
+            List<String> got = new ArrayList<>();
+            int wi = t.rowType().getFieldIndex("w");
+            int xi = t.rowType().getFieldIndex("x");
+            InternalRow.FieldGetter wg = InternalRow.createFieldGetter(t.rowType().getTypeAt(wi), wi);
+            InternalRow.FieldGetter xg = InternalRow.createFieldGetter(t.rowType().getTypeAt(xi), xi);
+            try (RecordReader<InternalRow> rr =
+                     rb.newRead().createReader(rb.newScan().plan().splits())) {
+                rr.forEachRemaining(row -> got.add(row.getInt(0) + "|" + wg.getFieldOrNull(row)
+                    + "|" + xg.getFieldOrNull(row)));
+            }
+            Collections.sort(got);
+            assertEquals(List.of("20|before rename|null", "21|after rename|5"), got);
+        }
+        // the translation itself: a rename applies, a drop discards, a later change does not
+        assertEquals(List.of("id", "w", SchemaRegistry.DROPPED),
+            r.asOfNow(16800, before, 0x1).columnNames());
+        assertSame(after, r.asOfNow(16800, after, Long.MAX_VALUE), "nothing after it: unchanged");
+        assertEquals(List.of("id", "v", "x"), r.asOfNow(HistoryKeys.histKey(16800), before, 0x1)
+            .columnNames(), "history tables keep the names they were decoded under");
+    }
 }

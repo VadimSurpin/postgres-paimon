@@ -60,7 +60,7 @@ public final class RowBuilder implements RowMaker {
     private void warnAboutIgnoredColumns(String tableName) {
         List<String> ignored = new ArrayList<>();
         for (int i = 0; i < paimonIndexForPgColumn.length; i++) {
-            if (paimonIndexForPgColumn[i] < 0) {
+            if (paimonIndexForPgColumn[i] < 0 && !SchemaRegistry.DROPPED.equals(pgColumnOrder.get(i))) {
                 ignored.add(pgColumnOrder.get(i));
             }
         }

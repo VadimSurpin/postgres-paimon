@@ -144,7 +144,10 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
                         m = new RelationMeta(HistoryKeys.relidOf(relid), "?", "?", List.of(),
                                              List.of());
                     }
-                    if (rb == null || m != builtFor) {
+                    // ... and with the names a later RENAME/DROP COLUMN gave its columns since
+                    // (SchemaRegistry.asOfNow): the main table's schema is already the later one.
+                    m = registry.asOfNow(relid, m, r.seq());
+                    if (rb == null || !m.equals(builtFor)) {
                         rb = registry.rowBuilder(relid, m);
                         builtFor = m;
                     }

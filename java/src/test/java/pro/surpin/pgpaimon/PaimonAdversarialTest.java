@@ -92,6 +92,7 @@ public class PaimonAdversarialTest {
         run("A12", PaimonAdversarialTest::a12_truncateThenInsert);
         run("A13", PaimonAdversarialTest::a13_insertThenDropTable);
         run("A14", PaimonAdversarialTest::a14_otherPublications);
+        run("A17", PaimonAdversarialTest::a17_renameInsideATransaction);
         run("A16", PaimonAdversarialTest::a16_secretRotation);
         run("A15", PaimonAdversarialTest::a15_healthStopsTheWriter);
 
@@ -454,6 +455,34 @@ public class PaimonAdversarialTest {
         }
         writerKeepsUp("A13");
         sameRows("A13 the rest of the transaction is committed", "dba_survivor", "id");
+    }
+
+    // ── A17: a row written, then its column renamed or dropped, in one transaction ─────────
+    // Review finding I4. Records are built at the commit against the schema current then, by
+    // name: the row inserted before RENAME COLUMN v TO w reached Paimon with w NULL, and with a
+    // drop and a re-add of the same name the old value met the new column's type.
+    static void a17_renameInsideATransaction() throws Exception {
+        System.out.println("\n── A17: INSERT, RENAME/DROP COLUMN, INSERT ─────────");
+        String t = "dba_ren";
+        try (Connection c = connect()) {
+            createTracked(c, t, "id int PRIMARY KEY, v text, x text");
+            c.setAutoCommit(false);
+            exec(c, "INSERT INTO " + t + " VALUES (20, 'before rename', 'old x')");
+            exec(c, "ALTER TABLE " + t + " RENAME COLUMN v TO w");
+            exec(c, "ALTER TABLE " + t + " DROP COLUMN x");
+            exec(c, "ALTER TABLE " + t + " ADD COLUMN x int");
+            exec(c, "INSERT INTO " + t + " VALUES (21, 'after rename', 5)");
+            c.commit();
+            // the reload shape the review measured: TRUNCATE; INSERT; ALTER; INSERT
+            exec(c, "TRUNCATE " + t);
+            exec(c, "INSERT INTO " + t + " VALUES (1, 'new', 10)");
+            exec(c, "ALTER TABLE " + t + " RENAME COLUMN w TO v2");
+            exec(c, "INSERT INTO " + t + " VALUES (2, 'newer', 11)");
+            c.commit();
+            c.setAutoCommit(true);
+        }
+        writerKeepsUp("A17");
+        sameRows("A17 every value written before the rename or drop is where PostgreSQL has it", t, "id");
     }
 
     // ── A14: another publication on a replicated table ─────────────────────────────────────

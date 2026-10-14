@@ -749,6 +749,7 @@ public final class SchemaRegistry implements TableTracker {
     }
 
     public void dropColumn(long relid, String name, long ddlLsn) {
+        noteNameChange(relid, ddlLsn, name, DROPPED);
         rotate(relid, ddlLsn, "drop_col '" + name + "'",
                user -> user.removeIf(f -> f.name().equals(name)));
         dropColumnMain(relid, name, ddlLsn);
@@ -768,6 +769,7 @@ public final class SchemaRegistry implements TableTracker {
 
     /** A rename is already applied when the source is gone and the target is there. */
     public void renameColumn(long relid, String from, String to, long ddlLsn) {
+        noteNameChange(relid, ddlLsn, from, to);
         rotate(relid, ddlLsn, "rename_col '" + from + "' -> '" + to + "'", user -> {
             if (user.stream().noneMatch(f -> f.name().equals(to))) {
                 user.replaceAll(f -> f.name().equals(from) ? f.newName(to) : f);
@@ -786,6 +788,89 @@ public final class SchemaRegistry implements TableTracker {
             return;
         }
         alter(relid, List.of(SchemaChange.renameColumn(from, to)), ddlLsn);
+    }
+
+    /**
+     * The name {@link #asOfNow} gives a column dropped since: empty, which no column can be called
+     * (the extension refuses a name with no visible character, and so does Paimon), so no field
+     * matches it and the builders skip it without a warning.
+     */
+    static final String DROPPED = "";
+
+    /**
+     * A column renamed (to {@code to}) or dropped ({@code to} is {@link #DROPPED}) by the DDL
+     * message at {@code lsn}.
+     */
+    private record NameChange(long lsn, String from, String to) {}
+
+    /** Per relation, in stream order: every rename and drop this process has seen. */
+    private final Map<Long, List<NameChange>> nameChanges = new ConcurrentHashMap<>();
+
+    /**
+     * Remembers a rename or drop, also when the message itself is a replay that the Paimon side
+     * skips: a record decoded before it may still be waiting to be built (see {@link #asOfNow}).
+     * A message seen twice (an in-process reconnect replays from the last confirmed LSN) is
+     * recorded once.
+     */
+    private void noteNameChange(long relid, long lsn, String from, String to) {
+        if (lsn == 0) {
+            return;
+        }
+        List<NameChange> l = nameChanges.computeIfAbsent(relid,
+            k -> java.util.Collections.synchronizedList(new ArrayList<>()));
+        NameChange c = new NameChange(lsn, from, to);
+        if (!l.contains(c)) {
+            l.add(c);
+        }
+    }
+
+    /**
+     * The column names a record decoded under {@code meta} at change LSN {@code seq} has in the
+     * main table's schema NOW: every rename and drop at a later LSN applied, in stream order; a
+     * dropped column's name becomes {@link #DROPPED} (its value is discarded, as PostgreSQL
+     * discarded it).
+     *
+     * <p>Why it exists. Records are built when their batch is committed, against the Paimon schema
+     * current then, by column NAME. A transaction that writes a row and then renames a column --
+     * {@code BEGIN; INSERT ...; ALTER TABLE s RENAME COLUMN v TO w; INSERT ...; COMMIT}, the shape
+     * of many reload and migration scripts -- had its first row built against a schema with no
+     * {@code v}: the value was discarded and Paimon held NULL where PostgreSQL held the value
+     * (measured: {@code 20 | null} against {@code 20 | before rename}). With a drop and a re-add
+     * of the same name the old value would even have landed in the NEW column. Translating the
+     * names to the schema's current ones is exact, because the stream orders every DDL message
+     * against every change.
+     *
+     * <p>Only main tables need it: a history row decoded before a DDL goes to that DDL's archive,
+     * whose schema is the one it was decoded under.
+     */
+    public RelationMeta asOfNow(long key, RelationMeta meta, long seq) {
+        if (meta == null || HistoryKeys.isHist(key)) {
+            return meta;
+        }
+        List<NameChange> l = nameChanges.get(key);
+        if (l == null || l.isEmpty()) {
+            return meta;
+        }
+        List<String> names = null;
+        synchronized (l) {
+            for (NameChange c : l) {
+                if (Long.compareUnsigned(c.lsn(), seq) <= 0) {
+                    continue;
+                }
+                if (names == null) {
+                    names = new ArrayList<>(meta.columnNames());
+                }
+                for (int i = 0; i < names.size(); i++) {
+                    if (c.from().equals(names.get(i))) {
+                        names.set(i, c.to());
+                    }
+                }
+            }
+        }
+        if (names == null || names.equals(meta.columnNames())) {
+            return meta;
+        }
+        return new RelationMeta(meta.relid(), meta.namespace(), meta.relName(), names, meta.isKey());
     }
 
     /** One field of the table's Paimon schema by name, or null if there is none. */
@@ -1184,6 +1269,7 @@ public final class SchemaRegistry implements TableTracker {
      */
     public void forget(long relid) {
         identifiers.remove(relid);
+        nameChanges.remove(relid);
         forget0(relid);
         if (!HistoryKeys.isHist(relid)) {
             long hk = HistoryKeys.histKey(relid);

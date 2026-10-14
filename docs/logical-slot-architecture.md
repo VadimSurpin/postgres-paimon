@@ -671,6 +671,13 @@ what is refused, and why"), each measured on PostgreSQL 18 against the real writ
   by the DDL guardrails.
 * `BEGIN; TRUNCATE t; INSERT INTO t ...; COMMIT` used to be one too ("mixes TRUNCATE and row
   changes"). It is now applied: the overwrite first, then the rows inserted after it.
+* `BEGIN; INSERT INTO s ...; ALTER TABLE s RENAME COLUMN v TO w; ...; COMMIT` lost the value: a
+  transaction's records are built at its commit, against the schema current then, by column name,
+  so the row inserted before the rename reached Paimon with `w` NULL (measured). With `DROP COLUMN x;
+  ADD COLUMN x int` in between, the dropped text value met the new `INT` column and stopped the
+  writer for good. The writer now builds each record with the names later renames and drops in the
+  stream gave its columns (a dropped column's value is discarded, as PostgreSQL discarded it); the
+  record of every rename and drop is kept for the life of the process.
 * A logical message under the `paimon` prefix from any role (`pg_logical_emit_message` is
   executable by PUBLIC) used to be one too: `SELECT pg_logical_emit_message(true, 'paimon', 'not
   json')` by a role with no privileges at all stopped the writer for good. Text that is not a DDL

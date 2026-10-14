@@ -67,7 +67,7 @@ public final class LogRowBuilder implements RowMaker {
         List<String> ignored = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             valueIndex[i] = names.indexOf(pgColumnOrder.get(i));
-            if (valueIndex[i] < 0) {
+            if (valueIndex[i] < 0 && !SchemaRegistry.DROPPED.equals(pgColumnOrder.get(i))) {
                 ignored.add(pgColumnOrder.get(i));
             }
         }
