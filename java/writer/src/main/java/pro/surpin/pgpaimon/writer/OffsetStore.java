@@ -42,7 +42,17 @@ public final class OffsetStore {
                 continue;
             }
             any = true;
-            Long ours = ourHighest(relid);
+            Long ours;
+            try {
+                ours = ourHighest(relid);
+            } catch (IllegalStateException missing) {
+                if (!HistoryKeys.isHist(relid)) {
+                    throw missing;
+                }
+                // A history table that a rotation renamed away and has not yet re-created (the
+                // replayed DDL message does): it holds nothing, so it constrains from the start.
+                ours = null;
+            }
             lowest = Math.min(lowest, ours == null ? 0 : ours);
         }
         return any ? lowest : 0;

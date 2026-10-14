@@ -211,6 +211,9 @@ class SchemaRegistryHistoryTest {
             DdlMessageHandler fh = new DdlMessageHandler(fresh, "paimon", TestAuth.TOKEN);
             fh.handle(new PgEvent.Message(true, 1, "paimon", TestAuth.authed(
                 create(rel, t, "[\"id\"]", "r" + rel))));
+            long r0 = rel;
+            assertDoesNotThrow(() -> new OffsetStore(fresh, cfg).highestCommittedLsn(
+                List.of(r0, HistoryKeys.histKey(r0))), step + ": the startup's resume position");
             replay(fh, add, at);
             replay(fh, add, at);
             assertEquals(List.of(archive(t, at)), archives(t), step);
