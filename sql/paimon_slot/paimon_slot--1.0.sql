@@ -64,6 +64,26 @@ CREATE TABLE paimon.retained_history (
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.retained_history', '');
 
+/*
+ * Main Paimon tables left behind by paimon.remove_table(), which (unlike DROP TABLE) keeps the
+ * main table so that adding the table again continues it. That only works with the same key:
+ * a primary-key table and an operation log are different layouts, and a table merged on another
+ * key collapses rows PostgreSQL keeps apart. A key can be added or dropped once the table is no
+ * longer replicated, and re-registering it then stopped the writer on every restart (measured:
+ * "Paimon schema has no metadata column '_seq'"). add_table() compares against this list and
+ * refuses with the remedy; paimon.forget_kept_table() removes a row once the operator has
+ * renamed or dropped that Paimon table by hand.
+ */
+CREATE TABLE paimon.kept_tables (
+    schema_name text        NOT NULL,
+    table_name  text        NOT NULL,
+    relid       oid         NOT NULL,
+    pk_cols     text[]      NOT NULL,
+    kept_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (schema_name, table_name)
+);
+SELECT pg_catalog.pg_extension_config_dump('paimon.kept_tables', '');
+
 -- Mirror of legacy:extension/type_map_pg.h.  Returns a Paimon type string.
 -- quiet => true suppresses the unmapped-type WARNING, for health(), which re-derives every
 -- table's columns on each call and would otherwise repeat it each time.
@@ -723,9 +743,9 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: buckets => % must be a positive integer', buckets
               USING HINT = 'omit the argument to size it from the table (see paimon.default_buckets), or give a count of 1 or more';
     END IF;
-    IF hist_buckets IS NOT NULL AND hist_buckets < 1 THEN
-        RAISE EXCEPTION 'paimon_slot: hist_buckets => % must be a positive integer', hist_buckets
-              USING HINT = 'the bucket count of the history table in each daily partition; omit it to estimate it from the table''s statistics (see paimon.estimate_hist_buckets), or give a count of 1 or more';
+    IF hist_buckets IS NOT NULL AND (hist_buckets < 1 OR hist_buckets > 64) THEN
+        RAISE EXCEPTION 'paimon_slot: hist_buckets => % must be between 1 and 64', hist_buckets
+              USING HINT = 'the bucket count of the history table in each daily partition, so the file count grows as buckets x days; omit it to estimate it from the table''s statistics (see paimon.estimate_hist_buckets), or give a count from 1 to 64 (the single-threaded writer gains nothing beyond that)';
     END IF;
 
     SELECT n.nspname, c.relname, c.relkind
@@ -755,6 +775,7 @@ BEGIN
      */
     v_pk := paimon.pk_cols(v_relid);
     PERFORM paimon.reject_name_collision(v_nsp, v_name);
+    PERFORM paimon.reject_kept_layout(v_nsp, v_name, v_pk);
 
     IF EXISTS (SELECT 1 FROM pg_constraint
                WHERE conrelid = v_relid AND contype = 'p' AND condeferrable) THEN
@@ -805,6 +826,8 @@ BEGIN
             v_has_rows, replica_identity, changelog_producer, v_buckets,
             paimon.hist_name(v_name), v_hist_buckets, hist_buckets)
     RETURNING registration INTO v_registration;
+    -- A main table kept by remove_table() with this very key is continued: no longer "kept".
+    DELETE FROM paimon.kept_tables WHERE schema_name = v_nsp AND table_name = v_name;
 
     PERFORM paimon.emit(jsonb_build_object(
         'v', 1, 'op', 'create', 'relid', v_relid,
@@ -830,6 +853,11 @@ BEGIN
     -- The history table stays in Paimon as the retained audit trail; remember it, so that a
     -- later add_table() cannot append a different registration's changes to it.
     PERFORM paimon.retain_history(rel::oid, 'remove_table');
+    -- ... and so does the main table, so a later add_table() can check the key still fits it.
+    INSERT INTO paimon.kept_tables (schema_name, table_name, relid, pk_cols)
+    SELECT schema_name, table_name, relid, pk_cols FROM paimon.table_registry WHERE relid = rel::oid
+    ON CONFLICT (schema_name, table_name) DO UPDATE
+       SET relid = EXCLUDED.relid, pk_cols = EXCLUDED.pk_cols, kept_at = now();
     -- ORDER IS LOAD-BEARING: the registry row goes FIRST. The event triggers guard every
     -- replicated table, i.e. every registry row: with the row still present, leaving the
     -- publication is refused by check_publication() and dropping a value guard by
@@ -911,7 +939,10 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: column name "%" has no visible character, which Paimon refuses', col_name
               USING HINT = 'choose a different column name';
     END IF;
-    IF col_name IN ('_seq', '_op_seq', '_xid') THEN
+    -- Compared case-insensitively, like the names above: Paimon itself is case-sensitive, but
+    -- Spark and Flink resolve names case-insensitively by default, so "_OP" beside the history's
+    -- _op made the table ambiguous to every reader (measured).
+    IF lower(col_name) IN ('_seq', '_op_seq', '_xid') THEN
         RAISE EXCEPTION 'paimon_slot: column name "%" is a metadata field the writer adds to every Paimon table', col_name
               USING HINT = 'choose a different column name (the writer''s fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)';
     END IF;
@@ -920,7 +951,7 @@ BEGIN
      * operation log a table without a primary key is replicated as. Both carry the user's columns
      * unprefixed beside these, so a user column with one of the names would duplicate a field.
      */
-    IF col_name IN ('_op', '_commit_lsn', '_lsn', '_op_seq', '_xid', '_ts', '_dt') THEN
+    IF lower(col_name) IN ('_op', '_commit_lsn', '_lsn', '_op_seq', '_xid', '_ts', '_dt') THEN
         RAISE EXCEPTION 'paimon_slot: column name "%" is a metadata field of the history table every replicated table has', col_name
               USING HINT = 'choose a different column name; _op, _commit_lsn, _lsn, _op_seq, _xid, _ts and _dt are the history table''s own fields';
     END IF;
@@ -957,7 +988,9 @@ $$;
 CREATE FUNCTION paimon.hist_buckets_for(bytes_per_day numeric) RETURNS int
 LANGUAGE sql IMMUTABLE
     SET search_path = pg_catalog, pg_temp AS $$
-    SELECT greatest(1, least(64, ceil(coalesce(bytes_per_day, 0) / (1024::numeric * 1024 * 1024))::int))
+    -- clamped BEFORE the cast: an absurd estimate (a bloated relation with a tiny reltuples) used
+    -- to overflow int and fail add_table()
+    SELECT greatest(1, least(64, ceil(coalesce(bytes_per_day, 0) / (1024::numeric * 1024 * 1024))))::int
 $$;
 
 /*
@@ -974,9 +1007,16 @@ $$;
 /*
  * add_table()'s estimate of the history's daily volume, from pg_stat_user_tables since the
  * database's statistics were last reset, and the table's average row width
- * (pg_relation_size / reltuples). Falls back to paimon.default_buckets() -- the main table's
- * size heuristic -- when there is nothing sound to divide: counters at zero, statistics never
- * reset or less than a day old, or no row width to measure.
+ * (pg_relation_size / reltuples). Falls back to hist_buckets_for(the table's total size), as if
+ * the whole table were one day's history, when there is nothing sound to divide: counters at
+ * zero, statistics never reset or less than a day old, or no row width to measure.
+ *
+ * The fallback is the NORMAL case, not the exception: pg_stat_database.stats_reset is NULL until
+ * someone runs pg_stat_reset(), which on most clusters is never (it was NULL on every cluster
+ * measured, TPC-C's included), and the table counters date from the table's creation anyway. It
+ * used to be paimon.default_buckets(), whose floor of 4 gave every history table 4 buckets per
+ * daily partition -- four times the files the formula wants for a small table. A table registered
+ * empty now gets 1, and a rotation re-measures from real partitions (HistBuckets).
  */
 CREATE FUNCTION paimon.estimate_hist_buckets(v_relid oid) RETURNS int
 LANGUAGE plpgsql STABLE
@@ -993,7 +1033,7 @@ BEGIN
     days := extract(epoch FROM now() - since) / 86400;
     IF st.relid IS NULL OR since IS NULL OR days < 1 OR tup IS NULL OR tup <= 0
        OR coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) = 0 THEN
-        RETURN paimon.default_buckets(v_relid);
+        RETURN paimon.hist_buckets_for(pg_total_relation_size(v_relid));
     END IF;
     RETURN paimon.hist_buckets_for(paimon.hist_bytes_per_day(
         st.n_tup_ins, st.n_tup_upd, st.n_tup_del, days, pg_relation_size(v_relid) / tup::numeric));
@@ -1044,6 +1084,41 @@ BEGIN
     END IF;
 END $$;
 
+/* Refuses a registration whose key does not fit the main table remove_table() kept. */
+CREATE FUNCTION paimon.reject_kept_layout(v_schema text, v_table text, v_pk text[]) RETURNS void
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    kept paimon.kept_tables;
+BEGIN
+    SELECT * INTO kept FROM paimon.kept_tables
+     WHERE schema_name = v_schema AND table_name = v_table;
+    IF FOUND AND kept.pk_cols IS DISTINCT FROM v_pk THEN
+        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: its Paimon table, kept by paimon.remove_table(), is %, and the table now has %',
+                        v_schema, v_table,
+                        CASE WHEN cardinality(kept.pk_cols) = 0 THEN 'an operation log (no primary key)'
+                             ELSE format('keyed on (%s)', array_to_string(kept.pk_cols, ', ')) END,
+                        CASE WHEN cardinality(v_pk) = 0 THEN 'no primary key'
+                             ELSE format('primary key (%s)', array_to_string(v_pk, ', ')) END
+              USING HINT = format('a primary-key table and an operation log are different layouts, and a table merged on another key would merge the wrong rows, so the kept table cannot be continued. Rename or drop the Paimon table %s.%s by hand (from Spark or Flink, or move its directory), then run SELECT paimon.forget_kept_table(%L, %L); and add the table again',
+                                  v_schema, v_table, v_schema, v_table);
+    END IF;
+END $$;
+
+/* The operator's statement that a kept main table has been renamed or dropped in Paimon. */
+CREATE FUNCTION paimon.forget_kept_table(schema_name text, table_name text) RETURNS void
+LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    DELETE FROM paimon.kept_tables k
+     WHERE k.schema_name = forget_kept_table.schema_name
+       AND k.table_name = forget_kept_table.table_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'paimon_slot: %.% is not a kept main table', schema_name, table_name
+              USING HINT = 'SELECT * FROM paimon.kept_tables lists them';
+    END IF;
+END $$;
+
 /* Records that a table's history table stays behind (remove_table, DROP TABLE). */
 CREATE FUNCTION paimon.retain_history(v_relid oid, why text) RETURNS void
 LANGUAGE sql
@@ -1072,6 +1147,10 @@ BEGIN
         RAISE EXCEPTION 'paimon_slot: %.% is not a retained history table', schema_name, hist_table
               USING HINT = 'SELECT * FROM paimon.retained_history lists them';
     END IF;
+    /* Nothing here can see the warehouse, and the archives are what an operator forgets: they
+     * have distinct names and look harmless. The writer refuses archives of another registration
+     * by name when the table is added again, but saying it here costs nothing. */
+    RAISE NOTICE 'paimon_slot: %.% is forgotten; its archives %_<16 hex digits> must be renamed or dropped in Paimon too, or the writer refuses the next table of that name', schema_name, hist_table, hist_table;
 END $$;
 
 /*

@@ -582,7 +582,7 @@ ALTER TABLE cn_t ADD COLUMN _op_seq int;                                        
 ALTER TABLE cn_t ADD COLUMN _xid int;                                           -- expect ERROR
 ALTER TABLE cn_t ADD COLUMN a int;
 ALTER TABLE cn_t RENAME COLUMN a TO _seq;                                       -- expect ERROR
-ALTER TABLE cn_t ADD COLUMN "_key_a" int, ADD COLUMN "_SEQ" int, ADD COLUMN " x" int;
+ALTER TABLE cn_t ADD COLUMN "_key_a" int, ADD COLUMN "_SEQX" int, ADD COLUMN " x" int;
 SELECT jsonb_path_query_array(cols, '$[*].name') FROM paimon.table_registry
 WHERE relid = 'cn_t'::regclass;
 DROP TABLE "id$x", "id:x", "id/x", ".", "..", sys.t, "s:x".t, "a.b", "Upper", "naïve_表",
@@ -852,6 +852,10 @@ ALTER TABLE pk_ts ADD COLUMN _dt date;                                          
 ALTER TABLE pk_ts ADD COLUMN _op_seq int;                                       -- expect ERROR
 ALTER TABLE pk_ts ADD COLUMN x int;
 ALTER TABLE pk_ts RENAME COLUMN x TO _xid;                                      -- expect ERROR
+-- in any case: readers resolve names case-insensitively, so "_OP" beside _op is ambiguous
+ALTER TABLE pk_ts ADD COLUMN "_OP" text;                                        -- expect ERROR
+ALTER TABLE pk_ts ADD COLUMN "_Dt" date;                                        -- expect ERROR
+ALTER TABLE pk_ts ADD COLUMN "_SEQ" int;                                        -- expect ERROR
 ALTER TABLE kl_t ADD COLUMN c int;
 SELECT paimon.peek_messages() - 'relid';
 -- name collisions: T_hist is a replicated table, or T is a replicated table's history
@@ -918,10 +922,14 @@ SELECT b, paimon.hist_buckets_for(b) AS buckets
 -- expected history bytes per day: (ins + 2 upd + del) / days * row bytes
 SELECT paimon.hist_bytes_per_day(1000, 500, 100, 2, 100) AS bytes;            -- (1000+1000+100)/2*100
 SELECT paimon.hist_buckets_for(paimon.hist_bytes_per_day(10000000, 5000000, 0, 1, 100)) AS buckets;
--- add_table: fresh statistics fall back to the table-size heuristic; hist_buckets wins
+-- the clamp comes before the cast: an absurd estimate is 64, not an integer overflow
+SELECT paimon.hist_buckets_for(1e30) AS huge;
+-- add_table: without statistics since a reset (the normal case) the estimate is the table's
+-- total size taken as one day of history: 1 for an empty table; hist_buckets wins, up to 64
 CREATE TABLE hb_t (id int PRIMARY KEY);
-SELECT paimon.estimate_hist_buckets('hb_t'::regclass) = paimon.default_buckets('hb_t'::regclass) AS fallback;
+SELECT paimon.estimate_hist_buckets('hb_t'::regclass) AS fallback;
 SELECT paimon.add_table('hb_t'::regclass, hist_buckets => 0);                   -- expect ERROR
+SELECT paimon.add_table('hb_t'::regclass, hist_buckets => 100000);              -- expect ERROR
 SELECT paimon.add_table('hb_t'::regclass, hist_buckets => 3);
 CREATE TABLE hb_u (id int PRIMARY KEY);
 SELECT paimon.add_table('hb_u'::regclass);
@@ -976,4 +984,26 @@ SELECT count(*) FROM paimon.table_registry WHERE table_name = 'pv_t';
 SELECT forget_history FROM paimon.forget_history('public', 'pv_t_hist');
 REVOKE CREATE ON SCHEMA public FROM paimon_app;
 DROP ROLE paimon_app;
+SELECT pg_drop_replication_slot('paimon_test');
+
+-- (15) re-registering after remove_table(): the kept main table must fit the key
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+CREATE TABLE kt_t (id int, v text);
+SELECT paimon.add_table('kt_t'::regclass);                     -- key-less: an operation log
+SELECT paimon.remove_table('kt_t'::regclass);
+SELECT schema_name, table_name, pk_cols FROM paimon.kept_tables WHERE table_name = 'kt_t';
+ALTER TABLE kt_t ADD PRIMARY KEY (id);                         -- allowed: no longer replicated
+SELECT forget_history FROM paimon.forget_history('public', 'kt_t_hist');
+SELECT paimon.add_table('kt_t'::regclass);                                      -- expect ERROR
+SELECT forget_kept_table FROM paimon.forget_kept_table('public', 'kt_t');
+SELECT paimon.forget_kept_table('public', 'kt_t');                              -- expect ERROR
+SELECT paimon.add_table('kt_t'::regclass);
+-- the same key again continues the kept table, and the row is gone once it is registered
+SELECT paimon.remove_table('kt_t'::regclass);
+SELECT forget_history FROM paimon.forget_history('public', 'kt_t_hist');
+SELECT paimon.add_table('kt_t'::regclass);
+SELECT count(*) AS kept FROM paimon.kept_tables WHERE table_name = 'kt_t';
+DROP TABLE kt_t;
+SELECT forget_history FROM paimon.forget_history('public', 'kt_t_hist');
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');
