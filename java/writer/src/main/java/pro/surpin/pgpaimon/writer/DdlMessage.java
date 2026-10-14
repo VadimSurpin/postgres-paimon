@@ -52,6 +52,17 @@ public record DdlMessage(int version, String op, long relid, String schema, Stri
         return options == null ? null : options.get("hist-table");
     }
 
+    /** The history table's bucket count per partition carried by {@code create}; null if absent. */
+    public Integer histBuckets() {
+        String v = options == null ? null : options.get("hist-bucket");
+        return v == null ? null : Integer.valueOf(v.trim());
+    }
+
+    /** Whether that count was given by the user ({@code hist_buckets => N}). */
+    public boolean histBucketsUser() {
+        return options != null && "true".equals(options.get("hist-bucket-user"));
+    }
+
     /** The registration id carried by {@code create}; null when absent. */
     public String registration() {
         return options == null ? null : options.get("registration");

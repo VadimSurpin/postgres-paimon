@@ -277,9 +277,19 @@ class BackfillerTest {
         try {
             sink.setRelation(relid, new RelationMeta(relid, "public", "bf_log",
                 List.of("id", "v"), List.of(false, false)));
+            long pgBefore = pgNowMicros(jdbc);
             long cp1 = load(cfg, reg, sink, relid);
+            long pgAfter = pgNowMicros(jdbc);
             assertEquals(7, ops(wh, "bf_log", "R"), "the log: one R row per loaded row");
             assertEquals(7, ops(wh, "bf_log_hist", "R"));
+            // An R row's _ts is PostgreSQL's now() in the load's snapshot transaction, the same
+            // for every row, and its _dt the UTC date of that instant.
+            List<long[]> tsDt = tsAndDt(wh, "bf_log_hist");
+            assertEquals(1, tsDt.stream().map(x -> x[0]).distinct().count(), "one _ts per load");
+            long ts = tsDt.get(0)[0];
+            assertTrue(ts >= pgBefore && ts <= pgAfter,
+                       "_ts " + ts + " is the server's clock during the load");
+            assertEquals(Math.floorDiv(ts, 86_400_000_000L), tsDt.get(0)[1], "_dt = UTC date");
             long cp2 = load(cfg, reg, sink, relid);       // a retried first load
             assertTrue(cp2 > cp1);
             assertEquals(7, ops(wh, "bf_log", "R"), "the retry replaced the first attempt");
@@ -292,15 +302,15 @@ class BackfillerTest {
                  Statement st = c.createStatement()) {
                 st.execute("SELECT pg_logical_emit_message(false, 'it', repeat('x', 4096))");
             }
-            SinkRecord change = SinkRecord.op(HistoryKeys.histKey(relid), 'I', null,
-                java.util.Arrays.asList("9", "streamed"), lsn - 10, 0, 42L, 0L, null)
-                .withCommitLsn(lsn);
-            sink.flush(List.of(change, new SinkRecord(relid, change.kind(), change.values(),
-                change.seq(), 0, 42L, null, new SinkRecord.Op('I', null, change.op().after(),
-                lsn, 0L))), lsn, lsn + 8);
+            List<String> streamed = java.util.Arrays.asList("9", "streamed");
+            sink.flush(List.of(
+                SinkRecord.op(HistoryKeys.histKey(relid), "+I", streamed, lsn - 10, 0, 42L, 0L,
+                              null).withCommitLsn(lsn),
+                SinkRecord.op(relid, "I", streamed, lsn - 10, 0, 42L, 0L, null)
+                    .withCommitLsn(lsn)), lsn, lsn + 8);
             long cp3 = load(cfg, reg, sink, relid);
             assertTrue(cp3 > lsn, "a new slot starts after the streamed change");
-            assertEquals(1, ops(wh, "bf_log_hist", "I"), "streamed history kept");
+            assertEquals(1, ops(wh, "bf_log_hist", "+I"), "streamed history kept");
             assertEquals(14, ops(wh, "bf_log_hist", "R"), "the reload appended its R rows");
             assertEquals(1, ops(wh, "bf_log", "I"));
             assertEquals(14, ops(wh, "bf_log", "R"));
@@ -349,6 +359,37 @@ class BackfillerTest {
                 }
             }
             return n;
+        }
+    }
+
+    private static long pgNowMicros(String jdbc) throws Exception {
+        try (Connection c = DriverManager.getConnection(jdbc);
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery(
+                 "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    /** {_ts micros, _dt days} of every row of a history table. */
+    private static List<long[]> tsAndDt(String wh, String table) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", wh);
+        try (Catalog c = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+            var t = c.getTable(org.apache.paimon.catalog.Identifier.create("public", table));
+            int ts = t.rowType().getFieldNames().indexOf("_ts");
+            int dt = t.rowType().getFieldNames().indexOf("_dt");
+            var rb = t.newReadBuilder();
+            List<long[]> out = new ArrayList<>();
+            try (var r = rb.newRead().createReader(rb.newScan().plan());
+                 var it = r.toCloseableIterator()) {
+                while (it.hasNext()) {
+                    var row = it.next();
+                    out.add(new long[] {row.getTimestamp(ts, 6).toMicros(), row.getInt(dt)});
+                }
+            }
+            return out;
         }
     }
 

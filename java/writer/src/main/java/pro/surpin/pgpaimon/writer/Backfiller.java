@@ -44,7 +44,8 @@ import org.postgresql.replication.LogSequenceNumber;
  * <p><b>Operation records.</b> Each loaded row is also an {@code R} row in the table's history
  * table and, for a table with no primary key, in its main table (an operation log), with
  * {@code _commit_lsn = _lsn = consistentPoint}, {@code _xid = 0} (no transaction made it) and
- * {@code _ts} the moment the load began. Those two tables are append-only, so the overwrite that
+ * {@code _ts} PostgreSQL's {@code now()} in the load's snapshot transaction ({@code _dt} its UTC
+ * date). Those two tables are append-only, so the overwrite that
  * clears an interrupted earlier attempt is applied to them only while they hold nothing but
  * {@code R} rows; once they hold streamed history (a re-bootstrap) that history is kept, and the
  * reload's {@code R} rows are appended after it.
@@ -153,15 +154,25 @@ public final class Backfiller implements AutoCloseable {
                 long chunks = (rows + chunk - 1) / chunk;
                 long truncId = truncateIdentifier(plan.consistentPoint(), chunks);
                 boolean log = registry.keyless(relid);
-                boolean hist = registry.hasHistory(relid);
-                long hk = HistoryKeys.histKey(relid);
+                // The history table of the schema being loaded: a load happens after every DDL it
+                // could follow, so the change LSN is the consistent point.
+                long hk = registry.historyKey(relid, plan.consistentPoint());
+                boolean hist = hk != 0;
                 if (!log || onlyLoads(relid)) {
                     requireApplied(sink.truncate(relid, truncId), qualified, truncId);
                 }
                 if (hist && onlyLoads(hk)) {
                     requireApplied(sink.truncate(hk, truncId), qualified + " (history)", truncId);
                 }
-                long loadMicros = System.currentTimeMillis() * 1000L;
+                // _ts of an R row, and so its _dt partition: PostgreSQL's now() in this snapshot
+                // transaction -- the server's clock when the load's transaction began, the same for
+                // every row of the table, and not the writer's clock.
+                long loadMicros;
+                try (ResultSet rs = st.executeQuery(
+                         "SELECT (extract(epoch FROM now()) * 1000000)::bigint")) {
+                    rs.next();
+                    loadMicros = rs.getLong(1);
+                }
 
                 CopyOut copy = conn.unwrap(PGConnection.class).getCopyAPI().copyOut(
                     "COPY " + qualified + " (" + cols + ") TO STDOUT");
@@ -187,14 +198,14 @@ public final class Backfiller implements AutoCloseable {
                     int seq = (int) (opSeq++ & Integer.MAX_VALUE);
                     long cp = plan.consistentPoint();
                     if (log) {
-                        batch.add(SinkRecord.op(relid, 'R', null, values, cp, seq, 0L,
-                                                loadMicros, null).withCommitLsn(cp));
+                        batch.add(SinkRecord.op(relid, "R", values, cp, seq, 0L, loadMicros, null)
+                            .withCommitLsn(cp));
                     } else {
                         batch.add(new SinkRecord(relid, RowKind.INSERT, values, cp, seq, 0L));
                     }
                     if (hist) {
-                        batch.add(SinkRecord.op(hk, 'R', null, values, cp, seq, 0L, loadMicros,
-                                                null).withCommitLsn(cp));
+                        batch.add(SinkRecord.op(hk, "R", values, cp, seq, 0L, loadMicros, null)
+                            .withCommitLsn(cp));
                     }
                     loaded++;
                     if (++inChunk == chunk) {

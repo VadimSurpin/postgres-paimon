@@ -80,7 +80,18 @@ public final class OffsetStore {
      */
     public long highestCommitted(long relid) {
         Long ours = ourHighest(relid);
-        return ours == null ? 0 : ours;
+        long committed = ours == null ? 0 : ours;
+        if (HistoryKeys.isHist(relid) && !HistoryKeys.isArchive(relid)) {
+            // A history table made by a rotation starts at its baseline, the DDL's LSN: no
+            // transaction committed before the DDL belongs in it (they are in the archive), so for
+            // rule 4 it counts as having committed up to there. Not part of the resume position,
+            // which reads snapshots only (highestCommittedLsn).
+            long base = registry.historyBaseline(HistoryKeys.relidOf(relid));
+            if (Long.compareUnsigned(base, committed) > 0) {
+                committed = base;
+            }
+        }
+        return committed;
     }
 
     /** The highest identifier committed by our commitUser to one table, or null if there is none. */

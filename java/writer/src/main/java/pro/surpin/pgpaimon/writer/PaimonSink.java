@@ -119,7 +119,11 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         for (SinkRecord r : records) {
             byRelid.computeIfAbsent(r.relid(), k -> new java.util.ArrayList<>()).add(r);
         }
-        for (Map.Entry<Long, List<SinkRecord>> g : hook.order(byRelid).entrySet()) {
+        // Archived history tables first. They are the only tables whose identifier does not count
+        // towards the resume position (only current tables do), so a crash after any later commit
+        // of this flush must never find an archive behind: it would not be replayed. Committed
+        // first, an archive is either complete or the flush's other tables are behind it too.
+        for (Map.Entry<Long, List<SinkRecord>> g : hook.order(archivesFirst(byRelid)).entrySet()) {
             long relid = g.getKey();
             RelationMeta meta = relations.get(HistoryKeys.relidOf(relid));
             if (meta == null && !allTruncates(g.getValue())) {
@@ -226,9 +230,24 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         return table + " (" + r.kind() + " at _seq " + SlotConsumer.formatLsn(r.seq()) + ")";
     }
 
+    private static Map<Long, List<SinkRecord>> archivesFirst(Map<Long, List<SinkRecord>> byKey) {
+        Map<Long, List<SinkRecord>> out = new LinkedHashMap<>();
+        byKey.forEach((k, v) -> {
+            if (HistoryKeys.isArchive(k)) {
+                out.put(k, v);
+            }
+        });
+        byKey.forEach((k, v) -> {
+            if (!HistoryKeys.isArchive(k)) {
+                out.put(k, v);
+            }
+        });
+        return out;
+    }
+
     private static boolean allTruncates(List<SinkRecord> records) {
         for (SinkRecord r : records) {
-            if (r.op() == null || r.op().code() != 'T') {
+            if (r.op() == null || !"T".equals(r.op().code())) {
                 return false;
             }
         }
@@ -289,7 +308,12 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         // The cached writer holds pre-truncate LSM files the overwrite is about to delete; reusing
         // it makes the next compaction fail with "File deletion conflicts detected".
         dropEntry(relid);
-        FileStoreTable t = registry.table(relid);
+        // dynamic-partition-overwrite off: on a partitioned table (a history table) Paimon's
+        // default overwrites only the partitions the commit writes to, and an empty commit writes
+        // to none, so the "truncate" would remove nothing. Off, an empty overwrite of the whole
+        // table (no static partition) empties every partition.
+        FileStoreTable t = registry.table(relid)
+            .copy(Map.of("dynamic-partition-overwrite", "false"));
         try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
             applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of())) >= 1;
             if (!applied) {

@@ -81,7 +81,8 @@ public final class DdlMessageHandler {
         switch (op) {
             case "create" -> registry.createTable(d.relid(), d.schema(), d.table(),
                 need(d.pk(), "pk", op), need(d.cols(), "cols", op), d.changelogProducer(),
-                d.buckets(), m.lsn(), d.histTable(), d.registration());
+                d.buckets(), m.lsn(), new SchemaRegistry.HistSpec(d.histTable(),
+                    d.registration(), d.histBuckets(), d.histBucketsUser()));
             case "add_col", "drop_col", "rename_col", "alter_col", "drop_table" -> {
                 if (!registry.tracked(d.relid())) {
                     LOG.warning("ignoring " + op + " for unregistered relation " + d.relid());

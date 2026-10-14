@@ -32,16 +32,17 @@ import java.util.logging.Logger;
  * way to reload a table -- stopped replication for good. Measured on PostgreSQL 18.)
  *
  * <p><b>Operation records</b> (spec 2026-10-14). Besides the changelog records of a primary-key
- * table, every change of a tracked relation also yields ONE operation record for its history
- * table, and -- for a relation with no primary key -- one for its main table, which is an
- * operation log. An operation record is the change as it happened: {@code I}, {@code U},
- * {@code D} or {@code T}, with the old row and the new row, its own change LSN and {@code _op_seq}
- * (the ordinal of the change's first record in the transaction), the transaction's xid and
- * commit time, and, stamped at the Commit, the commit LSN. Nothing about it is ever merged: two
- * updates of one row in one transaction are two operation records. A TRUNCATE is one {@code T}
+ * table, every change of a tracked relation also yields operation records: for its history table
+ * one per row image -- {@code +I}; {@code -U} then {@code +U}; {@code -D} -- each with its own
+ * {@code _op_seq} and the change's LSN, the transaction's xid and commit time and, stamped at the
+ * Commit, the commit LSN; and, for a relation with no primary key, one row per change for its
+ * main table, which is an operation log ({@code I}, {@code U}, {@code D}). Nothing is ever merged:
+ * two updates of one row in one transaction are four history rows. A TRUNCATE is one {@code T}
  * record, and it removes nothing from the history or from a log: the records before it stay,
  * because they happened. (Only a primary-key table's changelog records before a truncate are
- * dropped, as described above, since the overwrite would delete them anyway.)
+ * dropped, as described above, since the overwrite would delete them anyway.) Each history record
+ * goes to the history table of the schema its change was decoded under (see
+ * {@link TableTracker#historyKey}), so a transaction that straddles a DDL writes to two.
  */
 public final class TxnBatcher {
 
@@ -148,6 +149,7 @@ public final class TxnBatcher {
             dropUntracked(batch);
             // Operation records learn their transaction's commit LSN only now.
             batch.replaceAll(r -> r.withCommitLsn(c.commitLsn()));
+            rerouteHistory(batch);
             if (audit.isEmpty()) {
                 flusher.flush(batch, c.commitLsn(), c.endLsn());   // always, even when empty
             } else {
@@ -191,7 +193,14 @@ public final class TxnBatcher {
                     }
                     // One T operation record: the history keeps the truncate as an event, and a
                     // key-less table's log is not erased by it (it is an audit log).
-                    if (addOps(relid, 'T', null, null, changeLsn, opSeq, null)) {
+                    boolean any = false;
+                    if (log) {
+                        addOp(SinkRecord.op(relid, "T", null, changeLsn, opSeq, xid,
+                                            commitMicros, null), null);
+                        any = true;
+                    }
+                    any |= addHistory(relid, "T", null, changeLsn, opSeq, null);
+                    if (any) {
                         opSeq++;
                     }
                 }
@@ -217,18 +226,27 @@ public final class TxnBatcher {
                     buffered.add(p.relid());
                 }
             } else {
-                opSeq++;            // an operation log has one record per change
+                // An operation log has one row per change, the history one per row image; the
+                // _op_seq numbers are the history's, the log row takes its change's first.
+                opSeq += parts.size();
+                String code = event instanceof PgEvent.Insert ? "I"
+                    : event instanceof PgEvent.Update ? "U" : "D";
+                List<String> image = event instanceof PgEvent.Update ? parts.get(1).values()
+                    : parts.get(0).values();
+                addOp(SinkRecord.op(relid, code, image, changeLsn, changeOpSeq, xid, commitMicros,
+                                    meta), meta);
             }
-            // The change itself, once, with both images. An UPDATE resolves to the old row and
-            // the new one (-U/+U, or -D/+I when a key moved): before is the first, after the
-            // second, so a key move is still one U here.
+            // The history: one row per row image, with the row kind of the change as it happened.
+            // An UPDATE resolves to the old row then the new one (-U/+U, or -D/+I when a key
+            // moved); the history records an UPDATE as -U then +U either way. Each image takes the
+            // _op_seq of the changelog record of the same image.
             if (event instanceof PgEvent.Insert) {
-                addOps(relid, 'I', null, parts.get(0).values(), changeLsn, changeOpSeq, meta);
+                addHistory(relid, "+I", parts.get(0).values(), changeLsn, changeOpSeq, meta);
             } else if (event instanceof PgEvent.Update) {
-                addOps(relid, 'U', parts.get(0).values(), parts.get(1).values(), changeLsn,
-                       changeOpSeq, meta);
+                addHistory(relid, "-U", parts.get(0).values(), changeLsn, changeOpSeq, meta);
+                addHistory(relid, "+U", parts.get(1).values(), changeLsn, changeOpSeq + 1, meta);
             } else if (event instanceof PgEvent.Delete) {
-                addOps(relid, 'D', parts.get(0).values(), null, changeLsn, changeOpSeq, meta);
+                addHistory(relid, "-D", parts.get(0).values(), changeLsn, changeOpSeq, meta);
             }
         } catch (Throwable t) {
             discardOpenTransaction();
@@ -241,27 +259,55 @@ public final class TxnBatcher {
      * main table when that is an operation log (no primary key). Each goes through the same
      * poison-record escape as a changelog record.
      */
-    private boolean addOps(long relid, char code, List<String> before, List<String> after,
-                           long changeLsn, int seq, RelationMeta meta) {
+    /**
+     * A DDL message inside this transaction rotated a history table after some of its rows were
+     * recorded: those rows were decoded under the old schema and belong to the archive now. Each
+     * history row is therefore routed again at the Commit, when every DDL of the transaction has
+     * been applied, by its change LSN.
+     */
+    private void rerouteHistory(List<SinkRecord> batch) {
+        if (registry == null) {
+            return;
+        }
+        List<SinkRecord> out = new ArrayList<>(batch.size());
+        for (SinkRecord r : batch) {
+            if (r.op() != null && HistoryKeys.isHist(r.relid())) {
+                long relid = HistoryKeys.relidOf(r.relid());
+                long key = registry.historyKey(relid, r.seq());
+                if (key == 0) {
+                    continue;
+                }
+                if (key != r.relid()) {
+                    r = new SinkRecord(key, r.kind(), r.values(), r.seq(), r.opSeq(), r.xid(),
+                                       r.meta(), r.op());
+                }
+            }
+            out.add(r);
+        }
+        batch.clear();
+        batch.addAll(out);
+    }
+
+    /**
+     * Adds one row image to the relation's history: to the history table of the schema the change
+     * was decoded under, which {@link TableTracker#historyKey} picks by the change's LSN. Returns
+     * whether there was a history table to write.
+     */
+    private boolean addHistory(long relid, String code, List<String> image, long changeLsn,
+                               int seq, RelationMeta meta) {
         if (registry == null) {
             return false;   // no registry, no history: the unit-test configuration
         }
-        boolean any = false;
-        if (registry.keyless(relid)) {
-            addOp(SinkRecord.op(relid, code, before, after, changeLsn, seq, xid, commitMicros,
-                                meta), meta);
-            any = true;
+        long key = registry.historyKey(relid, changeLsn);
+        if (key == 0) {
+            return false;
         }
-        if (registry.hasHistory(relid)) {
-            addOp(SinkRecord.op(HistoryKeys.histKey(relid), code, before, after, changeLsn, seq,
-                                xid, commitMicros, meta), meta);
-            any = true;
-        }
-        return any;
+        addOp(SinkRecord.op(key, code, image, changeLsn, seq, xid, commitMicros, meta), meta);
+        return true;
     }
 
     private void addOp(SinkRecord record, RelationMeta meta) {
-        if (skipLsn != 0 && record.seq() == skipLsn && record.op().code() != 'T'
+        if (skipLsn != 0 && record.seq() == skipLsn && !"T".equals(record.op().code())
             && skip(record.withCommitLsn(Long.MAX_VALUE), meta)) {
             return;
         }

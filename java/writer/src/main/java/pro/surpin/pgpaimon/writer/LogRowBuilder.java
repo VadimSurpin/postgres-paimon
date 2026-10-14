@@ -12,27 +12,24 @@ import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 
 /**
- * Builds the row of an append-only table from an operation record ({@link SinkRecord#op()}):
- * one row per row-level change, always {@code +I}, nothing merged or collapsed.
+ * Builds the row of an append-only table from an operation record ({@link SinkRecord#op()}): one
+ * row per row image, always stored as {@code +I}, nothing merged or collapsed.
  *
- * <p>Two layouts, both mapped by column name (as {@link RowBuilder} is, for the same reasons):
- * <ul>
- *   <li>{@link Layout#HISTORY}, the {@code <table>_hist} of every tracked table: the metadata
- *       columns, then {@code before_<col>} and {@code after_<col>} for every column;</li>
- *   <li>{@link Layout#LOG}, the main table of a table with no primary key: the user columns
- *       unprefixed, holding the new row (the deleted row for {@code D}, NULL for {@code T}),
- *       then the metadata columns.</li>
- * </ul>
- * The metadata columns are fixed by the design (spec 2026-10-14 section 2): {@code _op},
- * {@code _commit_lsn}, {@code _lsn}, {@code _op_seq}, {@code _xid}, {@code _ts}. They are not
- * configurable as the primary-key tables' {@code _seq}/{@code _op_seq} are: a history table is
- * read by people and tools that need one fixed shape.
+ * <p>Both append-only layouts are the user columns, unprefixed and mapped by name (as
+ * {@link RowBuilder} does, for the same reasons), then the metadata columns (spec 2026-10-14,
+ * section 2): a history table ({@code <table>_hist} and its archives) has
+ * {@code _op, _commit_lsn, _lsn, _op_seq, _xid, _ts, _dt}; a key-less table's operation log has
+ * the same without {@code _dt}. The names are fixed, not configurable as the primary-key tables'
+ * {@code _seq}/{@code _op_seq} are: a history table is read by people and tools that need one shape.
+ *
+ * <p>{@code _dt} is the UTC calendar date of {@code _ts}, the transaction's commit timestamp as
+ * pgoutput sent it. It is computed here from the epoch microseconds, never through a time zone,
+ * so neither the JVM's nor any session's zone can move a row to another partition, and a replay
+ * writes the same partition.
  */
 public final class LogRowBuilder implements RowMaker {
 
     private static final Logger LOG = Logger.getLogger(LogRowBuilder.class.getName());
-
-    public enum Layout { HISTORY, LOG }
 
     public static final String OP = "_op";
     public static final String COMMIT_LSN = "_commit_lsn";
@@ -40,47 +37,38 @@ public final class LogRowBuilder implements RowMaker {
     public static final String OP_SEQ = "_op_seq";
     public static final String XID = "_xid";
     public static final String TS = "_ts";
-    /** In this order, which is the order a history table declares them in. */
+    public static final String DT = "_dt";
+    /** The operation log's metadata, in order. */
     public static final List<String> META = List.of(OP, COMMIT_LSN, LSN, OP_SEQ, XID, TS);
-
-    public static final String BEFORE = "before_";
-    public static final String AFTER = "after_";
+    /** A history table's metadata, in order: the log's plus the partition column. */
+    public static final List<String> HIST_META = List.of(OP, COMMIT_LSN, LSN, OP_SEQ, XID, TS, DT);
 
     /** PostgreSQL's epoch, 2000-01-01, in microseconds after the Unix epoch. */
     public static final long PG_EPOCH_MICROS = 946_684_800_000_000L;
+    static final long MICROS_PER_DAY = 86_400_000_000L;
 
-    private final Layout layout;
     private final RowType rowType;
     private final List<String> pgColumnOrder;
-    private final int[] beforeIndex;   // HISTORY only
-    private final int[] valueIndex;    // HISTORY: after_<col>; LOG: <col>
+    private final int[] valueIndex;
     private final int op;
     private final int commitLsn;
     private final int lsn;
     private final int opSeq;
     private final int xid;
     private final int ts;
+    private final int dt;          // -1 for an operation log
 
-    public LogRowBuilder(String tableName, Layout layout, RowType rowType,
-                         List<String> pgColumnOrder) {
-        this.layout = layout;
+    public LogRowBuilder(String tableName, RowType rowType, List<String> pgColumnOrder) {
         this.rowType = rowType;
         this.pgColumnOrder = List.copyOf(pgColumnOrder);
         List<String> names = rowType.getFieldNames();
         int n = pgColumnOrder.size();
         this.valueIndex = new int[n];
-        this.beforeIndex = layout == Layout.HISTORY ? new int[n] : null;
         List<String> ignored = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            String c = pgColumnOrder.get(i);
-            if (layout == Layout.HISTORY) {
-                beforeIndex[i] = names.indexOf(BEFORE + c);
-                valueIndex[i] = names.indexOf(AFTER + c);
-            } else {
-                valueIndex[i] = names.indexOf(c);
-            }
+            valueIndex[i] = names.indexOf(pgColumnOrder.get(i));
             if (valueIndex[i] < 0) {
-                ignored.add(c);
+                ignored.add(pgColumnOrder.get(i));
             }
         }
         if (!ignored.isEmpty()) {
@@ -96,6 +84,7 @@ public final class LogRowBuilder implements RowMaker {
         this.opSeq = required(names, OP_SEQ);
         this.xid = required(names, XID);
         this.ts = required(names, TS);
+        this.dt = names.indexOf(DT);
     }
 
     /** A PostgreSQL commit timestamp (microseconds after 2000-01-01) as Unix-epoch micros. */
@@ -103,12 +92,17 @@ public final class LogRowBuilder implements RowMaker {
         return pgMicros + PG_EPOCH_MICROS;
     }
 
+    /** The UTC calendar date of an instant, as days since 1970-01-01 (Paimon's DATE). */
+    public static int utcDay(long unixMicros) {
+        return (int) Math.floorDiv(unixMicros, MICROS_PER_DAY);
+    }
+
     @Override
     public GenericRow build(SinkRecord r) {
         SinkRecord.Op o = r.op();
         if (o == null) {
-            throw new IllegalStateException("an append-only " + layout + " table takes operation"
-                + " records only, got a " + r.kind() + " changelog record");
+            throw new IllegalStateException("an append-only table takes operation records only,"
+                + " got a " + r.kind() + " changelog record");
         }
         if (o.commitLsn() == 0) {
             throw new IllegalStateException("operation record at _lsn "
@@ -116,45 +110,35 @@ public final class LogRowBuilder implements RowMaker {
         }
         GenericRow row = new GenericRow(rowType.getFieldCount());
         row.setRowKind(RowKind.INSERT);
-        List<DataField> fields = rowType.getFields();
-        switch (o.code()) {
-            case 'I', 'R' -> set(row, fields, valueIndex, o.after());
-            case 'U' -> {
-                if (layout == Layout.HISTORY) {
-                    set(row, fields, beforeIndex, o.before());
-                }
-                set(row, fields, valueIndex, o.after());
+        if (o.image() != null) {
+            List<String> values = o.image();
+            if (values.size() != valueIndex.length) {
+                throw new IllegalStateException("record has " + values.size()
+                    + " values but the relation has " + valueIndex.length + " columns "
+                    + pgColumnOrder);
             }
-            case 'D' -> set(row, fields, layout == Layout.HISTORY ? beforeIndex : valueIndex,
-                            o.before());
-            case 'T' -> { }   // no row: every user column NULL
-            default -> throw new IllegalStateException("unknown operation '" + o.code() + "'");
+            List<DataField> fields = rowType.getFields();
+            for (int i = 0; i < valueIndex.length; i++) {
+                int target = valueIndex[i];
+                if (target < 0) {
+                    continue;
+                }
+                DataField f = fields.get(target);
+                row.setField(target, TextDecoder.toPaimon(f.name(), f.type(), values.get(i)));
+            }
+        } else if (!"T".equals(o.code())) {
+            throw new IllegalStateException("operation " + o.code() + " lacks its row image");
         }
-        row.setField(op, BinaryString.fromString(String.valueOf(o.code())));
+        row.setField(op, BinaryString.fromString(o.code()));
         row.setField(commitLsn, o.commitLsn());
         row.setField(lsn, r.seq());
         row.setField(opSeq, r.opSeq());
         row.setField(xid, r.xid());
         row.setField(ts, Timestamp.fromMicros(o.commitMicros()));
+        if (dt >= 0) {
+            row.setField(dt, utcDay(o.commitMicros()));
+        }
         return row;
-    }
-
-    private void set(GenericRow row, List<DataField> fields, int[] index, List<String> values) {
-        if (values == null) {
-            throw new IllegalStateException("operation record lacks the image it needs");
-        }
-        if (values.size() != index.length) {
-            throw new IllegalStateException("record has " + values.size()
-                + " values but the relation has " + index.length + " columns " + pgColumnOrder);
-        }
-        for (int i = 0; i < index.length; i++) {
-            int target = index[i];
-            if (target < 0) {
-                continue;
-            }
-            DataField f = fields.get(target);
-            row.setField(target, TextDecoder.toPaimon(f.name(), f.type(), values.get(i)));
-        }
     }
 
     private static int required(List<String> names, String name) {

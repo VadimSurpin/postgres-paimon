@@ -34,12 +34,16 @@ public final class Main {
     record RegistryRow(long relid, String schema, String table, List<String> pk,
                        List<DdlMessage.Col> cols, boolean backfillDue,
                        String changelogProducer, int buckets, String histTable,
-                       String registration) {
+                       String registration, Integer histBuckets, boolean histBucketsUser) {
         RegistryRow(long relid, String schema, String table, List<String> pk,
                     List<DdlMessage.Col> cols, boolean backfillDue,
                     String changelogProducer, int buckets) {
             this(relid, schema, table, pk, cols, backfillDue, changelogProducer, buckets, null,
-                 null);
+                 null, null, false);
+        }
+        SchemaRegistry.HistSpec hist() {
+            return new SchemaRegistry.HistSpec(histTable, registration, histBuckets,
+                                               histBucketsUser);
         }
     }
 
@@ -98,7 +102,7 @@ public final class Main {
             // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
             registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
                                     r.changelogProducer(), r.buckets(), !slotExists,
-                                    r.histTable(), r.registration());
+                                    r.hist());
         }
         LOG.info("registry rebuilt: " + rows.size() + " table(s), slot "
                  + (slotExists ? "exists" : "absent"));
@@ -339,7 +343,7 @@ public final class Main {
             for (RegistryRow r : rows) {
                 registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
                                         r.changelogProducer(), r.buckets(), true,
-                                        r.histTable(), r.registration());
+                                        r.hist());
             }
         }
         try (Backfiller backfiller = new Backfiller(config, registry, sink)) {
@@ -398,7 +402,8 @@ public final class Main {
         List<RegistryRow> rows = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
                  "SELECT relid::bigint, schema_name, table_name, pk_cols, cols::text,"
-                 + " backfill_due, changelog_producer, buckets, hist_table, registration::text"
+                 + " backfill_due, changelog_producer, buckets, hist_table, registration::text,"
+                 + " hist_buckets, hist_buckets_user IS NOT NULL"
                  + " FROM paimon.table_registry ORDER BY relid");
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
@@ -406,7 +411,8 @@ public final class Main {
                 rows.add(new RegistryRow(rs.getLong(1), rs.getString(2), rs.getString(3),
                     Arrays.asList((String[]) pk.getArray()),
                     DdlMessage.parseCols(rs.getString(5)), rs.getBoolean(6), rs.getString(7),
-                    rs.getInt(8), rs.getString(9), rs.getString(10)));
+                    rs.getInt(8), rs.getString(9), rs.getString(10), rs.getInt(11),
+                    rs.getBoolean(12)));
             }
         }
         return rows;

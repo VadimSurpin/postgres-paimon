@@ -178,8 +178,8 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
         long dropped = 0;
         for (Txn t : txns) {
             for (SinkRecord r : t.records()) {
-                // Keyed by Paimon table: a relation's history table (a negative key, see
-                // HistoryKeys) has its own identifier stream and is filtered on its own.
+                // Keyed by Paimon table: a relation's history table and each of its archives (a
+                // negative key, see HistoryKeys) has its own identifier stream, filtered on its own.
                 if (t.commitLsn() <= committed(r.relid())) {
                     dropped++;          // this table already holds this transaction
                 } else {
@@ -272,9 +272,6 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
         for (SinkRecord r : records) {
             n += RECORD_OVERHEAD_BYTES;
             n += chars(r.values());
-            if (r.op() != null && r.op().before() != null && r.op().before() != r.values()) {
-                n += chars(r.op().before());     // an operation record holds both images
-            }
         }
         return n;
     }
