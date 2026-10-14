@@ -24,8 +24,9 @@
 -- DO NOT add a key to `history` to make it look like the others: the stock schema is the point,
 -- and the comparison (TpccCompare.compareLog) checks the log as a multiset.
 --
--- Every registered table T also gets a history table T_hist in Paimon (every row-level change,
--- before and after, never collapsed); the comparison checks each one against PostgreSQL.
+-- Every registered table T also gets a history table T_hist in Paimon, partitioned by day (one row
+-- per row image: +I, an update's -U and +U, -D; never collapsed); the comparison checks each one
+-- against PostgreSQL.
 
 CREATE EXTENSION IF NOT EXISTS paimon_slot;
 

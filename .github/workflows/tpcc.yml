@@ -10,7 +10,7 @@ name: TPC-C verification
 # it compares every column of every row of the eight primary-key TPC-C tables, asserts the
 # changelog carries a real -U before-image for every update, compares `history` -- which has no
 # primary key in TPC-C and is replicated as an operation log -- as a multiset, and checks every
-# history table <table>_hist: its I/U/D counts equal the changelog's, every U carries both images,
+# history table <table>_hist: its +I/-U/+U/-D counts equal the changelog's, every -U has its +U,
 # no change appears twice, and replaying it rebuilds PostgreSQL's table. A difference fails the job.
 #
 # BenchBase is built UNMODIFIED: the TPC-C schema is exactly as it ships.
@@ -196,7 +196,7 @@ jobs:
             echo
             echo "Columns: the merged table against PostgreSQL (pg rows, paimon, missing, extra,"
             echo "differ), the changelog's row kinds (+I -U +U -D), and the history table's"
-            echo "operations (hist I/U/D), which must equal the changelog's. \`history\` has no key"
+            echo "row kinds (hist +I/+U/-D), which must equal the changelog's. \`history\` has no key"
             echo "and is compared as a multiset; its paimon column counts log rows."
             echo '```'
             sed -n '/^Summary/,$p' "$TPCC_RUN_DIR/compare.out" 2>/dev/null \

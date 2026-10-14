@@ -67,11 +67,12 @@ import java.util.TreeMap;
  * rebuilds, and checks the log row for row against that history.
  *
  * <p><b>The history of every table.</b> Every replicated table {@code T} also has
- * {@code T_hist}, one row per row-level change with its before and after images.
- * {@link #checkHistory} asserts it holds exactly the changes PostgreSQL made: its I/U/D counts
- * equal the changelog's +I/+U/-D (TPC-C never moves a key, so each UPDATE is one -U/+U pair and
- * one U), every U carries both images and every I and D the one it should, no change is in it
- * twice, and -- the strongest form -- replaying it from empty, in commit order, rebuilds exactly
+ * {@code T_hist} (plus an archive {@code T_hist_<lsn>} per DDL, none in TPC-C), partitioned by
+ * the UTC date {@code _dt}, one row per row image: {@code +I}, {@code -U} then {@code +U},
+ * {@code -D}. {@link #checkHistory} asserts it holds exactly the changes PostgreSQL made: its
+ * +I/-U/+U/-D counts equal the changelog's (TPC-C never moves a key), every -U is followed by its
+ * +U, every image is complete, every row sits in its commit's UTC date, no change is in it twice,
+ * and -- the strongest form -- replaying it from empty, in commit order, rebuilds exactly
  * PostgreSQL's final table.
  *
  * <p><b>The changelog, not only the merged state.</b> A merged read reports {@code INSERT} for
@@ -135,6 +136,10 @@ public final class TpccCompare {
     /** The metadata columns of an operation log and of every history table, in their order. */
     static final List<String> LOG_META =
         List.of("_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts");
+
+    /** The metadata columns of every history table: the log's plus the partition date. */
+    static final List<String> HIST_META =
+        List.of("_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts", "_dt");
 
     /**
      * Tables TPC-C always updates, so a run with any Payment or NewOrder transaction must leave
@@ -466,11 +471,11 @@ public final class TpccCompare {
         long[] hist = checkHistory(pg, catalog, pgSchema, table, pgCols, types, pkPos,
                                    notNullColumns(pg, qualified), maxDiffs, failures);
         if (hist != null) {
-            // TPC-C never moves a key, so every UPDATE is one -U/+U pair and one U row.
-            if (hist[0] != ins || hist[1] != uaf || hist[1] != ubf || hist[2] != del) {
-                failures.add("history has I " + hist[0] + ", U " + hist[1] + ", D " + hist[2]
-                    + " but the changelog has +I " + ins + ", -U " + ubf + ", +U " + uaf
-                    + ", -D " + del);
+            // TPC-C never moves a key, so the history's row kinds are the changelog's, one for one.
+            if (hist[H_PI] != ins || hist[H_MU] != ubf || hist[H_PU] != uaf || hist[H_MD] != del) {
+                failures.add("history has +I " + hist[H_PI] + ", -U " + hist[H_MU] + ", +U "
+                    + hist[H_PU] + ", -D " + hist[H_MD] + " but the changelog has +I " + ins
+                    + ", -U " + ubf + ", +U " + uaf + ", -D " + del);
                 System.out.println("  FAIL: history counts do not match the changelog");
             }
         }
@@ -482,22 +487,29 @@ public final class TpccCompare {
 
     // ── history tables ──────────────────────────────────────────────────────
 
-    /** One history row: its order, its operation, and both images canonicalised (null: none). */
-    record HistRow(long commitLsn, int opSeq, char op, String[] before, String[] after) {}
+    /** One history row: its order, its operation, its row image canonicalised (null for T). */
+    record HistRow(long commitLsn, int opSeq, long lsn, long xid, String op, String[] image,
+                   long tsMicros, int dt) {}
+
+    /** Counts returned by {@link #checkHistory}, by index. */
+    static final int H_PI = 0, H_MU = 1, H_PU = 2, H_MD = 3, H_T = 4, H_R = 5, H_ROWS = 6,
+                     H_TABLES = 7;
 
     /**
-     * Reads {@code <table>_hist} and asserts it holds exactly the changes PostgreSQL made.
-     * Returns {I, U, D, T, R, rows}, or null when the table cannot be read at all.
+     * Reads {@code <table>_hist} and every archive {@code <table>_hist_<lsn>} a DDL left (in name
+     * order, which is chronological), and asserts they hold exactly the changes PostgreSQL made.
+     * Returns the counts {+I, -U, +U, -D, T, R, rows, tables}, or null when nothing can be read.
      *
      * <ul>
-     *   <li>its columns are the six metadata columns, then {@code before_<c>} and {@code after_<c>}
-     *       for every PostgreSQL column, and it has no key;</li>
+     *   <li>each table's columns are the table's columns, then the seven metadata columns, it has
+     *       no key and is partitioned by {@code _dt};</li>
      *   <li>no (commit LSN, op_seq) occurs twice: a change in it twice is a replay that leaked;</li>
-     *   <li>an I or R carries no before image and a full after image (every NOT NULL column set),
-     *       a D the reverse, a U BOTH -- the before image is the point of the history;</li>
-     *   <li>replayed from empty in commit order -- I and R add, U replaces before by after, D
-     *       removes, T empties -- it rebuilds exactly PostgreSQL's table: by key for a table with
-     *       one, as a multiset of whole rows for one without. Every PostgreSQL row is compared.</li>
+     *   <li>every row but a T carries its image (every NOT NULL column set), and every -U is
+     *       followed at once by its +U with the same commit LSN, change LSN and xid;</li>
+     *   <li>{@code _dt} is the UTC date of {@code _ts} on every row;</li>
+     *   <li>replayed from empty in commit order -- +I and R add, -U removes, +U adds, -D removes,
+     *       T empties -- it rebuilds exactly PostgreSQL's table: by key for a table with one, as a
+     *       multiset of whole rows for one without. Every PostgreSQL row is compared.</li>
      * </ul>
      */
     static long[] checkHistory(Connection pg, Catalog catalog, String pgSchema, String table,
@@ -505,55 +517,87 @@ public final class TpccCompare {
                                Set<String> notNull, int maxDiffs, List<String> failures)
             throws Exception {
         String histName = table + "_hist";
-        List<HistRow> rows;
+        List<String> generations = new ArrayList<>();
+        for (String n : catalog.listTables(pgSchema)) {
+            if (n.matches(java.util.regex.Pattern.quote(histName + "_") + "[0-9A-F]{16}")) {
+                generations.add(n);
+            }
+        }
+        java.util.Collections.sort(generations);
+        generations.add(histName);
+        List<HistRow> rows = new ArrayList<>();
         try {
-            rows = readHistory(catalog, pgSchema, histName, pgCols, types, failures);
+            for (String g : generations) {
+                if (!readHistory(catalog, pgSchema, g, pgCols, types, failures, rows)) {
+                    return null;
+                }
+            }
         } catch (Catalog.TableNotExistException e) {
             failures.add("has no history table " + histName);
             System.out.println("  FAIL: no history table " + histName);
             return null;
         }
-        if (rows == null) {
-            return null;
-        }
-        long[] counts = new long[6];
+        rows.sort((x, y) -> x.commitLsn() != y.commitLsn()
+            ? Long.compare(x.commitLsn(), y.commitLsn()) : Integer.compare(x.opSeq(), y.opSeq()));
+        long[] counts = new long[8];
         Set<String> seen = new java.util.HashSet<>();
-        long dupes = 0, badImages = 0;
-        for (HistRow r : rows) {
+        long dupes = 0, badImages = 0, unpaired = 0, badDates = 0;
+        for (int i = 0; i < rows.size(); i++) {
+            HistRow r = rows.get(i);
             switch (r.op()) {
-                case 'I' -> counts[0]++;
-                case 'U' -> counts[1]++;
-                case 'D' -> counts[2]++;
-                case 'T' -> counts[3]++;
-                case 'R' -> counts[4]++;
+                case "+I" -> counts[H_PI]++;
+                case "-U" -> counts[H_MU]++;
+                case "+U" -> counts[H_PU]++;
+                case "-D" -> counts[H_MD]++;
+                case "T" -> counts[H_T]++;
+                case "R" -> counts[H_R]++;
                 default -> badImages++;
             }
             if (!seen.add(r.commitLsn() + "/" + r.opSeq())) {
                 dupes++;
             }
-            boolean needBefore = r.op() == 'U' || r.op() == 'D';
-            boolean needAfter = r.op() == 'U' || r.op() == 'I' || r.op() == 'R';
-            if (!image(r.before(), needBefore, pgCols, notNull)
-                || !image(r.after(), needAfter, pgCols, notNull)) {
-                if (badImages++ < maxDiffs) {
-                    System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn() + "/"
-                        + r.opSeq() + " has the wrong images: before "
-                        + (r.before() == null ? "none" : render(pgCols, r.before())) + "; after "
-                        + (r.after() == null ? "none" : render(pgCols, r.after())));
+            boolean ok = "T".equals(r.op()) ? r.image() == null : image(r.image(), pgCols, notNull);
+            if (!ok && badImages++ < maxDiffs) {
+                System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn() + "/"
+                    + r.opSeq() + " has the wrong image: "
+                    + (r.image() == null ? "none" : render(pgCols, r.image())));
+            }
+            if ("-U".equals(r.op())) {
+                HistRow next = i + 1 < rows.size() ? rows.get(i + 1) : null;
+                if (next == null || !"+U".equals(next.op()) || next.commitLsn() != r.commitLsn()
+                    || next.lsn() != r.lsn() || next.xid() != r.xid()) {
+                    unpaired++;
+                }
+            } else if ("+U".equals(r.op())) {
+                HistRow prev = i > 0 ? rows.get(i - 1) : null;
+                if (prev == null || !"-U".equals(prev.op()) || prev.lsn() != r.lsn()) {
+                    unpaired++;
                 }
             }
+            if (r.dt() != Math.floorDiv(r.tsMicros(), 86_400_000_000L)) {
+                badDates++;
+            }
         }
-        counts[5] = rows.size();
-        System.out.printf("  history     : I %d, U %d, D %d, T %d, R %d  (%d rows)%n",
-                          counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]);
+        counts[H_ROWS] = rows.size();
+        counts[H_TABLES] = generations.size();
+        System.out.printf("  history     : +I %d, -U %d, +U %d, -D %d, T %d, R %d  (%d rows in %d table(s))%n",
+                          counts[H_PI], counts[H_MU], counts[H_PU], counts[H_MD], counts[H_T],
+                          counts[H_R], counts[H_ROWS], counts[H_TABLES]);
         if (dupes > 0) {
-            failures.add("history holds " + dupes + " change(s) twice (same commit LSN and op_seq)");
+            failures.add("history holds " + dupes + " row(s) twice (same commit LSN and op_seq)");
             System.out.println("  FAIL: " + dupes + " duplicated history rows");
         }
         if (badImages > 0) {
-            failures.add(badImages + " history row(s) lack an image they must carry, or carry one"
-                + " they must not");
+            failures.add(badImages + " history row(s) lack the image they must carry");
             System.out.println("  FAIL: " + badImages + " history rows with wrong images");
+        }
+        if (unpaired > 0) {
+            failures.add(unpaired + " -U/+U row(s) not paired with their other half");
+            System.out.println("  FAIL: " + unpaired + " unpaired -U/+U rows");
+        }
+        if (badDates > 0) {
+            failures.add(badDates + " history row(s) whose _dt is not the UTC date of _ts");
+            System.out.println("  FAIL: " + badDates + " rows in the wrong _dt partition");
         }
 
         // Replay from empty, in commit order, and compare with PostgreSQL row for row.
@@ -561,27 +605,26 @@ public final class TpccCompare {
         Map<String, String> byKey = new HashMap<>();
         long replayErrors = 0;
         for (HistRow r : rows) {
-            if (r.op() == 'T') {
+            if ("T".equals(r.op())) {
                 multiset.clear();
                 byKey.clear();
                 continue;
             }
-            String b = r.before() == null ? null : String.join(String.valueOf(SEP), r.before());
-            String a = r.after() == null ? null : String.join(String.valueOf(SEP), r.after());
+            String img = String.join(String.valueOf(SEP), r.image());
+            boolean adds = "+I".equals(r.op()) || "+U".equals(r.op()) || "R".equals(r.op());
             if (pkPos != null) {
-                if (b != null && byKey.remove(key(r.before(), pkPos)) == null) {
-                    replayErrors++;    // an update or delete of a key the history never had
+                String k = key(r.image(), pkPos);
+                if (adds) {
+                    if (byKey.put(k, img) != null) {
+                        replayErrors++;    // an insert of a key the history already had
+                    }
+                } else if (byKey.remove(k) == null) {
+                    replayErrors++;        // an update or delete of a key the history never had
                 }
-                if (a != null && byKey.put(key(r.after(), pkPos), a) != null) {
-                    replayErrors++;    // an insert of a key the history already had
-                }
-            } else {
-                if (b != null && multiset.merge(b, -1L, Long::sum) < 0) {
-                    replayErrors++;    // a change to a row the history did not hold
-                }
-                if (a != null) {
-                    multiset.merge(a, 1L, Long::sum);
-                }
+            } else if (adds) {
+                multiset.merge(img, 1L, Long::sum);
+            } else if (multiset.merge(img, -1L, Long::sum) < 0) {
+                replayErrors++;            // a change to a row the history did not hold
             }
         }
         if (replayErrors > 0) {
@@ -644,11 +687,8 @@ public final class TpccCompare {
         return counts;
     }
 
-    /** An image is absent when it must be, and present (every NOT NULL column set) when it must be. */
-    static boolean image(String[] img, boolean required, List<String> cols, Set<String> notNull) {
-        if (!required) {
-            return img == null;
-        }
+    /** An image is present and has every NOT NULL column set. */
+    static boolean image(String[] img, List<String> cols, Set<String> notNull) {
         if (img == null) {
             return false;
         }
@@ -661,48 +701,50 @@ public final class TpccCompare {
     }
 
     /**
-     * Every row of a history table, sorted into commit order. An image whose every column is NULL
-     * is reported as absent: every TPC-C table has a NOT NULL column, so no real image is all
-     * NULL and this is exact here.
+     * Appends every row of one history table (current or archived) to {@code out}, its image
+     * mapped by column name onto PostgreSQL's columns. A T row's image is null. Returns false (and
+     * records the failure) when the table's shape is wrong.
      */
-    static List<HistRow> readHistory(Catalog catalog, String pgSchema, String histName,
-                                     List<String> pgCols, DataType[] types, List<String> failures)
+    static boolean readHistory(Catalog catalog, String pgSchema, String name, List<String> pgCols,
+                               DataType[] types, List<String> failures, List<HistRow> out)
             throws Exception {
-        Table h = catalog.getTable(Identifier.create(pgSchema, histName));
+        Table h = catalog.getTable(Identifier.create(pgSchema, name));
         List<String> names = h.rowType().getFieldNames();
-        List<String> want = new ArrayList<>(LOG_META);
-        for (String c : pgCols) want.add("before_" + c);
-        for (String c : pgCols) want.add("after_" + c);
-        if (!names.equals(want)) {
-            failures.add("history table columns " + names + " != " + want);
+        List<String> meta = names.subList(Math.max(0, names.size() - HIST_META.size()), names.size());
+        if (!meta.equals(HIST_META)) {
+            failures.add(name + " columns " + names + " do not end with " + HIST_META);
             System.out.println("  FAIL: history table schema " + names);
-            return null;
+            return false;
         }
         if (!h.primaryKeys().isEmpty()) {
-            failures.add("history table has a primary key " + h.primaryKeys());
+            failures.add(name + " has a primary key " + h.primaryKeys());
         }
-        int n = pgCols.size();
-        int base = LOG_META.size();
-        List<HistRow> out = new ArrayList<>();
+        if (!h.partitionKeys().equals(List.of("_dt"))) {
+            failures.add(name + " is not partitioned by _dt: " + h.partitionKeys());
+        }
+        int[] pos = new int[pgCols.size()];
+        for (int i = 0; i < pos.length; i++) {
+            pos[i] = names.indexOf(pgCols.get(i));
+        }
+        int op = names.indexOf("_op"), cl = names.indexOf("_commit_lsn"), l = names.indexOf("_lsn"),
+            os = names.indexOf("_op_seq"), x = names.indexOf("_xid"), ts = names.indexOf("_ts"),
+            dt = names.indexOf("_dt");
         ReadBuilder rb = h.newReadBuilder();
         try (RecordReader<InternalRow> reader = rb.newRead().createReader(rb.newScan().plan())) {
             reader.forEachRemaining(r -> {
-                String[] before = new String[n];
-                String[] after = new String[n];
-                boolean anyB = false, anyA = false;
-                for (int i = 0; i < n; i++) {
-                    before[i] = paimonValue(r, base + i, types[i]);
-                    after[i] = paimonValue(r, base + n + i, types[i]);
-                    anyB |= !NULL.equals(before[i]);
-                    anyA |= !NULL.equals(after[i]);
+                String code = r.getString(op).toString();
+                String[] img = null;
+                if (!"T".equals(code)) {
+                    img = new String[pos.length];
+                    for (int i = 0; i < pos.length; i++) {
+                        img[i] = pos[i] < 0 ? NULL : paimonValue(r, pos[i], types[i]);
+                    }
                 }
-                out.add(new HistRow(r.getLong(1), r.getInt(3), r.getString(0).toString().charAt(0),
-                                    anyB ? before : null, anyA ? after : null));
+                out.add(new HistRow(r.getLong(cl), r.getInt(os), r.getLong(l), r.getLong(x), code,
+                                    img, r.getTimestamp(ts, 6).toMicros(), r.getInt(dt)));
             });
         }
-        out.sort((x, y) -> x.commitLsn() != y.commitLsn()
-            ? Long.compare(x.commitLsn(), y.commitLsn()) : Integer.compare(x.opSeq(), y.opSeq()));
-        return out;
+        return true;
     }
 
     static Set<String> notNullColumns(Connection pg, String qualified) throws Exception {
@@ -791,16 +833,34 @@ public final class TpccCompare {
         long[] hist = checkHistory(pg, catalog, pgSchema, table, pgCols, types, null,
                                    notNullColumns(pg, qualified), maxDiffs, failures);
         if (hist != null) {
+            // The log, row for row against the history: a log row takes its change's first
+            // (commit LSN, op_seq); I matches a +I, U a -U followed by the +U whose values the log
+            // row carries, D a -D, T a T, R an R.
+            List<HistRow> hrows = new ArrayList<>();
+            readHistory(catalog, pgSchema, table + "_hist", pgCols, types, new ArrayList<>(), hrows);
+            hrows.sort((x, y) -> x.commitLsn() != y.commitLsn()
+                ? Long.compare(x.commitLsn(), y.commitLsn()) : Integer.compare(x.opSeq(), y.opSeq()));
             long logMismatch = 0;
-            for (HistRow h : readHistory(catalog, pgSchema, table + "_hist", pgCols, types,
-                                         new ArrayList<>())) {
-                String[] vals = h.op() == 'D' ? h.before() : h.op() == 'T' ? null : h.after();
+            for (int i = 0; i < hrows.size(); i++) {
+                HistRow h = hrows.get(i);
+                String logOp;
+                String[] vals;
+                switch (h.op()) {
+                    case "+I" -> { logOp = "I"; vals = h.image(); }
+                    case "-U" -> {
+                        logOp = "U";
+                        vals = i + 1 < hrows.size() ? hrows.get(i + 1).image() : null;
+                        i++;                 // its +U is part of the same log row
+                    }
+                    case "-D" -> { logOp = "D"; vals = h.image(); }
+                    case "T" -> { logOp = "T"; vals = null; }
+                    default -> { logOp = h.op(); vals = h.image(); }
+                }
                 if (vals == null) {
                     vals = new String[pgCols.size()];
                     Arrays.fill(vals, NULL);
                 }
-                String expect = h.op() + String.valueOf(SEP)
-                    + String.join(String.valueOf(SEP), vals);
+                String expect = logOp + SEP + String.join(String.valueOf(SEP), vals);
                 String got = logRows.remove(h.commitLsn() + "/" + h.opSeq());
                 if (!expect.equals(got) && logMismatch++ < maxDiffs) {
                     System.out.println("  DIFF log row " + h.commitLsn() + "/" + h.opSeq()
@@ -814,13 +874,13 @@ public final class TpccCompare {
                 failures.add(logMismatch + " log row(s) disagree with the history, or have no"
                     + " history row");
             }
-            if (hist[0] + hist[4] == 0) {
+            if (hist[H_PI] + hist[H_R] == 0) {
                 failures.add("the history of " + table + " holds no insert");
             }
         }
         System.out.println(failures.isEmpty() ? "  OK" : "  FAILED: " + failures.size() + " check(s)");
         return new TableResult(table, pgCount, logCount, 0, 0, 0,
-                               hist == null ? 0 : hist[0], 0, 0, 0, failures, hist);
+                               hist == null ? 0 : hist[H_PI], 0, 0, 0, failures, hist);
     }
 
 
@@ -1093,13 +1153,13 @@ public final class TpccCompare {
         System.out.println("Summary");
         System.out.printf("%-12s %10s %10s %8s %8s %8s %9s %8s %8s %8s %9s %8s %8s  %s%n",
             "table", "pg rows", "paimon", "missing", "extra", "differ",
-            "+I", "-U", "+U", "-D", "hist I", "hist U", "hist D", "verdict");
+            "+I", "-U", "+U", "-D", "hist +I", "hist +U", "hist -D", "verdict");
         System.out.println("-".repeat(146));
         for (TableResult r : results) {
-            long[] h = r.hist() == null ? new long[6] : r.hist();
+            long[] h = r.hist() == null ? new long[8] : r.hist();
             System.out.printf("%-12s %10d %10d %8d %8d %8d %9d %8d %8d %8d %9d %8d %8d  %s%n",
                 r.table(), r.pgRows(), r.paimonRows(), r.missing(), r.extra(), r.mismatched(),
-                r.insert(), r.updBefore(), r.updAfter(), r.delete(), h[0], h[1], h[2],
+                r.insert(), r.updBefore(), r.updAfter(), r.delete(), h[H_PI], h[H_PU], h[H_MD],
                 r.ok() ? "ok" : "FAIL");
         }
         System.out.println("-".repeat(146));
