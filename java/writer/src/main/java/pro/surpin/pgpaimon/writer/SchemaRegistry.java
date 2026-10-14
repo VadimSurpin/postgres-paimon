@@ -264,7 +264,36 @@ public final class SchemaRegistry implements TableTracker {
      */
     private static Schema histSchema(List<DataField> userColumns, int buckets, long ddlLsn,
                                      long baseline, String historyOf, String registration) {
+        return histSchema(userColumns, buckets, ddlLsn, baseline, historyOf, registration, Map.of());
+    }
+
+    /**
+     * The options an operator set on a history table that its successor at a rotation keeps:
+     * every one except the writer's own ({@code pgpaimon.*}), the layout it decides
+     * ({@code bucket}, which a rotation re-measures, {@code bucket-key},
+     * {@code partition.legacy-name}) and {@code path}. Retention above all: the guide tells
+     * operators to set {@code partition.expiration-time} on {@code T_hist}, and a rotation built
+     * the new table's options from scratch, so after the next DDL the history grew without bound
+     * again, without a word (review of the history tables, I5).
+     */
+    static Map<String, String> carriedOptions(Map<String, String> archived) {
+        Map<String, String> out = new java.util.TreeMap<>();
+        for (Map.Entry<String, String> e : archived.entrySet()) {
+            String k = e.getKey();
+            if (k.startsWith("pgpaimon.") || k.equals("bucket") || k.equals("bucket-key")
+                || k.equals("partition.legacy-name") || k.equals("path")) {
+                continue;
+            }
+            out.put(k, e.getValue());
+        }
+        return out;
+    }
+
+    private static Schema histSchema(List<DataField> userColumns, int buckets, long ddlLsn,
+                                     long baseline, String historyOf, String registration,
+                                     Map<String, String> carried) {
         Schema.Builder b = Schema.newBuilder();
+        carried.forEach(b::option);       // first: the writer's own options below win
         for (DataField f : userColumns) {
             b.column(f.name(), f.type().copy(true));
         }
@@ -342,15 +371,28 @@ public final class SchemaRegistry implements TableTracker {
         }
 
         Identifier id = identifierOf(schema, table);
-        Table existing = null;
+        Table existing = lookup(id);
+        if (existing != null && !existing.primaryKeys().equals(pk)) {
+            // remove_table() keeps the main Paimon table, and a table re-registered after its key
+            // was added, dropped or changed in between cannot continue it: a primary-key table
+            // and an operation log are different layouts (measured: "Paimon schema has no
+            // metadata column '_seq'" on every restart, replication down for every table), and a
+            // table merged on another key would merge the wrong rows. add_table() refuses this
+            // when it can see it (paimon.kept_tables); this is the backstop.
+            throw new IllegalStateException("Paimon table " + id + " exists as "
+                + (existing.primaryKeys().isEmpty() ? "an operation log (no primary key)"
+                   : "a primary-key table (key " + existing.primaryKeys() + ")")
+                + " but " + schema + "." + table + " is now registered "
+                + (isLog ? "without a primary key (an operation log)"
+                         : "with primary key " + pk)
+                + ": the two cannot continue one another. It is the main table kept by an"
+                + " earlier paimon.remove_table(). Rename or drop " + id + " from a compute engine"
+                + " (or move its directory out of the warehouse), then restart the writer: it"
+                + " creates the table afresh. Nothing has been written.");
+        }
         try {
             // One Paimon database per PostgreSQL schema, created on demand. Idempotent.
             catalog.createDatabase(schema, true);
-            try {
-                existing = catalog.getTable(id);
-            } catch (Catalog.TableNotExistException e) {
-                // normal first-time case
-            }
             catalog.createTable(id, wanted, true);
         } catch (Exception e) {
             throw new IllegalStateException("cannot create Paimon table " + id, e);
@@ -393,6 +435,7 @@ public final class SchemaRegistry implements TableTracker {
                                long ddlLsn, String registration, boolean reconcileLostDdl) {
         long hk = HistoryKeys.histKey(relid);
         Identifier hid = identifierOf(schema, histTable);
+        requireOwnArchives(hid, registration, schema + "." + table);
         Table existing = null;
         try {
             // Paimon's catalog caches tables (cache-enabled is its default). The remedy for a
@@ -451,6 +494,57 @@ public final class SchemaRegistry implements TableTracker {
             : st.archives.isEmpty() ? 0 : st.archives.lastKey();
         if (existing != null) {
             reconcileHistory(hk, hid, existing, cols, reconcileLostDdl);
+        }
+    }
+
+    /**
+     * Refuses archives {@code <hist>_<lsn>} that belong to another registration (or to none).
+     *
+     * <p>An archive is recognised by its name, and a name says nothing about whose it is. The
+     * archives of a table dropped earlier stay (they are its audit trail), and an operator who
+     * moved aside only {@code <hist>} -- the archives have distinct names and look harmless --
+     * then ran forget_history() and add_table() for a new table of the same name, made this
+     * writer take them for the new table's: measured, it read the absent {@code <hist>} as an
+     * interrupted rotation ("the replayed DDL message completes it"), never created it, and
+     * stopped on every restart with "cannot load Paimon table", replication down for every table.
+     * And a reader who unions {@code <hist>} with its archives, as the guide says to, would get the
+     * earlier table's rows as this one's history. Archives carry the registration of the history
+     * they were rotated out of ({@code pgpaimon.registration}), so ownership is checked, and a
+     * foreign one is refused by name, with the remedy, before anything is written.
+     */
+    private void requireOwnArchives(Identifier hid, String registration, String table) {
+        if (registration == null) {
+            return;     // a create without a registration (older messages): nothing to compare
+        }
+        Table current = lookup(hid);
+        if (current != null && !registration.equals(current.options().get(REGISTRATION_OPTION))) {
+            return;     // <hist> itself is foreign: createHistory refuses that, more specifically
+        }
+        List<String> foreign = new ArrayList<>();
+        try {
+            for (String n : catalog.listTables(hid.getDatabaseName())) {
+                if (HistoryKeys.archiveLsn(n, hid.getObjectName()) < 0) {
+                    continue;
+                }
+                Identifier aid = Identifier.create(hid.getDatabaseName(), n);
+                catalog.invalidateTable(aid);
+                String owner = catalog.getTable(aid).options().get(REGISTRATION_OPTION);
+                if (!registration.equals(owner)) {
+                    foreign.add(n + (owner == null ? " (no registration)" : " (registration " + owner + ")"));
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot list the history archives of " + hid, e);
+        }
+        if (!foreign.isEmpty()) {
+            throw new IllegalStateException("Paimon table(s) " + foreign + " in database "
+                + hid.getDatabaseName() + " are named like archives of " + hid.getObjectName()
+                + " but belong to another registration than this one of " + table + " ("
+                + registration + "): they are the retained history of an earlier table of the same"
+                + " name. A history and its archives are an audit trail and are never continued by a"
+                + " different table. Rename or drop them (and " + hid.getObjectName() + ", if it"
+                + " is also an earlier table's) from a compute engine, or move their directories out"
+                + " of the warehouse, then restart the writer. Nothing has been written.");
         }
     }
 
@@ -520,7 +614,7 @@ public final class SchemaRegistry implements TableTracker {
             DataType got = have.get(c.name());
             if (got == null) {
                 if (reconcileLostDdl) {
-                    add.add(SchemaChange.addColumn(c.name(), t));
+                    add.add(addUserColumn(true, c.name(), t));
                 } else {
                     diffs.add("column '" + c.name() + "' is missing; its DDL message should still"
                         + " be in the slot and rotates the table when applied");
@@ -631,7 +725,7 @@ public final class SchemaRegistry implements TableTracker {
             }
             DataType t = mainType(relid, c.type());
             try {
-                catalog.alterTable(id, List.of(SchemaChange.addColumn(c.name(), t)), false);
+                catalog.alterTable(id, List.of(addUserColumn(keyless(relid), c.name(), t)), false);
                 forget0(relid);
                 LOG.warning("create for existing table " + id + ": column '" + c.name() + "' "
                     + t.asSQLString() + " was missing from its Paimon schema and has been added"
@@ -745,7 +839,7 @@ public final class SchemaRegistry implements TableTracker {
                 + " cannot be ruled out: leaving the stored type alone");
             return;
         }
-        alter(relid, List.of(SchemaChange.addColumn(col.name(), wanted)), ddlLsn);
+        alter(relid, List.of(addUserColumn(keyless(relid), col.name(), wanted)), ddlLsn);
     }
 
     public void dropColumn(long relid, String name, long ddlLsn) {
@@ -873,6 +967,18 @@ public final class SchemaRegistry implements TableTracker {
         return new RelationMeta(meta.relid(), meta.namespace(), meta.relName(), names, meta.isKey());
     }
 
+    /**
+     * Adds a user column. In an operation log or a history table it goes before the metadata
+     * ({@code _op} onwards), where the layout puts the user's columns: appended at the end it
+     * landed after them (review of the history tables, m2), contradicting the documented layout
+     * and the TPC-C comparator's schema check.
+     */
+    static SchemaChange addUserColumn(boolean logLayout, String name, DataType type) {
+        return logLayout
+            ? SchemaChange.addColumn(name, type, null, SchemaChange.Move.before(name, LogRowBuilder.OP))
+            : SchemaChange.addColumn(name, type);
+    }
+
     /** One field of the table's Paimon schema by name, or null if there is none. */
     private DataField field(long key, String name) {
         for (DataField f : table(key).schema().fields()) {
@@ -978,9 +1084,14 @@ public final class SchemaRegistry implements TableTracker {
             change.accept(user);
             registerArchive(relid, st, ddlLsn, arch);
             int buckets = bucketsAfterRotation(st);
+            Map<String, String> carried = carriedOptions(archived.options());
+            if (!carried.isEmpty()) {
+                LOG.info(what + ": the new " + cur + " keeps the options set on the archived one: "
+                    + carried);
+            }
             catalog.createTable(cur, histSchema(user, buckets, ddlLsn, ddlLsn,
                 archived.options().getOrDefault(HISTORY_OF_OPTION, ""),
-                archived.options().get(REGISTRATION_OPTION)), false);
+                archived.options().get(REGISTRATION_OPTION), carried), false);
             hook.step("rotate-created");
         } catch (RuntimeException e) {
             throw e;

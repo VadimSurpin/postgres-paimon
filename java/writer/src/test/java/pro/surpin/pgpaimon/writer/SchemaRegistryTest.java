@@ -375,12 +375,13 @@ class SchemaRegistryTest {
         assertTrue(a.get(0).getMessage().contains("'price'"), a.get(0).getMessage());
         assertTrue(a.get(0).getMessage().contains("DECIMAL(10, 2)"));
 
-        List<LogRecord> b = captureWarnings(SchemaRegistry.class, () ->
+        // A different KEY is no drift to warn about: merged on another key, the table would
+        // collapse rows PostgreSQL keeps apart. Refused, and nothing is altered (review of the
+        // history tables, I4: a table re-registered after its key changed).
+        IllegalStateException b = assertThrows(IllegalStateException.class, () ->
             handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t")
                 .replace("\"pk\":[\"id\"]", "\"pk\":[\"id\",\"qty\"]"))));
-        assertEquals(1, b.size());
-        assertTrue(b.get(0).getMessage().contains("primary key"), b.get(0).getMessage());
-        assertTrue(b.get(0).getMessage().contains("qty"));
+        assertTrue(b.getMessage().contains("primary key [id, qty]"), b.getMessage());
 
         assertEquals(ver, reg.table(40002L).schema().id(), "drift must not alter the table");
 

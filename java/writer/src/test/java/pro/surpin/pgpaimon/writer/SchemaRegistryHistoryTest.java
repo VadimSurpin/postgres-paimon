@@ -302,6 +302,103 @@ class SchemaRegistryHistoryTest {
                            "the same registration (a restart) adopts it");
     }
 
+    /**
+     * Review of the history tables, I3: a table dropped after a DDL leaves T_hist and an archive.
+     * The operator moves only T_hist aside and registers a new table of the same name. The
+     * archive used to be taken for an interrupted rotation of the NEW table (T_hist never made,
+     * the writer stopped on every restart with a misleading message); it is refused by name.
+     */
+    @Test
+    void anArchiveOfAnEarlierRegistrationIsRefusedByName() throws Exception {
+        long rel = 50020;
+        send(create(rel, "q_arc", "[\"id\"]", "r20"));
+        long at = send("{\"v\":1,\"op\":\"add_col\",\"relid\":%d,\"col\":{\"id\":3,\"name\":\"x\",\"type\":\"INT\"}}"
+            .formatted(rel));
+        send("{\"v\":1,\"op\":\"drop_table\",\"relid\":%d,\"schema\":\"public\",\"table\":\"q_arc\"}"
+            .formatted(rel));
+        catalog.renameTable(Identifier.create("public", "q_arc_hist"),
+                            Identifier.create("public", "q_arc_hist_moved_aside"), false);
+        assertEquals(List.of(archive("q_arc", at)), archives("q_arc"));
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> send(create(50021, "q_arc", "[\"id\"]", "r21")));
+        assertTrue(e.getMessage().contains(archive("q_arc", at) + " (registration r20)"), e.getMessage());
+        assertTrue(e.getMessage().contains("Rename or drop them"), e.getMessage());
+        assertFalse(e.getMessage().contains("interrupted"), e.getMessage());
+        assertThrows(Catalog.TableNotExistException.class,
+            () -> catalog.getTable(Identifier.create("public", "q_arc_hist")), "nothing created");
+        // moved aside too: the new registration starts clean
+        catalog.renameTable(Identifier.create("public", archive("q_arc", at)),
+                            Identifier.create("public", "q_arc_old_archive"), false);
+        assertDoesNotThrow(() -> send(create(50021, "q_arc", "[\"id\"]", "r21")));
+        assertEquals("r21", get("q_arc_hist").options().get(SchemaRegistry.REGISTRATION_OPTION));
+    }
+
+    /**
+     * Review of the history tables, I4: remove_table() keeps the main table; the table gets a key
+     * (or loses it) and is registered again. The writer used to warn and then stop on every
+     * restart ("no metadata column '_seq'"); it refuses with the remedy, before writing anything,
+     * in both directions.
+     */
+    @Test
+    void aKeptMainTableOfTheOtherLayoutIsRefusedWithTheRemedy() throws Exception {
+        send(create(50030, "lay_a", "[]", "r30"));
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> send(create(50031, "lay_a", "[\"id\"]", "r31")));
+        assertTrue(e.getMessage().contains("exists as an operation log"), e.getMessage());
+        assertTrue(e.getMessage().contains("Rename or drop"), e.getMessage());
+        assertEquals(List.of(), get("lay_a").primaryKeys(), "untouched");
+        assertFalse(reg.tracked(50031));
+
+        send(create(50032, "lay_b", "[\"id\"]", "r32"));
+        e = assertThrows(IllegalStateException.class,
+            () -> send(create(50033, "lay_b", "[]", "r33")));
+        assertTrue(e.getMessage().contains("exists as a primary-key table (key [id])"), e.getMessage());
+        assertFalse(reg.tracked(50033));
+    }
+
+    /**
+     * Review of the history tables, I5: retention set on T_hist (as the guide says) was dropped
+     * at the next DDL, because the new table's options were built from scratch.
+     */
+    @Test
+    void retentionSetOnTheHistoryTableSurvivesARotation() throws Exception {
+        long rel = 50040;
+        send(create(rel, "ret_t", "[\"id\"]", "r40"));
+        catalog.alterTable(Identifier.create("public", "ret_t_hist"), List.of(
+            org.apache.paimon.schema.SchemaChange.setOption("partition.expiration-time", "30 d"),
+            org.apache.paimon.schema.SchemaChange.setOption("partition.timestamp-formatter",
+                                                            "yyyy-MM-dd")), false);
+        send("{\"v\":1,\"op\":\"add_col\",\"relid\":%d,\"col\":{\"id\":3,\"name\":\"e\",\"type\":\"INT\"}}"
+            .formatted(rel));
+        Map<String, String> o = get("ret_t_hist").options();
+        assertEquals("30 d", o.get("partition.expiration-time"), o.toString());
+        assertEquals("yyyy-MM-dd", o.get("partition.timestamp-formatter"), o.toString());
+        assertEquals("r40", o.get(SchemaRegistry.REGISTRATION_OPTION), "the writer's own still win");
+        assertNotEquals(get(archives("ret_t").get(0)).options().get(SchemaRegistry.BASELINE_OPTION),
+                        o.get(SchemaRegistry.BASELINE_OPTION), "a new baseline, not the archive's");
+        assertTrue(fields("ret_t_hist").contains("e"));
+    }
+
+    @Test
+    void theWritersOwnLayoutOptionsAreNotCarried() {
+        assertEquals(Map.of("partition.expiration-time", "30 d", "snapshot.num-retained.max", "5"),
+            SchemaRegistry.carriedOptions(Map.of("partition.expiration-time", "30 d",
+                "snapshot.num-retained.max", "5", "bucket", "7", "bucket-key", "_lsn",
+                "partition.legacy-name", "false", "path", "/x", "pgpaimon.registration", "r",
+                "pgpaimon.applied-ddl-lsn", "1")));
+    }
+
+    /** Review of the history tables, m2: a key-less log's added column goes before the metadata. */
+    @Test
+    void aColumnAddedToAnOperationLogGoesBeforeItsMetadata() throws Exception {
+        long rel = 50050;
+        send(create(rel, "log_add", "[]", "r50"));
+        send("{\"v\":1,\"op\":\"add_col\",\"relid\":%d,\"col\":{\"id\":3,\"name\":\"c\",\"type\":\"INT\"}}"
+            .formatted(rel));
+        assertEquals(with(List.of("id", "n", "c"), LogRowBuilder.META), fields("log_add"));
+        assertEquals(with(List.of("id", "n", "c"), META), fields("log_add_hist"));
+    }
+
     @Test
     void aHistoryTableThisWriterDidNotMakeIsRefused() throws Exception {
         catalog.createDatabase("public", true);
