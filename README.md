@@ -84,8 +84,11 @@ Each is deliberate and explained, with its reason, in section 5 of the guide:
   key cannot be added to a replicated table later; a primary key must not be `DEFERRABLE`;
 * the history tables (`<table>_hist`) roughly **double write volume** and **grow without bound**,
   in rows and in archived tables (one per DDL): retention is yours to run (drop old `_dt`
-  partitions); a dropped table's history is kept and its names stay taken until you move them aside
-  and call `paimon.forget_history()`; the seven history field names (`_op`, `_commit_lsn`, `_lsn`,
+  partitions, and drop old archives by hand: nothing written to an archive again, so Paimon never
+  expires it); a dropped table's history and its archives are kept and their names stay taken until
+  you move them aside and call `paimon.forget_history()`; a table re-added after
+  `paimon.remove_table()` must keep its key (or you drop the kept Paimon table and call
+  `paimon.forget_kept_table()`); the seven history field names (`_op`, `_commit_lsn`, `_lsn`,
   `_op_seq`, `_xid`, `_ts`, `_dt`) are reserved column names;
 * `numeric` columns need an explicit precision of at most 38;
 * any role that can read `paimon.secret`, **including members of `pg_read_all_data`**, can forge a

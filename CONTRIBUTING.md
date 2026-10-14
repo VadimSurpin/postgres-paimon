@@ -37,7 +37,9 @@ make -C sql/paimon_slot installcheck
 ./test/slot-acceptance/run_acceptance.sh
 ```
 
-`run_acceptance.sh` takes suite names to run a subset. It fails if a named suite matches no tests
+`run_acceptance.sh` with no argument also runs the writer module's live ITs (`BackfillerTest`'s
+initial-load tests, skipped by plain `mvn test`) against a database of its own, and fails if any is
+skipped. It takes suite names to run a subset. It fails if a named suite matches no tests
 or if every test in it is skipped, so a mistyped name cannot pass silently. The S3 test is skipped
 unless `E2E_MINIO_BIN` points at a MinIO binary; the run reports that plainly instead of counting
 the skip as a pass.
