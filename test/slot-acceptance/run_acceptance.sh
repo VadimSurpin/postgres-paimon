@@ -204,6 +204,38 @@ run_suites() {
   return "$rc"
 }
 
+# The writer module's live ITs (BackfillerTest's initial-load tests), which `mvn test` skips
+# without PGPAIMON_IT_JDBC_URL: they are the only check of the partitioned-history truncate a
+# reload depends on (review of the history tables, m7), and no other layer ran them. In a database
+# of their own, because they register tables with rows (which the running writer's database must
+# not get) and create and drop a slot of their own (paimon_it_wr; slot names are cluster-wide).
+run_writer_its() {
+  local itdb=paimon_it_writer
+  DB_OVERRIDE=postgres psql_q -c "DROP DATABASE IF EXISTS $itdb WITH (FORCE)" >/dev/null
+  DB_OVERRIDE=postgres psql_q -c "CREATE DATABASE $itdb" >/dev/null
+  DB_OVERRIDE=$itdb psql_q -c "CREATE EXTENSION paimon_slot" >/dev/null
+  rm -rf "$RUN/it-warehouse"; mkdir -p "$RUN/it-warehouse"
+  local reports="$REPO/java/writer/target/surefire-reports" rc=0
+  rm -f "$reports"/TEST-*BackfillerTest.xml
+  echo ">> writer live ITs (BackfillerTest) against database $itdb"
+  PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$itdb?user=$PGUSER" \
+  PGPAIMON_IT_WAREHOUSE="$RUN/it-warehouse" \
+  PGPAIMON_IT_SLOT=paimon_it_wr \
+    mvn -B -ntp -q -f "$REPO/java/writer/pom.xml" test -Dtest=BackfillerTest || rc=$?
+  local rpt sk n
+  rpt="$(ls "$reports"/TEST-*BackfillerTest.xml 2>/dev/null | head -n1 || true)"
+  n=0; sk=0
+  [ -n "$rpt" ] && n="$(sed -n 's/.*<testsuite [^>]*tests="\([0-9]*\)".*/\1/p' "$rpt" | head -n1)"
+  [ -n "$rpt" ] && sk="$(sed -n 's/.*<testsuite [^>]*skipped="\([0-9]*\)".*/\1/p' "$rpt" | head -n1)"
+  if [ "${n:-0}" -lt 1 ] || [ "${sk:-0}" -ne 0 ]; then
+    echo "FAIL: writer live ITs: ${n:-0} tests, ${sk:-0} skipped (every one must run)" >&2
+    rc=1
+  else
+    echo ">> writer live ITs: $n tests, none skipped"
+  fi
+  return "$rc"
+}
+
 stop_all() {
   local rc=$?
   trap - EXIT
@@ -228,6 +260,9 @@ main() {
   start_writer
   local rc=0
   run_suites "$@" || rc=$?
+  if [ "$#" -eq 0 ]; then
+    run_writer_its || rc=$?
+  fi
   [ "$rc" -eq 0 ] && echo ">> ALL SUITES PASSED${NOT_RUN:+ -- except: $NOT_RUN}" || echo ">> SUITES FAILED (mvn exit $rc)" >&2
   exit "$rc"
 }

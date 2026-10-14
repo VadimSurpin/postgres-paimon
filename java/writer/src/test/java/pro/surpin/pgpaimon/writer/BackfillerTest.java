@@ -177,6 +177,8 @@ class BackfillerTest {
         Map<String, String> env = new HashMap<>();
         env.put("PGPAIMON_JDBC_URL", jdbc);
         env.put("PGPAIMON_WAREHOUSE", wh);
+        // Never the live writer's slot (slot names are cluster-wide): this test creates and DROPS it.
+        env.put("PGPAIMON_SLOT", System.getenv().getOrDefault("PGPAIMON_IT_SLOT", "paimon_it"));
         env.put("PGPAIMON_FLUSH_MAX_RECORDS", "300");     // 4 chunks
         WriterConfig cfg = WriterConfig.fromEnv(env);
 
@@ -263,6 +265,8 @@ class BackfillerTest {
         Map<String, String> env = new HashMap<>();
         env.put("PGPAIMON_JDBC_URL", jdbc);
         env.put("PGPAIMON_WAREHOUSE", wh);
+        // Never the live writer's slot (slot names are cluster-wide): this test creates and DROPS it.
+        env.put("PGPAIMON_SLOT", System.getenv().getOrDefault("PGPAIMON_IT_SLOT", "paimon_it"));
         env.put("PGPAIMON_FLUSH_MAX_RECORDS", "3");     // 3 chunks
         WriterConfig cfg = WriterConfig.fromEnv(env);
         Options o = new Options();
