@@ -111,8 +111,8 @@ build_benchbase() {
   # Pinned to a tag, not a branch, so the schema and the loader cannot move under the harness.
   #
   # BUILT UNMODIFIED. Nothing is patched and the TPC-C schema is exactly as it ships: the one
-  # table paimon_slot cannot replicate (`history`, which has no primary key) is left out of
-  # replication rather than altered. See setup.sql.
+  # table with no primary key (`history`) is replicated as an operation log rather than altered.
+  # See setup.sql.
   local src="$RUN/benchbase/src"
   if [ ! -d "$src/.git" ]; then
     say "cloning BenchBase $BENCHBASE_REF"
@@ -352,9 +352,9 @@ main() {
 
   # 2. Register every table while it is still empty, and before the slot exists. The Paimon
   #    tables come from the extension's own `create` messages; nothing here writes the warehouse.
-  # Eight of the nine: `history` has no primary key in TPC-C, so paimon_slot refuses it by
-  # design. setup.sql proves that refusal, and the comparison proves the table stays absent.
-  say "registering the eight replicable TPC-C tables"
+  # All nine. `history` has no primary key in TPC-C and is replicated as an operation log; every
+  # table also gets a history table <table>_hist. The comparison checks all of them.
+  say "registering the nine TPC-C tables"
   psql_q -f "$HERE/setup.sql" || die "setup.sql failed"
 
   # 3. The writer creates the slot and starts streaming.

@@ -17,18 +17,15 @@
 --  2. The Paimon tables are created by the extension's own `create` messages, emitted by
 --     add_table below. Nothing here, and nothing in the harness, touches the warehouse.
 --
--- EIGHT OF THE NINE TPC-C TABLES ARE REGISTERED. `history` is not, and that is the design behaving
--- as specified rather than falling short of it: TPC-C's `history` has no primary key -- two foreign
--- keys and nothing else -- and paimon_slot requires a primary key on every replicated table,
--- because the write target is a Paimon primary-key table and without a key there is nothing to
--- merge on. add_table() refuses such a table on purpose. So `history` cannot be replicated, stays
--- out of the publication, and never appears in the warehouse.
+-- ALL NINE TPC-C TABLES ARE REGISTERED. TPC-C's `history` has no primary key -- two foreign keys
+-- and nothing else -- and is replicated as an OPERATION LOG (docs/superpowers/specs/
+-- 2026-10-14-operation-history-design.md): its Paimon table has no key and one row per operation,
+-- since without a key there is nothing to merge on. Payment inserts into it throughout the run.
+-- DO NOT add a key to `history` to make it look like the others: the stock schema is the point,
+-- and the comparison (TpccCompare.compareLog) checks the log as a multiset.
 --
--- DO NOT "FIX" THIS by adding a key to `history`. It is a visible, intended consequence of the
--- primary-key requirement, and the comparison asserts the exclusion holds (TpccCompare's
--- checkExcluded) rather than assuming it. What it costs in coverage is one table's breadth, not a
--- class of behaviour: `history` is insert-only in TPC-C, and the other eight tables exercise
--- inserts, composite-key updates and deletes far harder.
+-- Every registered table T also gets a history table T_hist in Paimon (every row-level change,
+-- before and after, never collapsed); the comparison checks each one against PostgreSQL.
 
 CREATE EXTENSION IF NOT EXISTS paimon_slot;
 
@@ -42,22 +39,37 @@ SELECT paimon.add_table('customer'::regclass);
 SELECT paimon.add_table('oorder'::regclass);
 SELECT paimon.add_table('new_order'::regclass);
 SELECT paimon.add_table('order_line'::regclass);
+SELECT paimon.add_table('history'::regclass);
 
 -- Show what was registered and how wide each key is. Composite keys are the common case here:
--- district and stock are two columns, customer, oorder and new_order three, order_line four.
-SELECT table_name, cardinality(pk_cols) AS pk_width, pk_cols
+-- district and stock are two columns, customer, oorder and new_order three, order_line four;
+-- history none.
+SELECT table_name, cardinality(pk_cols) AS pk_width, pk_cols, hist_table
   FROM paimon.table_registry ORDER BY table_name;
 
 DO $$
 DECLARE n int;
 BEGIN
     SELECT count(*) INTO n FROM paimon.table_registry;
-    IF n <> 8 THEN
-        RAISE EXCEPTION 'expected 8 registered tables, found %', n;
+    IF n <> 9 THEN
+        RAISE EXCEPTION 'expected 9 registered tables, found %', n;
     END IF;
+    -- Exactly one key-less table, and it is history: an operation log.
     SELECT count(*) INTO n FROM paimon.table_registry WHERE cardinality(pk_cols) = 0;
-    IF n <> 0 THEN
-        RAISE EXCEPTION '% registered table(s) have no primary key', n;
+    IF n <> 1 OR NOT EXISTS (SELECT 1 FROM paimon.table_registry
+                             WHERE table_name = 'history' AND cardinality(pk_cols) = 0) THEN
+        RAISE EXCEPTION 'expected exactly history to be registered without a key';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conrelid = 'history'::regclass AND contype = 'p') THEN
+        RAISE EXCEPTION 'history has a primary key: the stock TPC-C schema has been altered';
+    END IF;
+    IF (SELECT relreplident FROM pg_class WHERE oid = 'history'::regclass) <> 'f' THEN
+        RAISE EXCEPTION 'history is not REPLICA IDENTITY FULL';
+    END IF;
+    -- Every table names its history table.
+    IF EXISTS (SELECT 1 FROM paimon.table_registry WHERE hist_table <> table_name || '_hist') THEN
+        RAISE EXCEPTION 'a registry row names an unexpected history table';
     END IF;
     -- Every table was empty at registration, so none is awaiting a backfill: the whole load
     -- travels through the slot.
@@ -65,33 +77,8 @@ BEGIN
     IF n <> 0 THEN
         RAISE EXCEPTION '% table(s) were not empty at add_table(); the load would not stream', n;
     END IF;
-
-    -- `history` must be out, and out for the stated reason. Checked here as well as in the
-    -- comparison, so a mistake is caught before the workload runs rather than after it.
-    IF EXISTS (SELECT 1 FROM paimon.table_registry WHERE table_name = 'history') THEN
-        RAISE EXCEPTION 'history is registered, but it must not be';
+    SELECT count(*) INTO n FROM paimon.health();
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'paimon.health() reports % problem(s)', n;
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_publication_tables
-               WHERE pubname = 'paimon_pub' AND tablename = 'history') THEN
-        RAISE EXCEPTION 'history is published by paimon_pub, but it must not be';
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_constraint
-               WHERE conrelid = 'history'::regclass AND contype = 'p') THEN
-        RAISE EXCEPTION 'history has a primary key: the stock TPC-C schema has been altered, '
-                        'so the documented reason for excluding it no longer holds';
-    END IF;
-END $$;
-
--- And prove the refusal is real, not merely unexercised: registering history must fail with the
--- primary-key error. Caught so this script still succeeds, and re-raised if it does NOT fail.
-DO $$
-BEGIN
-    PERFORM paimon.add_table('history'::regclass);
-    RAISE EXCEPTION 'add_table(history) succeeded, but a table with no primary key must be refused';
-EXCEPTION
-    WHEN sqlstate 'P0001' THEN
-        IF position('has no primary key' in SQLERRM) = 0 THEN
-            RAISE;
-        END IF;
-        RAISE NOTICE 'add_table(history) refused as designed: %', SQLERRM;
 END $$;

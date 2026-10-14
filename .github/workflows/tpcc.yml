@@ -7,10 +7,11 @@ name: TPC-C verification
 # and writes a few hundred thousand rows; it must never fire on a push or a pull request.
 #
 # The job's verdict is the comparison (java/src/test/java/pro/surpin/pgpaimon/TpccCompare.java):
-# it compares every column of every row of the eight replicated TPC-C tables, asserts the changelog
-# carries a real -U before-image for every update, and asserts that `history` -- which has no
-# primary key in TPC-C and therefore cannot be replicated by design -- is absent from the
-# publication and from the warehouse. A difference fails the job.
+# it compares every column of every row of the eight primary-key TPC-C tables, asserts the
+# changelog carries a real -U before-image for every update, compares `history` -- which has no
+# primary key in TPC-C and is replicated as an operation log -- as a multiset, and checks every
+# history table <table>_hist: its I/U/D counts equal the changelog's, every U carries both images,
+# no change appears twice, and replaying it rebuilds PostgreSQL's table. A difference fails the job.
 #
 # BenchBase is built UNMODIFIED: the TPC-C schema is exactly as it ships.
 #
@@ -152,8 +153,8 @@ jobs:
             echo "# so a table lives at <warehouse>/<schema>.db/<table>."
             find "$RUN/warehouse" -maxdepth 2 -type d 2>/dev/null | sort
             echo
-            echo "# per-table file count, size and snapshot count"
-            echo "# (one snapshot per replicated PostgreSQL transaction)"
+            echo "# per-table file count, size and snapshot count, <table>_hist included"
+            echo "# (about one snapshot per commit batch per touched table)"
             for d in "$RUN"/warehouse/*.db/*; do
               [ -d "$d" ] || continue
               printf '%s  files=%s  size=%s  snapshots=%s\n' \
@@ -193,6 +194,10 @@ jobs:
             echo "BenchBase \`${BENCHBASE_REF}\`, ${TPCC_WAREHOUSES} warehouse(s),"
             echo "${TPCC_TIME}s execute at up to ${TPCC_RATE} tps, ${TPCC_TERMINALS} terminal(s)."
             echo
+            echo "Columns: the merged table against PostgreSQL (pg rows, paimon, missing, extra,"
+            echo "differ), the changelog's row kinds (+I -U +U -D), and the history table's"
+            echo "operations (hist I/U/D), which must equal the changelog's. \`history\` has no key"
+            echo "and is compared as a multiset; its paimon column counts log rows."
             echo '```'
             sed -n '/^Summary/,$p' "$TPCC_RUN_DIR/compare.out" 2>/dev/null \
               || echo "(no comparison output: the run failed before the comparison)"

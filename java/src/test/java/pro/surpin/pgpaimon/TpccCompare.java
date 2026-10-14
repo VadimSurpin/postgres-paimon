@@ -20,7 +20,6 @@ import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
 
-import java.io.File;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.Connection;
@@ -61,12 +60,19 @@ import java.util.TreeMap;
  * decoders, so {@code numeric(12,2)} is compared as a scale-2 decimal on both sides rather than as
  * two differently formatted strings. Nothing is compared as a double unless it is a double in both.
  *
- * <p><b>The table that must not be there.</b> {@code history} has no primary key in the stock
- * TPC-C schema, so {@code paimon_slot} cannot replicate it and the harness never registers it. That
- * exclusion is asserted, not assumed: {@link #checkExcluded} proves the table is untracked,
- * unpublished, absent from the Paimon catalog and absent from the warehouse directory, while still
- * accumulating rows from Payment — so an unregistered table in a busy workload is shown to stay
- * genuinely untouched.
+ * <p><b>The table with no key.</b> {@code history} has no primary key in the stock TPC-C schema, so
+ * it is replicated as an operation log (spec 2026-10-14): its Paimon table has no key and one row
+ * per operation. With no key to compare by, {@link #compareLog} compares it as a multiset: the
+ * rows PostgreSQL holds, each as many times as it holds it, against the state the log's history
+ * rebuilds, and checks the log row for row against that history.
+ *
+ * <p><b>The history of every table.</b> Every replicated table {@code T} also has
+ * {@code T_hist}, one row per row-level change with its before and after images.
+ * {@link #checkHistory} asserts it holds exactly the changes PostgreSQL made: its I/U/D counts
+ * equal the changelog's +I/+U/-D (TPC-C never moves a key, so each UPDATE is one -U/+U pair and
+ * one U), every U carries both images and every I and D the one it should, no change is in it
+ * twice, and -- the strongest form -- replaying it from empty, in commit order, rebuilds exactly
+ * PostgreSQL's final table.
  *
  * <p><b>The changelog, not only the merged state.</b> A merged read reports {@code INSERT} for
  * every surviving row — it physically cannot report a row kind — so the row kinds come from the
@@ -112,8 +118,7 @@ public final class TpccCompare {
     /**
      * The eight TPC-C tables this architecture replicates.
      *
-     * <p>{@code history} is deliberately absent, and its absence is asserted rather than assumed:
-     * see {@link #EXCLUDED_TABLES}.
+     * <p>{@code history}, which has no key, is compared separately: see {@link #LOG_TABLES}.
      */
     static final String[] DEFAULT_TABLES = {
         "warehouse", "district", "customer",
@@ -121,22 +126,15 @@ public final class TpccCompare {
     };
 
     /**
-     * TPC-C tables that cannot be replicated, and are therefore checked to be absent.
-     *
-     * <p>{@code history} has <b>no primary key</b> in the stock TPC-C schema — two foreign keys and
-     * nothing else — and {@code paimon_slot} requires one on every replicated table. That is not a
-     * shortfall to work around: the write target is a Paimon primary-key table, so without a key
-     * there is nothing to merge on, and {@code add_table()} refuses the registration by design. The
-     * stock BenchBase schema is therefore left exactly as it ships, and {@code history} stays out
-     * of the publication and out of the warehouse.
-     *
-     * <p>Asserting the absence makes the exclusion a tested property. It is also a live test rather
-     * than a formality: TPC-C's Payment transaction inserts into {@code history} throughout the
-     * run, so this proves that a table never passed to {@code add_table} stays genuinely untouched
-     * under a busy workload — the same guarantee the acceptance suite's T17 checks in miniature,
-     * here at TPC-C scale.
+     * TPC-C tables with no primary key, replicated as operation logs. {@code history} has two
+     * foreign keys and nothing else; Payment inserts into it throughout the run. The stock
+     * BenchBase schema is left exactly as it ships.
      */
-    static final String[] EXCLUDED_TABLES = {"history"};
+    static final String[] LOG_TABLES = {"history"};
+
+    /** The metadata columns of an operation log and of every history table, in their order. */
+    static final List<String> LOG_META =
+        List.of("_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts");
 
     /**
      * Tables TPC-C always updates, so a run with any Payment or NewOrder transaction must leave
@@ -171,7 +169,13 @@ public final class TpccCompare {
     record TableResult(String table, long pgRows, long paimonRows,
                        long missing, long extra, long mismatched,
                        long insert, long updBefore, long updAfter, long delete,
-                       List<String> failures) {
+                       List<String> failures, long[] hist) {
+        TableResult(String table, long pgRows, long paimonRows, long missing, long extra,
+                    long mismatched, long insert, long updBefore, long updAfter, long delete,
+                    List<String> failures) {
+            this(table, pgRows, paimonRows, missing, extra, mismatched, insert, updBefore,
+                 updAfter, delete, failures, null);
+        }
         boolean ok() { return failures.isEmpty(); }
     }
 
@@ -221,9 +225,9 @@ public final class TpccCompare {
                                          metaFields, maxDiffs, deliveryRan));
                 System.out.println();
             }
-            for (String table : EXCLUDED_TABLES) {
-                System.out.println("── " + table + " (must NOT be replicated) ──");
-                results.add(checkExcluded(pg, catalog, warehouse, pgSchema, table));
+            for (String table : LOG_TABLES) {
+                System.out.println("── " + table + " (no primary key: an operation log) ──");
+                results.add(compareLog(pg, catalog, pgSchema, table, maxDiffs));
                 System.out.println();
             }
         }
@@ -234,7 +238,8 @@ public final class TpccCompare {
         System.out.println();
         System.out.println(allOk
             ? "RESULT: PASS -- PostgreSQL and Paimon agree on every row of every table, "
-              + "and the changelog accounts for every change."
+              + "the changelog accounts for every change, and every history table holds "
+              + "exactly the changes PostgreSQL made."
             : "RESULT: FAIL -- see the failures listed above.");
         System.exit(allOk ? 0 : 1);
     }
@@ -457,117 +462,367 @@ public final class TpccCompare {
             System.out.println("  FAIL: Delivery ran but new_order has no -D record");
         }
 
-        System.out.println(failures.isEmpty() ? "  OK" : "  FAILED: " + failures.size() + " check(s)");
-        return new TableResult(table, pgCount, paimonCount, missing, extra, mismatched,
-                               ins, ubf, uaf, del, failures);
-    }
-
-    // ── the table that must not be there ────────────────────────────────────
-
-    /**
-     * Asserts that an unreplicable table reached neither the publication nor the warehouse.
-     *
-     * <p>Seven things are checked, and each one would fail for a different reason, so a failure
-     * says which assumption broke:
-     *
-     * <ol>
-     *   <li>the table exists in PostgreSQL — otherwise every check below is vacuous;</li>
-     *   <li>it still has no primary key, so the documented reason for excluding it holds and
-     *       nobody has quietly added one;</li>
-     *   <li>it holds rows, so the workload really did write to it and the absence checks are
-     *       live rather than trivially true;</li>
-     *   <li>{@code paimon.table_registry} has no row for it;</li>
-     *   <li>{@code paimon_pub} does not publish it, which is what keeps its changes out of the
-     *       slot's stream in the first place;</li>
-     *   <li>the Paimon catalog does not know the table;</li>
-     *   <li>no directory for it exists under the warehouse's database directory.</li>
-     * </ol>
-     */
-    static TableResult checkExcluded(Connection pg, Catalog catalog, String warehouse,
-                                     String pgSchema, String table) throws Exception {
-        List<String> failures = new ArrayList<>();
-        String qualified = quote(pgSchema) + "." + quote(table);
-
-        boolean exists = scalarBoolean(pg,
-            "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
-            + " WHERE n.nspname = ? AND c.relname = ? AND c.relkind = 'r')", pgSchema, table);
-        if (!exists) {
-            failures.add("table does not exist in PostgreSQL, so nothing here was actually checked");
-            System.out.println("  FAIL: " + qualified + " does not exist in PostgreSQL");
-            return new TableResult(table, -1, -1, 0, 0, 0, 0, 0, 0, 0, failures);
-        }
-
-        List<String> pk = pgPrimaryKey(pg, qualified);
-        if (!pk.isEmpty()) {
-            failures.add("has a primary key " + pk + ", so the reason it is excluded no longer "
-                + "holds: either replicate it or update the exclusion");
-            System.out.println("  FAIL: unexpectedly has a primary key: " + pk);
-        } else {
-            System.out.println("  pk          : none  (which is why it cannot be replicated)");
-        }
-
-        long rows = 0;
-        try (Statement st = pg.createStatement();
-             ResultSet rs = st.executeQuery("SELECT count(*) FROM " + qualified)) {
-            rows = rs.next() ? rs.getLong(1) : 0;
-        }
-        System.out.println("  rows         : postgres " + rows + "  (written by Payment "
-            + "throughout the run, so the absence checks below are live)");
-        if (rows == 0) {
-            failures.add("holds no rows, so the workload never wrote to it and its absence from "
-                + "Paimon proves nothing");
-            System.out.println("  FAIL: no rows, so this check is vacuous");
-        }
-
-        boolean tracked = scalarBoolean(pg,
-            "SELECT EXISTS (SELECT 1 FROM paimon.table_registry"
-            + " WHERE schema_name = ? AND table_name = ?)", pgSchema, table);
-        System.out.println("  registry     : " + (tracked ? "TRACKED" : "not tracked"));
-        if (tracked) {
-            failures.add("is registered in paimon.table_registry, but it must not be");
-            System.out.println("  FAIL: present in paimon.table_registry");
-        }
-
-        boolean published = scalarBoolean(pg,
-            "SELECT EXISTS (SELECT 1 FROM pg_publication_tables"
-            + " WHERE pubname = 'paimon_pub' AND schemaname = ? AND tablename = ?)",
-            pgSchema, table);
-        System.out.println("  publication  : " + (published ? "PUBLISHED" : "not in paimon_pub"));
-        if (published) {
-            failures.add("is published by paimon_pub, so its changes travel the slot's stream");
-            System.out.println("  FAIL: published by paimon_pub");
-        }
-
-        boolean inCatalog;
-        try {
-            catalog.getTable(Identifier.create(pgSchema, table));
-            inCatalog = true;
-        } catch (Catalog.TableNotExistException e) {
-            inCatalog = false;
-        }
-        System.out.println("  paimon table : " + (inCatalog ? "EXISTS" : "absent from the catalog"));
-        if (inCatalog) {
-            failures.add("exists in the Paimon catalog as " + pgSchema + "." + table);
-            System.out.println("  FAIL: the Paimon catalog knows " + pgSchema + "." + table);
-        }
-
-        // Only meaningful for a local warehouse; a remote URI is left to the catalog check above.
-        if (!warehouse.contains("://") || warehouse.startsWith("file://")) {
-            File dir = new File(warehouse.replaceFirst("^file://", ""),
-                                pgSchema + ".db/" + table);
-            System.out.println("  warehouse dir: " + dir
-                + (dir.exists() ? "  EXISTS" : "  does not exist"));
-            if (dir.exists()) {
-                failures.add("has a directory in the warehouse at " + dir);
-                System.out.println("  FAIL: the warehouse holds a directory for it");
+        // ── the history table ───────────────────────────────────────────────
+        long[] hist = checkHistory(pg, catalog, pgSchema, table, pgCols, types, pkPos,
+                                   notNullColumns(pg, qualified), maxDiffs, failures);
+        if (hist != null) {
+            // TPC-C never moves a key, so every UPDATE is one -U/+U pair and one U row.
+            if (hist[0] != ins || hist[1] != uaf || hist[1] != ubf || hist[2] != del) {
+                failures.add("history has I " + hist[0] + ", U " + hist[1] + ", D " + hist[2]
+                    + " but the changelog has +I " + ins + ", -U " + ubf + ", +U " + uaf
+                    + ", -D " + del);
+                System.out.println("  FAIL: history counts do not match the changelog");
             }
         }
 
-        System.out.println(failures.isEmpty()
-            ? "  OK -- never registered, never published, never written"
-            : "  FAILED: " + failures.size() + " check(s)");
-        return new TableResult(table, rows, 0, 0, 0, 0, 0, 0, 0, 0, failures);
+        System.out.println(failures.isEmpty() ? "  OK" : "  FAILED: " + failures.size() + " check(s)");
+        return new TableResult(table, pgCount, paimonCount, missing, extra, mismatched,
+                               ins, ubf, uaf, del, failures, hist);
     }
+
+    // ── history tables ──────────────────────────────────────────────────────
+
+    /** One history row: its order, its operation, and both images canonicalised (null: none). */
+    record HistRow(long commitLsn, int opSeq, char op, String[] before, String[] after) {}
+
+    /**
+     * Reads {@code <table>_hist} and asserts it holds exactly the changes PostgreSQL made.
+     * Returns {I, U, D, T, R, rows}, or null when the table cannot be read at all.
+     *
+     * <ul>
+     *   <li>its columns are the six metadata columns, then {@code before_<c>} and {@code after_<c>}
+     *       for every PostgreSQL column, and it has no key;</li>
+     *   <li>no (commit LSN, op_seq) occurs twice: a change in it twice is a replay that leaked;</li>
+     *   <li>an I or R carries no before image and a full after image (every NOT NULL column set),
+     *       a D the reverse, a U BOTH -- the before image is the point of the history;</li>
+     *   <li>replayed from empty in commit order -- I and R add, U replaces before by after, D
+     *       removes, T empties -- it rebuilds exactly PostgreSQL's table: by key for a table with
+     *       one, as a multiset of whole rows for one without. Every PostgreSQL row is compared.</li>
+     * </ul>
+     */
+    static long[] checkHistory(Connection pg, Catalog catalog, String pgSchema, String table,
+                               List<String> pgCols, DataType[] types, int[] pkPos,
+                               Set<String> notNull, int maxDiffs, List<String> failures)
+            throws Exception {
+        String histName = table + "_hist";
+        List<HistRow> rows;
+        try {
+            rows = readHistory(catalog, pgSchema, histName, pgCols, types, failures);
+        } catch (Catalog.TableNotExistException e) {
+            failures.add("has no history table " + histName);
+            System.out.println("  FAIL: no history table " + histName);
+            return null;
+        }
+        if (rows == null) {
+            return null;
+        }
+        long[] counts = new long[6];
+        Set<String> seen = new java.util.HashSet<>();
+        long dupes = 0, badImages = 0;
+        for (HistRow r : rows) {
+            switch (r.op()) {
+                case 'I' -> counts[0]++;
+                case 'U' -> counts[1]++;
+                case 'D' -> counts[2]++;
+                case 'T' -> counts[3]++;
+                case 'R' -> counts[4]++;
+                default -> badImages++;
+            }
+            if (!seen.add(r.commitLsn() + "/" + r.opSeq())) {
+                dupes++;
+            }
+            boolean needBefore = r.op() == 'U' || r.op() == 'D';
+            boolean needAfter = r.op() == 'U' || r.op() == 'I' || r.op() == 'R';
+            if (!image(r.before(), needBefore, pgCols, notNull)
+                || !image(r.after(), needAfter, pgCols, notNull)) {
+                if (badImages++ < maxDiffs) {
+                    System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn() + "/"
+                        + r.opSeq() + " has the wrong images: before "
+                        + (r.before() == null ? "none" : render(pgCols, r.before())) + "; after "
+                        + (r.after() == null ? "none" : render(pgCols, r.after())));
+                }
+            }
+        }
+        counts[5] = rows.size();
+        System.out.printf("  history     : I %d, U %d, D %d, T %d, R %d  (%d rows)%n",
+                          counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]);
+        if (dupes > 0) {
+            failures.add("history holds " + dupes + " change(s) twice (same commit LSN and op_seq)");
+            System.out.println("  FAIL: " + dupes + " duplicated history rows");
+        }
+        if (badImages > 0) {
+            failures.add(badImages + " history row(s) lack an image they must carry, or carry one"
+                + " they must not");
+            System.out.println("  FAIL: " + badImages + " history rows with wrong images");
+        }
+
+        // Replay from empty, in commit order, and compare with PostgreSQL row for row.
+        Map<String, Long> multiset = new HashMap<>();
+        Map<String, String> byKey = new HashMap<>();
+        long replayErrors = 0;
+        for (HistRow r : rows) {
+            if (r.op() == 'T') {
+                multiset.clear();
+                byKey.clear();
+                continue;
+            }
+            String b = r.before() == null ? null : String.join(String.valueOf(SEP), r.before());
+            String a = r.after() == null ? null : String.join(String.valueOf(SEP), r.after());
+            if (pkPos != null) {
+                if (b != null && byKey.remove(key(r.before(), pkPos)) == null) {
+                    replayErrors++;    // an update or delete of a key the history never had
+                }
+                if (a != null && byKey.put(key(r.after(), pkPos), a) != null) {
+                    replayErrors++;    // an insert of a key the history already had
+                }
+            } else {
+                if (b != null && multiset.merge(b, -1L, Long::sum) < 0) {
+                    replayErrors++;    // a change to a row the history did not hold
+                }
+                if (a != null) {
+                    multiset.merge(a, 1L, Long::sum);
+                }
+            }
+        }
+        if (replayErrors > 0) {
+            failures.add("replaying the history hit " + replayErrors + " change(s) to rows it did"
+                + " not hold, or inserts of keys it already held");
+            System.out.println("  FAIL: " + replayErrors + " inconsistent history changes");
+        }
+        long missing = 0, differ = 0, reported = 0;
+        StringBuilder sql = new StringBuilder("SELECT ");
+        for (int i = 0; i < pgCols.size(); i++) {
+            sql.append(i > 0 ? ", " : "").append(quote(pgCols.get(i)));
+        }
+        sql.append(" FROM ").append(quote(pgSchema)).append('.').append(quote(table));
+        try (PreparedStatement st = pg.prepareStatement(sql.toString())) {
+            st.setFetchSize(10_000);
+            try (ResultSet rs = st.executeQuery()) {
+                while (rs.next()) {
+                    String[] vals = new String[pgCols.size()];
+                    for (int i = 0; i < vals.length; i++) {
+                        vals[i] = pgValue(rs, i + 1, types[i]);
+                    }
+                    String row = String.join(String.valueOf(SEP), vals);
+                    if (pkPos != null) {
+                        String got = byKey.remove(key(vals, pkPos));
+                        if (got == null) {
+                            missing++;
+                        } else if (!got.equals(row)) {
+                            differ++;
+                            if (reported++ < maxDiffs) {
+                                System.out.println("  DIFF history replay differs at key "
+                                    + show(key(vals, pkPos)) + ": history "
+                                    + render(pgCols, got.split(String.valueOf(SEP), -1))
+                                    + "; postgres " + render(pgCols, vals));
+                            }
+                        }
+                    } else {
+                        Long n = multiset.get(row);
+                        if (n == null || n <= 0) {
+                            missing++;
+                            if (reported++ < maxDiffs) {
+                                System.out.println("  DIFF a PostgreSQL row the history does not"
+                                    + " produce (or produces fewer times): " + render(pgCols, vals));
+                            }
+                        } else {
+                            multiset.put(row, n - 1);
+                        }
+                    }
+                }
+            }
+        }
+        long extra = pkPos != null ? byKey.size()
+            : multiset.values().stream().filter(n -> n > 0).mapToLong(Long::longValue).sum();
+        System.out.printf("  history replay vs postgres: missing %d, extra %d, differ %d%n",
+                          missing, extra, differ);
+        if (missing + extra + differ > 0) {
+            failures.add("replaying the history does not rebuild PostgreSQL's table: missing "
+                + missing + ", extra " + extra + ", differing " + differ);
+            System.out.println("  FAIL: the history does not rebuild the table");
+        }
+        return counts;
+    }
+
+    /** An image is absent when it must be, and present (every NOT NULL column set) when it must be. */
+    static boolean image(String[] img, boolean required, List<String> cols, Set<String> notNull) {
+        if (!required) {
+            return img == null;
+        }
+        if (img == null) {
+            return false;
+        }
+        for (int i = 0; i < cols.size(); i++) {
+            if (notNull.contains(cols.get(i)) && NULL.equals(img[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Every row of a history table, sorted into commit order. An image whose every column is NULL
+     * is reported as absent: every TPC-C table has a NOT NULL column, so no real image is all
+     * NULL and this is exact here.
+     */
+    static List<HistRow> readHistory(Catalog catalog, String pgSchema, String histName,
+                                     List<String> pgCols, DataType[] types, List<String> failures)
+            throws Exception {
+        Table h = catalog.getTable(Identifier.create(pgSchema, histName));
+        List<String> names = h.rowType().getFieldNames();
+        List<String> want = new ArrayList<>(LOG_META);
+        for (String c : pgCols) want.add("before_" + c);
+        for (String c : pgCols) want.add("after_" + c);
+        if (!names.equals(want)) {
+            failures.add("history table columns " + names + " != " + want);
+            System.out.println("  FAIL: history table schema " + names);
+            return null;
+        }
+        if (!h.primaryKeys().isEmpty()) {
+            failures.add("history table has a primary key " + h.primaryKeys());
+        }
+        int n = pgCols.size();
+        int base = LOG_META.size();
+        List<HistRow> out = new ArrayList<>();
+        ReadBuilder rb = h.newReadBuilder();
+        try (RecordReader<InternalRow> reader = rb.newRead().createReader(rb.newScan().plan())) {
+            reader.forEachRemaining(r -> {
+                String[] before = new String[n];
+                String[] after = new String[n];
+                boolean anyB = false, anyA = false;
+                for (int i = 0; i < n; i++) {
+                    before[i] = paimonValue(r, base + i, types[i]);
+                    after[i] = paimonValue(r, base + n + i, types[i]);
+                    anyB |= !NULL.equals(before[i]);
+                    anyA |= !NULL.equals(after[i]);
+                }
+                out.add(new HistRow(r.getLong(1), r.getInt(3), r.getString(0).toString().charAt(0),
+                                    anyB ? before : null, anyA ? after : null));
+            });
+        }
+        out.sort((x, y) -> x.commitLsn() != y.commitLsn()
+            ? Long.compare(x.commitLsn(), y.commitLsn()) : Integer.compare(x.opSeq(), y.opSeq()));
+        return out;
+    }
+
+    static Set<String> notNullColumns(Connection pg, String qualified) throws Exception {
+        Set<String> out = new java.util.HashSet<>();
+        try (PreparedStatement st = pg.prepareStatement("SELECT attname FROM pg_attribute"
+                 + " WHERE attrelid = ?::regclass AND attnum > 0 AND NOT attisdropped AND attnotnull")) {
+            st.setString(1, qualified);
+            try (ResultSet rs = st.executeQuery()) {
+                while (rs.next()) out.add(rs.getString(1));
+            }
+        }
+        return out;
+    }
+
+    // ── a table with no key: an operation log ───────────────────────────────
+
+    /**
+     * {@code history}: no primary key in PostgreSQL, so in Paimon an append-only operation log.
+     * Asserted: the log's columns are PostgreSQL's then the six metadata columns and it has no key;
+     * every log row is the matching history row's after image (the before image for a D, NULLs
+     * for a T), one for one with the same (commit LSN, op_seq); and {@link #checkHistory} shows
+     * the history rebuilds PostgreSQL's rows as a multiset. That the workload really wrote to it
+     * is asserted too, or the comparison would prove nothing.
+     */
+    static TableResult compareLog(Connection pg, Catalog catalog, String pgSchema, String table,
+                                  int maxDiffs) throws Exception {
+        List<String> failures = new ArrayList<>();
+        String qualified = quote(pgSchema) + "." + quote(table);
+        List<String> pgCols = pgColumns(pg, qualified);
+        if (!pgPrimaryKey(pg, qualified).isEmpty()) {
+            failures.add("has a primary key: the stock TPC-C schema has been altered");
+        }
+        Table log = catalog.getTable(Identifier.create(pgSchema, table));
+        List<String> want = new ArrayList<>(pgCols);
+        want.addAll(LOG_META);
+        if (!log.rowType().getFieldNames().equals(want)) {
+            failures.add("log columns " + log.rowType().getFieldNames() + " != " + want);
+            System.out.println("  FAIL: log schema " + log.rowType().getFieldNames());
+            return new TableResult(table, -1, -1, 0, 0, 0, 0, 0, 0, 0, failures);
+        }
+        if (!log.primaryKeys().isEmpty()) {
+            failures.add("the log has a primary key " + log.primaryKeys());
+        }
+        DataType[] types = new DataType[pgCols.size()];
+        for (int i = 0; i < types.length; i++) {
+            types[i] = log.rowType().getFields().get(i).type();
+        }
+        long pgCount;
+        try (Statement st = pg.createStatement();
+             ResultSet rs = st.executeQuery("SELECT count(*) FROM " + qualified)) {
+            rs.next();
+            pgCount = rs.getLong(1);
+        }
+        System.out.println("  rows        : postgres " + pgCount);
+        if (pgCount == 0) {
+            failures.add("holds no rows, so the workload never wrote to it and the comparison"
+                + " proves nothing");
+        }
+        Map<String, String> logRows = new HashMap<>();
+        long logCount = 0, logDupes = 0;
+        int base = pgCols.size();
+        ReadBuilder rb = log.newReadBuilder();
+        try (RecordReader<InternalRow> reader = rb.newRead().createReader(rb.newScan().plan())) {
+            RecordReader.RecordIterator<InternalRow> batch;
+            while ((batch = reader.readBatch()) != null) {
+                InternalRow r;
+                while ((r = batch.next()) != null) {
+                    logCount++;
+                    String[] vals = new String[pgCols.size()];
+                    for (int i = 0; i < vals.length; i++) {
+                        vals[i] = paimonValue(r, i, types[i]);
+                    }
+                    String k = r.getLong(base + 1) + "/" + r.getInt(base + 3);
+                    if (logRows.put(k, r.getString(base).toString() + SEP
+                            + String.join(String.valueOf(SEP), vals)) != null) {
+                        logDupes++;
+                    }
+                }
+                batch.releaseBatch();
+            }
+        }
+        System.out.println("  log rows    : " + logCount);
+        if (logDupes > 0) {
+            failures.add("the log holds " + logDupes + " change(s) twice");
+        }
+        long[] hist = checkHistory(pg, catalog, pgSchema, table, pgCols, types, null,
+                                   notNullColumns(pg, qualified), maxDiffs, failures);
+        if (hist != null) {
+            long logMismatch = 0;
+            for (HistRow h : readHistory(catalog, pgSchema, table + "_hist", pgCols, types,
+                                         new ArrayList<>())) {
+                String[] vals = h.op() == 'D' ? h.before() : h.op() == 'T' ? null : h.after();
+                if (vals == null) {
+                    vals = new String[pgCols.size()];
+                    Arrays.fill(vals, NULL);
+                }
+                String expect = h.op() + String.valueOf(SEP)
+                    + String.join(String.valueOf(SEP), vals);
+                String got = logRows.remove(h.commitLsn() + "/" + h.opSeq());
+                if (!expect.equals(got) && logMismatch++ < maxDiffs) {
+                    System.out.println("  DIFF log row " + h.commitLsn() + "/" + h.opSeq()
+                        + ": log " + (got == null ? "absent" : show(got))
+                        + "; history " + show(expect));
+                }
+            }
+            logMismatch += logRows.size();
+            System.out.println("  log vs history: " + logMismatch + " row(s) disagree");
+            if (logMismatch > 0) {
+                failures.add(logMismatch + " log row(s) disagree with the history, or have no"
+                    + " history row");
+            }
+            if (hist[0] + hist[4] == 0) {
+                failures.add("the history of " + table + " holds no insert");
+            }
+        }
+        System.out.println(failures.isEmpty() ? "  OK" : "  FAILED: " + failures.size() + " check(s)");
+        return new TableResult(table, pgCount, logCount, 0, 0, 0,
+                               hist == null ? 0 : hist[0], 0, 0, 0, failures, hist);
+    }
+
 
     static boolean scalarBoolean(Connection pg, String sql, String... args) throws Exception {
         try (PreparedStatement st = pg.prepareStatement(sql)) {
@@ -836,17 +1091,18 @@ public final class TpccCompare {
 
     static void printSummary(List<TableResult> results) {
         System.out.println("Summary");
-        System.out.printf("%-12s %10s %10s %8s %8s %8s %9s %8s %8s %8s  %s%n",
+        System.out.printf("%-12s %10s %10s %8s %8s %8s %9s %8s %8s %8s %9s %8s %8s  %s%n",
             "table", "pg rows", "paimon", "missing", "extra", "differ",
-            "+I", "-U", "+U", "-D", "verdict");
-        System.out.println("-".repeat(118));
+            "+I", "-U", "+U", "-D", "hist I", "hist U", "hist D", "verdict");
+        System.out.println("-".repeat(146));
         for (TableResult r : results) {
-            System.out.printf("%-12s %10d %10d %8d %8d %8d %9d %8d %8d %8d  %s%n",
+            long[] h = r.hist() == null ? new long[6] : r.hist();
+            System.out.printf("%-12s %10d %10d %8d %8d %8d %9d %8d %8d %8d %9d %8d %8d  %s%n",
                 r.table(), r.pgRows(), r.paimonRows(), r.missing(), r.extra(), r.mismatched(),
-                r.insert(), r.updBefore(), r.updAfter(), r.delete(),
+                r.insert(), r.updBefore(), r.updAfter(), r.delete(), h[0], h[1], h[2],
                 r.ok() ? "ok" : "FAIL");
         }
-        System.out.println("-".repeat(118));
+        System.out.println("-".repeat(146));
         Map<String, List<String>> failed = new LinkedHashMap<>();
         for (TableResult r : results) {
             if (!r.ok()) {
