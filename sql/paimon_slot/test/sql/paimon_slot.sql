@@ -759,8 +759,15 @@ ALTER TABLE kl_t ADD COLUMN _ts timestamptz;                                    
 ALTER TABLE kl_t ADD COLUMN _commit_lsn bigint;                                 -- expect ERROR
 CREATE TABLE kl_bad (x int, _ts timestamptz);
 SELECT paimon.add_table('kl_bad'::regclass);                                    -- expect ERROR
+-- ... and on a table WITH a key too: its history table carries its columns unprefixed
 CREATE TABLE pk_ts (id int PRIMARY KEY, _ts timestamptz, _lsn bigint);
+SELECT paimon.add_table('pk_ts'::regclass);                                     -- expect ERROR
+ALTER TABLE pk_ts DROP COLUMN _ts, DROP COLUMN _lsn;
 SELECT paimon.add_table('pk_ts'::regclass);
+ALTER TABLE pk_ts ADD COLUMN _dt date;                                          -- expect ERROR
+ALTER TABLE pk_ts ADD COLUMN _op_seq int;                                       -- expect ERROR
+ALTER TABLE pk_ts ADD COLUMN x int;
+ALTER TABLE pk_ts RENAME COLUMN x TO _xid;                                      -- expect ERROR
 ALTER TABLE kl_t ADD COLUMN c int;
 SELECT paimon.peek_messages() - 'relid';
 -- name collisions: T_hist is a replicated table, or T is a replicated table's history
@@ -797,5 +804,47 @@ UPDATE paimon.table_registry SET table_name = 'col_a' WHERE table_name = 'col_b_
 SELECT * FROM paimon.health();
 DROP TABLE kl_t, kl_bad, pk_ts, col_a, col_a_hist, col_b, col_b_hist, s12.col_a_hist;
 DROP SCHEMA s12;
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
+SELECT pg_drop_replication_slot('paimon_test');
+
+-- (13) history archives (<t>_hist_<16 hex>) and the history's bucket count per daily partition
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+SELECT c, h, paimon.is_history_of(c, h) AS is_hist
+  FROM (VALUES ('a_hist', 'a_hist'), ('a_hist_00000000016E3A40', 'a_hist'),
+               ('a_hist_00000000016e3a40', 'a_hist'), ('a_hist_16E3A40', 'a_hist'),
+               ('a_hist_00000000016E3A40x', 'a_hist'), ('b_hist_00000000016E3A40', 'a_hist')) v(c, h);
+-- a tracked table named like another table's archive, in either order
+CREATE TABLE arc (id int PRIMARY KEY);
+CREATE TABLE arc_hist_0000000000000001 (id int PRIMARY KEY);
+SELECT paimon.add_table('arc'::regclass);
+SELECT paimon.add_table('arc_hist_0000000000000001'::regclass);                 -- expect ERROR
+-- (quoted: the archive's hex digits are upper case, and Paimon names are case-sensitive, so an
+-- unquoted, folded arc2_hist_00000000000000ff would be a different name and is allowed)
+CREATE TABLE "arc2_hist_00000000000000FF" (id int PRIMARY KEY);
+CREATE TABLE arc2 (id int PRIMARY KEY);
+SELECT paimon.add_table('"arc2_hist_00000000000000FF"'::regclass);
+SELECT paimon.add_table('arc2'::regclass);                                      -- expect ERROR
+-- a dropped table's archives stay retained by name pattern
+DROP TABLE arc;
+SELECT paimon.add_table('arc_hist_0000000000000001'::regclass);                 -- expect ERROR
+-- the bucket formula: clamp(1, ceil(bytes per day / 1 GiB), 64)
+SELECT b, paimon.hist_buckets_for(b) AS buckets
+  FROM (VALUES (NULL::numeric), (0), (1), (1073741824), (1073741825), (10737418240),
+               (68719476736), (68719476737), (1e15)) v(b);
+-- expected history bytes per day: (ins + 2 upd + del) / days * row bytes
+SELECT paimon.hist_bytes_per_day(1000, 500, 100, 2, 100) AS bytes;            -- (1000+1000+100)/2*100
+SELECT paimon.hist_buckets_for(paimon.hist_bytes_per_day(10000000, 5000000, 0, 1, 100)) AS buckets;
+-- add_table: fresh statistics fall back to the table-size heuristic; hist_buckets wins
+CREATE TABLE hb_t (id int PRIMARY KEY);
+SELECT paimon.estimate_hist_buckets('hb_t'::regclass) = paimon.default_buckets('hb_t'::regclass) AS fallback;
+SELECT paimon.add_table('hb_t'::regclass, hist_buckets => 0);                   -- expect ERROR
+SELECT paimon.add_table('hb_t'::regclass, hist_buckets => 3);
+CREATE TABLE hb_u (id int PRIMARY KEY);
+SELECT paimon.add_table('hb_u'::regclass);
+SELECT table_name, hist_buckets, hist_buckets_user FROM paimon.table_registry
+ WHERE table_name IN ('hb_t', 'hb_u') ORDER BY 1;
+SELECT j->'options'->>'hist-bucket' AS hb, j->'options'->>'hist-bucket-user' AS hb_user
+  FROM paimon.peek_messages() j WHERE j->>'op' = 'create' AND j->>'table' IN ('hb_t', 'hb_u') ORDER BY j->>'table';
+DROP TABLE arc_hist_0000000000000001, "arc2_hist_00000000000000FF", arc2, hb_t, hb_u;
 SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');

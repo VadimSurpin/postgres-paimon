@@ -21,7 +21,12 @@ CREATE TABLE paimon.table_registry (
     -- Identifies this registration. The writer stamps it on the history table it creates and
     -- refuses to append to a history table carrying another one: a table dropped and
     -- re-created under the same name must not continue someone else's audit trail.
-    registration       uuid        NOT NULL DEFAULT gen_random_uuid()
+    registration       uuid        NOT NULL DEFAULT gen_random_uuid(),
+    -- The history table's bucket count, per daily partition (paimon.hist_buckets_for): what
+    -- add_table() resolved, and the user's hist_buckets => N when one was given (it always
+    -- wins, also when the writer re-sizes a new history table at a DDL rotation).
+    hist_buckets       int         NOT NULL DEFAULT 1,
+    hist_buckets_user  int
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.table_registry', '');
 
@@ -611,7 +616,8 @@ $$;
 CREATE FUNCTION paimon.add_table(rel regclass,
                                  replica_identity text DEFAULT 'full',
                                  changelog_producer text DEFAULT 'input',
-                                 buckets int DEFAULT NULL)
+                                 buckets int DEFAULT NULL,
+                                 hist_buckets int DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     v_relid  oid  := rel::oid;
@@ -623,6 +629,7 @@ DECLARE
     v_has_rows boolean;
     v_buckets  int;
     v_registration uuid;
+    v_hist_buckets int;
 BEGIN
     IF replica_identity <> 'full' THEN
         RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
@@ -637,6 +644,10 @@ BEGIN
     IF buckets IS NOT NULL AND buckets < 1 THEN
         RAISE EXCEPTION 'paimon_slot: buckets => % must be a positive integer', buckets
               USING HINT = 'omit the argument to size it from the table (see paimon.default_buckets), or give a count of 1 or more';
+    END IF;
+    IF hist_buckets IS NOT NULL AND hist_buckets < 1 THEN
+        RAISE EXCEPTION 'paimon_slot: hist_buckets => % must be a positive integer', hist_buckets
+              USING HINT = 'the bucket count of the history table in each daily partition; omit it to estimate it from the table''s statistics (see paimon.estimate_hist_buckets), or give a count of 1 or more';
     END IF;
 
     SELECT n.nspname, c.relname, c.relkind
@@ -674,7 +685,7 @@ BEGIN
     END IF;
 
     v_cols := paimon.table_cols(v_relid);
-    PERFORM paimon.reject_reserved_name(c->>'name', cardinality(v_pk) = 0) FROM jsonb_array_elements(v_cols) c;
+    PERFORM paimon.reject_reserved_name(c->>'name') FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_unsafe_numeric(v_relid, (c->>'id')::int) FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_unsupported_column(v_relid, (c->>'id')::int) FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_inheritance(v_relid);
@@ -697,6 +708,7 @@ BEGIN
     -- The resolved count, not the argument: the registry records what the table actually got,
     -- so the writer's startup bootstrap replays the same value it was created with.
     v_buckets := coalesce(buckets, paimon.default_buckets(v_relid));
+    v_hist_buckets := coalesce(hist_buckets, paimon.estimate_hist_buckets(v_relid));
 
     EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', rel::text);
     -- The value guards, validated against the rows already there (see add_guards).
@@ -709,10 +721,11 @@ BEGIN
 
     INSERT INTO paimon.table_registry
         (relid, schema_name, table_name, pk_cols, cols,
-         backfill_due, replica_identity, changelog_producer, buckets, hist_table)
+         backfill_due, replica_identity, changelog_producer, buckets, hist_table,
+         hist_buckets, hist_buckets_user)
     VALUES (v_relid, v_nsp, v_name, v_pk, v_cols,
             v_has_rows, replica_identity, changelog_producer, v_buckets,
-            paimon.hist_name(v_name))
+            paimon.hist_name(v_name), v_hist_buckets, hist_buckets)
     RETURNING registration INTO v_registration;
 
     PERFORM paimon.emit(jsonb_build_object(
@@ -722,6 +735,8 @@ BEGIN
         'options', jsonb_build_object('changelog-producer', changelog_producer,
                                       'bucket', v_buckets,
                                       'hist-table', paimon.hist_name(v_name),
+                                      'hist-bucket', v_hist_buckets,
+                                      'hist-bucket-user', hist_buckets IS NOT NULL,
                                       'registration', v_registration)));
 END $$;
 
@@ -784,7 +799,7 @@ REVOKE ALL ON FUNCTION paimon.peek_messages() FROM PUBLIC;
  * one (ruling R4).  Compared case-insensitively.  The single definition of the
  * rule: add_table() and the ddl_command_end trigger both call it.
  */
-CREATE FUNCTION paimon.reject_reserved_name(col_name text, keyless boolean DEFAULT false)
+CREATE FUNCTION paimon.reject_reserved_name(col_name text)
 RETURNS void LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
     IF lower(col_name) = ANY (ARRAY['_value_kind', '_row_id', 'rowkind',
@@ -814,20 +829,83 @@ BEGIN
               USING HINT = 'choose a different column name (the writer''s fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)';
     END IF;
     /*
-     * A table with no primary key is replicated as an operation log whose Paimon table carries
-     * the user's columns unprefixed beside _op, _commit_lsn, _lsn, _op_seq, _xid and _ts; a
-     * user column with one of those names would duplicate a field. (History tables prefix
-     * every user column with before_/after_, so they cannot collide.)
+     * The metadata columns of the history table (<table>_hist, every replicated table) and of the
+     * operation log a table without a primary key is replicated as. Both carry the user's columns
+     * unprefixed beside these, so a user column with one of the names would duplicate a field.
      */
-    IF keyless AND col_name IN ('_op', '_commit_lsn', '_lsn', '_ts') THEN
-        RAISE EXCEPTION 'paimon_slot: column name "%" is a field of the operation log a table without a primary key is replicated as', col_name
-              USING HINT = 'choose a different column name; _op, _commit_lsn, _lsn, _op_seq, _xid and _ts are the log''s own fields';
+    IF col_name IN ('_op', '_commit_lsn', '_lsn', '_op_seq', '_xid', '_ts', '_dt') THEN
+        RAISE EXCEPTION 'paimon_slot: column name "%" is a metadata field of the history table every replicated table has', col_name
+              USING HINT = 'choose a different column name; _op, _commit_lsn, _lsn, _op_seq, _xid, _ts and _dt are the history table''s own fields';
     END IF;
 END $$;
 
 /* The history table of a table registered as `name`. One place, so every check agrees. */
 CREATE FUNCTION paimon.hist_name(name text) RETURNS text
 LANGUAGE sql IMMUTABLE AS $$ SELECT name || '_hist' $$;
+
+/*
+ * Whether `candidate` is one of the Paimon tables of the history `hist` (= T_hist): the current
+ * one, or an archive the writer made at a DDL rotation, T_hist_<16 upper-case hex digits of the
+ * DDL message's LSN>.
+ */
+CREATE FUNCTION paimon.is_history_of(candidate text, hist text) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT candidate = hist
+        OR (length(candidate) = length(hist) + 17
+            AND left(candidate, length(hist) + 1) = hist || '_'
+            AND right(candidate, 16) ~ '^[0-9A-F]{16}$')
+$$;
+
+/*
+ * The bucket count of a history table, PER DAILY PARTITION (a fixed-bucket Paimon table has that
+ * many buckets in every partition): clamp(1, ceil(bytes_per_day / 1 GiB), 64). The target of
+ * 1 GiB of history per bucket per day, and the minimum of 1, are deliberate: measured on Paimon
+ * 1.4.1, live files after the writer's own compaction are about four per bucket per partition, so
+ * a table's file count grows as buckets x days, and the single-threaded writer gains nothing from
+ * more buckets. The ceiling matches paimon.default_buckets(). The writer applies the same formula
+ * (HistBuckets) when it re-sizes a history table at a DDL rotation; keep the two in step.
+ */
+CREATE FUNCTION paimon.hist_buckets_for(bytes_per_day numeric) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT greatest(1, least(64, ceil(coalesce(bytes_per_day, 0) / (1024::numeric * 1024 * 1024))::int))
+$$;
+
+/*
+ * Expected history bytes per day: every INSERT and DELETE is one history row and every UPDATE two
+ * (its -U and +U), each carrying the whole row.
+ */
+CREATE FUNCTION paimon.hist_bytes_per_day(n_ins bigint, n_upd bigint, n_del bigint,
+                                          days numeric, row_bytes numeric) RETURNS numeric
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT (n_ins + 2 * n_upd + n_del) / days * row_bytes
+$$;
+
+/*
+ * add_table()'s estimate of the history's daily volume, from pg_stat_user_tables since the
+ * database's statistics were last reset, and the table's average row width
+ * (pg_relation_size / reltuples). Falls back to paimon.default_buckets() -- the main table's
+ * size heuristic -- when there is nothing sound to divide: counters at zero, statistics never
+ * reset or less than a day old, or no row width to measure.
+ */
+CREATE FUNCTION paimon.estimate_hist_buckets(v_relid oid) RETURNS int
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    st    pg_stat_user_tables;
+    since timestamptz;
+    days  numeric;
+    tup   real;
+BEGIN
+    SELECT * INTO st FROM pg_stat_user_tables WHERE relid = v_relid;
+    SELECT stats_reset INTO since FROM pg_stat_database WHERE datname = current_database();
+    SELECT reltuples INTO tup FROM pg_class WHERE oid = v_relid;
+    days := extract(epoch FROM now() - since) / 86400;
+    IF st.relid IS NULL OR since IS NULL OR days < 1 OR tup IS NULL OR tup <= 0
+       OR coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) = 0 THEN
+        RETURN paimon.default_buckets(v_relid);
+    END IF;
+    RETURN paimon.hist_buckets_for(paimon.hist_bytes_per_day(
+        st.n_tup_ins, st.n_tup_upd, st.n_tup_del, days, pg_relation_size(v_relid) / tup::numeric));
+END $$;
 
 /*
  * add_table() writes two Paimon tables, <schema>.T and <schema>.T_hist, and neither may be
@@ -847,28 +925,29 @@ DECLARE
     kept  paimon.retained_history;
 BEGIN
     SELECT table_name INTO other FROM paimon.table_registry
-     WHERE schema_name = v_schema AND table_name = paimon.hist_name(v_table);
+     WHERE schema_name = v_schema AND paimon.is_history_of(table_name, paimon.hist_name(v_table));
     IF FOUND THEN
         RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: its history table %.% would be the replicated table %.%',
-                        v_schema, v_table, v_schema, paimon.hist_name(v_table), v_schema, other
-              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema; rename one of the two tables before paimon.add_table()';
+                        v_schema, v_table, v_schema, other, v_schema, other
+              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema, archived as T_hist_<lsn> at each DDL; rename one of the two tables before paimon.add_table()';
     END IF;
     SELECT table_name INTO other FROM paimon.table_registry
-     WHERE schema_name = v_schema AND hist_table = v_table;
+     WHERE schema_name = v_schema AND paimon.is_history_of(v_table, hist_table);
     IF FOUND THEN
-        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: that name is the history table of replicated table %.%',
+        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: that name is a history table of replicated table %.%',
                         v_schema, v_table, v_schema, other
-              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema; rename the table before paimon.add_table()';
+              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema, archived as T_hist_<lsn> at each DDL; rename the table before paimon.add_table()';
     END IF;
     SELECT * INTO kept FROM paimon.retained_history
-     WHERE schema_name = v_schema AND hist_table IN (v_table, paimon.hist_name(v_table))
+     WHERE schema_name = v_schema
+       AND (paimon.is_history_of(v_table, hist_table) OR hist_table = paimon.hist_name(v_table))
      ORDER BY retained_at LIMIT 1;
     IF FOUND THEN
         RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: Paimon table %.% is the retained history of %.%, which stopped being replicated by %',
                         v_schema, v_table, kept.schema_name, kept.hist_table, kept.schema_name,
                         kept.table_name, kept.reason
-              USING HINT = format('a history table is kept as the audit trail when its table is dropped or removed, and a new registration must not append to it. Rename or drop the Paimon table %s.%s by hand (from Spark or Flink, or move its directory), then run SELECT paimon.forget_history(%L, %L); and add the table again',
-                                  kept.schema_name, kept.hist_table, kept.schema_name, kept.hist_table);
+              USING HINT = format('a history table and its archives (%s_<lsn>) are kept as the audit trail when their table is dropped or removed, and a new registration must not append to them. Rename or drop the Paimon table %s.%s and its archives by hand (from Spark or Flink, or move their directories), then run SELECT paimon.forget_history(%L, %L); and add the table again',
+                                  kept.hist_table, kept.schema_name, kept.hist_table, kept.schema_name, kept.hist_table);
     END IF;
 END $$;
 
@@ -1024,7 +1103,7 @@ BEGIN
                       USING HINT = 'add the column without a default, then UPDATE it';
             END IF;
 
-            PERFORM paimon.reject_reserved_name(c->>'name', cardinality(reg.pk_cols) = 0);
+            PERFORM paimon.reject_reserved_name(c->>'name');
 
             IF (c->>'type') LIKE '% NOT NULL' THEN
                 RAISE EXCEPTION
@@ -1033,7 +1112,7 @@ BEGIN
             END IF;
         ELSE
             IF (o->>'name') <> (c->>'name') THEN
-                PERFORM paimon.reject_reserved_name(c->>'name', cardinality(reg.pk_cols) = 0);
+                PERFORM paimon.reject_reserved_name(c->>'name');
             END IF;
 
             /*
@@ -1388,12 +1467,13 @@ BEGIN
             RETURN NEXT format('registry row for %I.%I names history table %L, not %L', r.schema_name, r.table_name, r.hist_table, paimon.hist_name(r.table_name));
         END IF;
         IF EXISTS (SELECT 1 FROM paimon.table_registry o
-                    WHERE o.schema_name = r.schema_name AND o.hist_table = r.table_name) THEN
+                    WHERE o.schema_name = r.schema_name AND o.relid <> r.relid
+                      AND paimon.is_history_of(r.table_name, o.hist_table)) THEN
             RETURN NEXT format('replicated table %I.%I has the name of another replicated table''s history table: both would write one Paimon table', r.schema_name, r.table_name);
         END IF;
         IF EXISTS (SELECT 1 FROM paimon.retained_history h
                     WHERE h.schema_name = r.schema_name
-                      AND h.hist_table IN (r.table_name, r.hist_table)) THEN
+                      AND (paimon.is_history_of(r.table_name, h.hist_table) OR h.hist_table = r.hist_table)) THEN
             RETURN NEXT format('replicated table %I.%I writes a Paimon table that paimon.retained_history records as the retained history of a table no longer replicated', r.schema_name, r.table_name);
         END IF;
     END LOOP;
