@@ -72,8 +72,11 @@ import java.util.TreeMap;
  * {@code -D}. {@link #checkHistory} asserts it holds exactly the changes PostgreSQL made: its
  * +I/-U/+U/-D counts equal the changelog's (TPC-C never moves a key), every -U is followed by its
  * +U, every image is complete, every row sits in its commit's UTC date, no change is in it twice,
- * and -- the strongest form -- replaying it from empty, in commit order, rebuilds exactly
- * PostgreSQL's final table.
+ * every {@code _ts} and {@code _xid} lies inside the run (bounds {@code run_tpcc.sh} takes before
+ * the writer starts and after it drains) and is one value per transaction, every {@code -U} and
+ * {@code -D} carries exactly the row as the replay holds it (the before-image), and -- the
+ * strongest form -- replaying it from empty, in commit order, rebuilds exactly PostgreSQL's final
+ * table. TpccCompareSelfTest proves each of these fails on a tampered history.
  *
  * <p><b>The changelog, not only the merged state.</b> A merged read reports {@code INSERT} for
  * every surviving row — it physically cannot report a row kind — so the row kinds come from the
@@ -112,7 +115,9 @@ import java.util.TreeMap;
  * {@code TPCC_TABLES} (comma-separated override of the table list), {@code TPCC_MAX_DIFFS}
  * (differing rows reported per table, default 10), {@code TPCC_META_FIELDS} (comma-separated
  * writer metadata columns to expect in Paimon and exclude from the comparison, default
- * {@code _seq,_op_seq,_xid}).
+ * {@code _seq,_op_seq,_xid}), {@code TPCC_TS_MIN}/{@code TPCC_TS_MAX} (the run's commit-time
+ * window, microseconds since the epoch) and {@code TPCC_XID_MIN}/{@code TPCC_XID_MAX} (its 32-bit
+ * transaction ids); without the four the history checks fail rather than pass unchecked.
  */
 public final class TpccCompare {
 
@@ -202,6 +207,7 @@ public final class TpccCompare {
         String[] metaFields = env("TPCC_META_FIELDS", String.join(",", DEFAULT_META_FIELDS))
             .split(",");
         int maxDiffs = Integer.parseInt(env("TPCC_MAX_DIFFS", "10"));
+        bounds = Bounds.fromEnv();
 
         System.out.println("TPC-C state comparison: PostgreSQL vs Paimon");
         System.out.println("  warehouse   : " + warehouse);
@@ -210,6 +216,9 @@ public final class TpccCompare {
             + "  (Paimon database; tables at <warehouse>/" + pgSchema + ".db/<table>)");
         System.out.println("  tables      : " + String.join(", ", tables));
         System.out.println("  meta fields : " + String.join(", ", metaFields) + " (excluded)");
+        System.out.println("  run window  : " + (bounds == null ? "NOT GIVEN (fails the history checks)"
+            : "_ts in [" + bounds.tsMin() + ", " + bounds.tsMax() + "] us, _xid in ["
+              + bounds.xidMin() + ", " + bounds.xidMax() + "]"));
         System.out.println();
 
         List<TableResult> results = new ArrayList<>();
@@ -537,11 +546,83 @@ public final class TpccCompare {
             System.out.println("  FAIL: no history table " + histName);
             return null;
         }
+        // PostgreSQL's rows, canonicalised as the history's images are.
+        List<String[]> pgRows = new ArrayList<>();
+        StringBuilder sql = new StringBuilder("SELECT ");
+        for (int i = 0; i < pgCols.size(); i++) {
+            sql.append(i > 0 ? ", " : "").append(quote(pgCols.get(i)));
+        }
+        sql.append(" FROM ").append(quote(pgSchema)).append('.').append(quote(table));
+        try (PreparedStatement st = pg.prepareStatement(sql.toString())) {
+            st.setFetchSize(10_000);
+            try (ResultSet rs = st.executeQuery()) {
+                while (rs.next()) {
+                    String[] vals = new String[pgCols.size()];
+                    for (int i = 0; i < vals.length; i++) {
+                        vals[i] = pgValue(rs, i + 1, types[i]);
+                    }
+                    pgRows.add(vals);
+                }
+            }
+        }
+        long[] counts = verifyHistory(rows, pgRows, pgCols, pkPos, notNull, bounds, maxDiffs,
+                                      failures);
+        counts[H_TABLES] = generations.size();
+        return counts;
+    }
+
+    /**
+     * The window the history's metadata must fall in: the commit times ({@code _ts}, microseconds
+     * since the Unix epoch) and transaction ids ({@code _xid}, 32-bit as pgoutput sends them) of
+     * the run, taken by {@code run_tpcc.sh} before the writer starts and after it has drained
+     * ({@code TPCC_TS_MIN}, {@code TPCC_TS_MAX}, {@code TPCC_XID_MIN}, {@code TPCC_XID_MAX}).
+     * Without them a history whose every {@code _ts} was a day late, or whose every {@code _xid}
+     * was 0, passed (review of the history tables, finding I1).
+     */
+    record Bounds(long tsMin, long tsMax, long xidMin, long xidMax) {
+        static Bounds fromEnv() {
+            String a = env("TPCC_TS_MIN", ""), b = env("TPCC_TS_MAX", ""),
+                   c = env("TPCC_XID_MIN", ""), d = env("TPCC_XID_MAX", "");
+            if (a.isEmpty() || b.isEmpty() || c.isEmpty() || d.isEmpty()) {
+                return null;
+            }
+            return new Bounds(Long.parseLong(a.trim()), Long.parseLong(b.trim()),
+                              Long.parseLong(c.trim()) & 0xFFFFFFFFL,
+                              Long.parseLong(d.trim()) & 0xFFFFFFFFL);
+        }
+
+        boolean tsOk(long micros) {
+            return micros >= tsMin && micros <= tsMax;
+        }
+
+        /** 32-bit transaction ids, allowing for one wraparound between the two ends. */
+        boolean xidOk(long xid) {
+            long x = xid & 0xFFFFFFFFL;
+            if (x != xid || x < 3) {
+                return false;      // not a 32-bit xid, or a special one (0 invalid, 1-2 frozen)
+            }
+            return xidMin <= xidMax ? x >= xidMin && x <= xidMax : x >= xidMin || x <= xidMax;
+        }
+    }
+
+    /** Set by {@link #main} from the environment; null when not given (which fails the run). */
+    static Bounds bounds;
+
+    /**
+     * The checks of {@link #checkHistory} on rows already read: pure, so that the comparator can
+     * be tested against tampered histories without a warehouse (TpccCompareSelfTest).
+     */
+    static long[] verifyHistory(List<HistRow> unsorted, List<String[]> pgRows, List<String> pgCols,
+                                int[] pkPos, Set<String> notNull, Bounds window, int maxDiffs,
+                                List<String> failures) {
+        List<HistRow> rows = new ArrayList<>(unsorted);
         rows.sort((x, y) -> x.commitLsn() != y.commitLsn()
             ? Long.compare(x.commitLsn(), y.commitLsn()) : Integer.compare(x.opSeq(), y.opSeq()));
         long[] counts = new long[8];
         Set<String> seen = new java.util.HashSet<>();
-        long dupes = 0, badImages = 0, unpaired = 0, badDates = 0;
+        long dupes = 0, badImages = 0, unpaired = 0, badDates = 0, badTs = 0, badXid = 0,
+             splitTxn = 0;
+        Map<Long, long[]> perCommit = new HashMap<>();     // commit LSN -> {xid, ts}
         for (int i = 0; i < rows.size(); i++) {
             HistRow r = rows.get(i);
             switch (r.op()) {
@@ -577,12 +658,28 @@ public final class TpccCompare {
             if (r.dt() != Math.floorDiv(r.tsMicros(), 86_400_000_000L)) {
                 badDates++;
             }
+            // _ts and _xid: inside the run's window, and one value per transaction.
+            if (window != null && !window.tsOk(r.tsMicros()) && badTs++ < maxDiffs) {
+                System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn() + "/"
+                    + r.opSeq() + " has _ts " + r.tsMicros() + " outside the run ["
+                    + window.tsMin() + ", " + window.tsMax() + "]");
+            }
+            // An R row (initial load) is made by no transaction: its _xid is 0 by design.
+            boolean xidOk = "R".equals(r.op()) ? r.xid() == 0 : window == null || window.xidOk(r.xid());
+            if (window != null && !xidOk && badXid++ < maxDiffs) {
+                System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn() + "/"
+                    + r.opSeq() + " has _xid " + r.xid() + " outside the run ["
+                    + window.xidMin() + ", " + window.xidMax() + "]");
+            }
+            long[] first = perCommit.putIfAbsent(r.commitLsn(), new long[] {r.xid(), r.tsMicros()});
+            if (first != null && (first[0] != r.xid() || first[1] != r.tsMicros())) {
+                splitTxn++;
+            }
         }
         counts[H_ROWS] = rows.size();
-        counts[H_TABLES] = generations.size();
-        System.out.printf("  history     : +I %d, -U %d, +U %d, -D %d, T %d, R %d  (%d rows in %d table(s))%n",
+        System.out.printf("  history     : +I %d, -U %d, +U %d, -D %d, T %d, R %d  (%d rows)%n",
                           counts[H_PI], counts[H_MU], counts[H_PU], counts[H_MD], counts[H_T],
-                          counts[H_R], counts[H_ROWS], counts[H_TABLES]);
+                          counts[H_R], counts[H_ROWS]);
         if (dupes > 0) {
             failures.add("history holds " + dupes + " row(s) twice (same commit LSN and op_seq)");
             System.out.println("  FAIL: " + dupes + " duplicated history rows");
@@ -599,11 +696,32 @@ public final class TpccCompare {
             failures.add(badDates + " history row(s) whose _dt is not the UTC date of _ts");
             System.out.println("  FAIL: " + badDates + " rows in the wrong _dt partition");
         }
+        if (window == null) {
+            failures.add("no run window given (TPCC_TS_MIN, TPCC_TS_MAX, TPCC_XID_MIN,"
+                + " TPCC_XID_MAX), so _ts and _xid were not checked");
+            System.out.println("  FAIL: _ts and _xid not checked: no run window in the environment");
+        }
+        if (badTs > 0) {
+            failures.add(badTs + " history row(s) whose _ts is outside the run's commit times");
+            System.out.println("  FAIL: " + badTs + " rows with a _ts outside the run");
+        }
+        if (badXid > 0) {
+            failures.add(badXid + " history row(s) whose _xid is outside the run's transactions");
+            System.out.println("  FAIL: " + badXid + " rows with an _xid outside the run");
+        }
+        if (splitTxn > 0) {
+            failures.add(splitTxn + " history row(s) whose _xid or _ts differs from another row of"
+                + " the same commit");
+            System.out.println("  FAIL: " + splitTxn + " rows disagree with their commit's _xid/_ts");
+        }
 
-        // Replay from empty, in commit order, and compare with PostgreSQL row for row.
+        // Replay from empty, in commit order, and compare with PostgreSQL row for row. A -U or -D
+        // must carry exactly the image the replay holds for its key: the before-image is the
+        // reason this layout exists, and a writer that put the after-image there passed when only
+        // the key was checked (review finding I1).
         Map<String, Long> multiset = new HashMap<>();
         Map<String, String> byKey = new HashMap<>();
-        long replayErrors = 0;
+        long replayErrors = 0, wrongBefore = 0;
         for (HistRow r : rows) {
             if ("T".equals(r.op())) {
                 multiset.clear();
@@ -618,8 +736,15 @@ public final class TpccCompare {
                     if (byKey.put(k, img) != null) {
                         replayErrors++;    // an insert of a key the history already had
                     }
-                } else if (byKey.remove(k) == null) {
-                    replayErrors++;        // an update or delete of a key the history never had
+                } else {
+                    String held = byKey.remove(k);
+                    if (held == null) {
+                        replayErrors++;    // an update or delete of a key the history never had
+                    } else if (!held.equals(img) && wrongBefore++ < maxDiffs) {
+                        System.out.println("  DIFF history " + r.op() + " at " + r.commitLsn()
+                            + "/" + r.opSeq() + " carries " + render(pgCols, r.image())
+                            + " but the row was " + render(pgCols, held.split(String.valueOf(SEP), -1)));
+                    }
                 }
             } else if (adds) {
                 multiset.merge(img, 1L, Long::sum);
@@ -632,46 +757,36 @@ public final class TpccCompare {
                 + " not hold, or inserts of keys it already held");
             System.out.println("  FAIL: " + replayErrors + " inconsistent history changes");
         }
-        long missing = 0, differ = 0, reported = 0;
-        StringBuilder sql = new StringBuilder("SELECT ");
-        for (int i = 0; i < pgCols.size(); i++) {
-            sql.append(i > 0 ? ", " : "").append(quote(pgCols.get(i)));
+        if (wrongBefore > 0) {
+            failures.add(wrongBefore + " -U/-D row(s) whose before-image is not the row as it was");
+            System.out.println("  FAIL: " + wrongBefore + " wrong before-images");
         }
-        sql.append(" FROM ").append(quote(pgSchema)).append('.').append(quote(table));
-        try (PreparedStatement st = pg.prepareStatement(sql.toString())) {
-            st.setFetchSize(10_000);
-            try (ResultSet rs = st.executeQuery()) {
-                while (rs.next()) {
-                    String[] vals = new String[pgCols.size()];
-                    for (int i = 0; i < vals.length; i++) {
-                        vals[i] = pgValue(rs, i + 1, types[i]);
+        long missing = 0, differ = 0, reported = 0;
+        for (String[] vals : pgRows) {
+            String row = String.join(String.valueOf(SEP), vals);
+            if (pkPos != null) {
+                String got = byKey.remove(key(vals, pkPos));
+                if (got == null) {
+                    missing++;
+                } else if (!got.equals(row)) {
+                    differ++;
+                    if (reported++ < maxDiffs) {
+                        System.out.println("  DIFF history replay differs at key "
+                            + show(key(vals, pkPos)) + ": history "
+                            + render(pgCols, got.split(String.valueOf(SEP), -1))
+                            + "; postgres " + render(pgCols, vals));
                     }
-                    String row = String.join(String.valueOf(SEP), vals);
-                    if (pkPos != null) {
-                        String got = byKey.remove(key(vals, pkPos));
-                        if (got == null) {
-                            missing++;
-                        } else if (!got.equals(row)) {
-                            differ++;
-                            if (reported++ < maxDiffs) {
-                                System.out.println("  DIFF history replay differs at key "
-                                    + show(key(vals, pkPos)) + ": history "
-                                    + render(pgCols, got.split(String.valueOf(SEP), -1))
-                                    + "; postgres " + render(pgCols, vals));
-                            }
-                        }
-                    } else {
-                        Long n = multiset.get(row);
-                        if (n == null || n <= 0) {
-                            missing++;
-                            if (reported++ < maxDiffs) {
-                                System.out.println("  DIFF a PostgreSQL row the history does not"
-                                    + " produce (or produces fewer times): " + render(pgCols, vals));
-                            }
-                        } else {
-                            multiset.put(row, n - 1);
-                        }
+                }
+            } else {
+                Long n = multiset.get(row);
+                if (n == null || n <= 0) {
+                    missing++;
+                    if (reported++ < maxDiffs) {
+                        System.out.println("  DIFF a PostgreSQL row the history does not"
+                            + " produce (or produces fewer times): " + render(pgCols, vals));
                     }
+                } else {
+                    multiset.put(row, n - 1);
                 }
             }
         }
@@ -818,8 +933,10 @@ public final class TpccCompare {
                         vals[i] = paimonValue(r, i, types[i]);
                     }
                     String k = r.getLong(base + 1) + "/" + r.getInt(base + 3);
+                    // _xid and _ts too: the log row and its history rows are one change.
                     if (logRows.put(k, r.getString(base).toString() + SEP
-                            + String.join(String.valueOf(SEP), vals)) != null) {
+                            + String.join(String.valueOf(SEP), vals) + SEP + r.getLong(base + 4)
+                            + SEP + r.getTimestamp(base + 5, 6).toMicros()) != null) {
                         logDupes++;
                     }
                 }
@@ -860,7 +977,8 @@ public final class TpccCompare {
                     vals = new String[pgCols.size()];
                     Arrays.fill(vals, NULL);
                 }
-                String expect = logOp + SEP + String.join(String.valueOf(SEP), vals);
+                String expect = logOp + SEP + String.join(String.valueOf(SEP), vals) + SEP
+                    + h.xid() + SEP + h.tsMicros();
                 String got = logRows.remove(h.commitLsn() + "/" + h.opSeq());
                 if (!expect.equals(got) && logMismatch++ < maxDiffs) {
                     System.out.println("  DIFF log row " + h.commitLsn() + "/" + h.opSeq()

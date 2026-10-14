@@ -33,7 +33,7 @@ NOT_RUN=""                          # checks a suite will skip: reported next to
 # C++ implementation it exercised; naming a suite that does not exist fails the run, by design.)
 ALL_SUITES=(SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
             PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
-            PaimonAdversarialTest PaimonHistoryTest)
+            PaimonAdversarialTest PaimonHistoryTest TpccCompareSelfTest)
 LAUNCHER="$RUN/start_writer.sh"
 PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER

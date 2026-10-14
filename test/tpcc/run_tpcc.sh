@@ -357,7 +357,12 @@ main() {
   say "registering the nine TPC-C tables"
   psql_q -f "$HERE/setup.sql" || die "setup.sql failed"
 
-  # 3. The writer creates the slot and starts streaming.
+  # 3. The writer creates the slot and starts streaming. The run window opens here: every commit
+  #    the history records happens after this instant and in a transaction after this xid
+  #    (TpccCompare checks every _ts and _xid against it).
+  TPCC_TS_MIN="$(psql_q -c "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")"
+  TPCC_XID_MIN="$(psql_q -c "SELECT pg_current_xact_id()::text::bigint % 4294967296")"
+  export TPCC_TS_MIN TPCC_XID_MIN
   start_writer
 
   # 4. The bulk load, through the slot.
@@ -369,6 +374,11 @@ main() {
   # 6. Let the writer finish, then stop it cleanly, so the comparison reads a settled warehouse.
   drain_writer
   stop_writer || die "the writer had to be killed; the warehouse may be mid-commit"
+  # ... and closes here, after the last commit the writer replicated.
+  TPCC_TS_MAX="$(psql_q -c "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")"
+  TPCC_XID_MAX="$(psql_q -c "SELECT pg_current_xact_id()::text::bigint % 4294967296")"
+  export TPCC_TS_MAX TPCC_XID_MAX
+  say "run window: _ts in [$TPCC_TS_MIN, $TPCC_TS_MAX] us, _xid in [$TPCC_XID_MIN, $TPCC_XID_MAX]"
 
   # 7. The verdict.
   local rc=0
