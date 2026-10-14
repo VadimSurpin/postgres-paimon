@@ -452,6 +452,21 @@ ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2;                                
 ALTER TABLE vg_t RENAME CONSTRAINT paimon_guard_3 TO mine;                      -- expect ERROR
 ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_4,
   ADD CONSTRAINT paimon_guard_4 CHECK (true);                                   -- expect ERROR
+-- ... nor by the very same expression declared NOT ENFORCED (PostgreSQL 18), which checks nothing
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;       -- expect ERROR
+INSERT INTO vg_t (id, n) VALUES (12, 'NaN');                                    -- expect ERROR
+-- ... and health() does not take one for a guard either (made with the trigger off)
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+SELECT * FROM paimon.health();
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric);
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+SELECT * FROM paimon.health();
 -- a column added later gets its guard, NOT VALID: the column is NULL in every existing row
 ALTER TABLE vg_t ADD COLUMN n2 numeric(5,1), ADD COLUMN ts2 timestamptz, ADD COLUMN i2 int;
 SELECT conname, convalidated FROM pg_constraint
@@ -467,8 +482,23 @@ SELECT count(*) FROM pg_constraint WHERE conrelid = 'vg_bad'::regclass AND conty
 -- a same-named constraint that is not the guard refuses add_table rather than pass for one
 CREATE TABLE vg_named (id int PRIMARY KEY, n numeric(5,2) CONSTRAINT paimon_guard_2 CHECK (n > 0));
 SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
--- remove_table drops the guards (and only them), after which they are ordinary DDL again
+-- ... and so does one with the guard's very expression, NOT ENFORCED or NOT VALID (neither checked
+-- the rows already there), or one on a column that needs no guard at all
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;
+INSERT INTO vg_named VALUES (1, 'NaN');
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT VALID;
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_1 CHECK (id > 0);
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'vg_named';
+-- remove_table drops the guards (and only them), after which they are ordinary DDL again; a
+-- user's constraint merely NAMED like a guard (on a column that needs none) stays
 ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
+ALTER TABLE vg_t ADD CONSTRAINT paimon_guard_6 CHECK (t <> 'forbidden');
 SELECT paimon.peek_messages() - 'relid';
 SELECT paimon.remove_table('vg_t'::regclass);
 SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c';

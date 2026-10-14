@@ -891,13 +891,21 @@ ERROR:  new row for relation "v" violates check constraint "paimon_guard_2"
 
 The guard cannot be dropped, renamed, or replaced by a same-named constraint while the table is
 replicated (`constraint "paimon_guard_2" on public.v is the value guard of column "amt" and must stay
-while the table is replicated`); `remove_table()` drops the guards. `add_table()` validates them
+while the table is replicated`), and that includes the very same expression declared `NOT ENFORCED`
+(PostgreSQL 18), which checks nothing: a guard is recognised by name, expression *and*
+`conenforced`, by the trigger and by `health()` alike. Before, `DROP CONSTRAINT paimon_guard_2, ADD
+CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED` passed, `health()` was clean, and
+the next NaN stopped the writer (measured). `remove_table()` drops the guards, recognised the same
+way, and leaves a user's own constraint that is merely named like one. `add_table()` validates them
 against the rows already there (one scan, under the lock it holds anyway; a table registered empty
 costs nothing), so a value already present is reported at registration rather than poisoning the
 initial load. A guard added later to a live table is `NOT VALID`: it checks every new and updated row
 — everything the stream will carry — and skips the scan, because an added column is NULL in every
-existing row and a retyped one only arrives from a type that could not hold the value either. A
-constraint already called `paimon_guard_<n>` refuses `add_table()` rather than passing for a guard.
+existing row and a retyped one only arrives from a type that could not hold the value either. **Any**
+constraint already called `paimon_guard_<n>` refuses `add_table()`, whatever it checks: one with the
+guard's own expression may be `NOT VALID` (it never checked the rows the initial load will carry) or
+`NOT ENFORCED` (it checks nothing), and one on a column that needs no guard would later be taken for
+one. The extension's guards are only ever the ones it added.
 Consequence: `ALTER COLUMN amt TYPE text` on a guarded column fails in PostgreSQL itself (`operator
 does not exist: text <> numeric`), which the type-change rule below would refuse anyway.
 

@@ -407,8 +407,11 @@ CREATE FUNCTION paimon.guard_name(v_attnum int) RETURNS name
 LANGUAGE sql IMMUTABLE
     SET search_path = pg_catalog, pg_temp AS $$ SELECT ('paimon_guard_' || v_attnum)::name $$;
 
-/* Whether the column's guard is in place, by name AND by expression: a same-named
- * CHECK (true) is not a guard. */
+/* Whether the column's guard is in place: by name, by expression, and ENFORCED. A same-named
+ * CHECK (true) is not a guard, and neither is the right expression declared NOT ENFORCED
+ * (PostgreSQL 18), which checks nothing: measured, DROP CONSTRAINT paimon_guard_2, ADD CONSTRAINT
+ * paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED passed for the guard, health() was
+ * clean, and the next NaN stopped the writer. */
 CREATE FUNCTION paimon.guard_present(v_relid oid, v_attnum int) RETURNS boolean
 LANGUAGE plpgsql STABLE
     SET search_path = pg_catalog, pg_temp AS $$
@@ -421,6 +424,7 @@ BEGIN
     RETURN EXISTS (SELECT 1 FROM pg_constraint
                     WHERE conrelid = v_relid AND contype = 'c'
                       AND conname = paimon.guard_name(v_attnum)
+                      AND conenforced
                       AND pg_get_expr(conbin, conrelid) = want);
 END $$;
 
@@ -428,6 +432,12 @@ END $$;
  * Adds the guards the given columns need and do not have yet, in ONE ALTER TABLE: that
  * statement fires the event triggers in turn, and sync_table must find every guard of the
  * table in place when it does.
+ *
+ * validate => true (add_table) first refuses ANY constraint already named like a guard
+ * (paimon_guard_<n>), whatever it checks: one that merely matches the expression may be
+ * NOT VALID (it never checked the rows already there, which the initial load would then carry)
+ * or NOT ENFORCED (it checks nothing), and one on a column that needs no guard would be dropped
+ * by remove_table() as if it were ours. The extension's guards are only ever its own.
  *
  * validate => true (add_table) checks the rows already in the table, once, under the lock
  * add_table holds anyway, and turns a violation into an error naming the problem: a value
@@ -446,6 +456,17 @@ DECLARE
     clauses text[] := '{}';
     exprs   text[] := '{}';
 BEGIN
+    IF validate THEN
+        PERFORM FROM pg_constraint
+          WHERE conrelid = v_relid AND conname ~ '^paimon_guard_[0-9]+$';
+        IF FOUND THEN
+            RAISE EXCEPTION 'paimon_slot: constraint name "%" on % is reserved for paimon_slot',
+                            (SELECT conname FROM pg_constraint
+                              WHERE conrelid = v_relid AND conname ~ '^paimon_guard_[0-9]+$'
+                              ORDER BY conname LIMIT 1), v_relid::regclass
+                  USING HINT = 'paimon_slot names the value guard of a column paimon_guard_<attnum> and adds every one itself; rename or drop that constraint first';
+        END IF;
+    END IF;
     FOREACH n IN ARRAY attnums
     LOOP
         CONTINUE WHEN paimon.guard_expr(v_relid, n) IS NULL OR paimon.guard_present(v_relid, n);
@@ -790,8 +811,13 @@ BEGIN
     DELETE FROM paimon.table_registry WHERE relid = rel::oid;
     EXECUTE format('ALTER PUBLICATION paimon_pub DROP TABLE %s', rel::text);
     -- The table is no longer replicated, so its value guards no longer have a reason.
+    -- Only the guards themselves: name AND expression, as guard_present() recognises them. A
+    -- user's own constraint that happens to be called paimon_guard_<n> (possible on a column that
+    -- needs no guard, which nothing checks once the table is registered) is the user's.
     FOR g IN SELECT conname FROM pg_constraint
               WHERE conrelid = rel::oid AND contype = 'c' AND conname ~ '^paimon_guard_[0-9]+$'
+                AND pg_get_expr(conbin, conrelid)
+                    = paimon.guard_expr(rel::oid, substring(conname from 14)::int)
     LOOP
         EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', rel::text, g);
     END LOOP;

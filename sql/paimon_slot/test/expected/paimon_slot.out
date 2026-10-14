@@ -1346,6 +1346,34 @@ ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_4,
   ADD CONSTRAINT paimon_guard_4 CHECK (true);                                   -- expect ERROR
 ERROR:  paimon_slot: constraint "paimon_guard_4" on public.vg_t is the value guard of column "tz" and must stay while the table is replicated
 HINT:  it keeps values Paimon cannot represent (numeric NaN, a timestamp after 294247-01-10 04:00:54.775807) out of the replication stream, where one would stop replication for good; paimon.remove_table() drops it
+-- ... nor by the very same expression declared NOT ENFORCED (PostgreSQL 18), which checks nothing
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;       -- expect ERROR
+ERROR:  paimon_slot: constraint "paimon_guard_2" on public.vg_t is the value guard of column "n" and must stay while the table is replicated
+HINT:  it keeps values Paimon cannot represent (numeric NaN, a timestamp after 294247-01-10 04:00:54.775807) out of the replication stream, where one would stop replication for good; paimon.remove_table() drops it
+INSERT INTO vg_t (id, n) VALUES (12, 'NaN');                                    -- expect ERROR
+ERROR:  new row for relation "vg_t" violates check constraint "paimon_guard_2"
+DETAIL:  Failing row contains (12, NaN, null, null, null, null, null).
+-- ... and health() does not take one for a guard either (made with the trigger off)
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+SELECT * FROM paimon.health();
+                                    health                                    
+------------------------------------------------------------------------------
+ replicated table public.vg_t has lost value guard paimon_guard_2 on column n
+(1 row)
+
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+ALTER TABLE vg_t DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric);
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+SELECT * FROM paimon.health();
+ health 
+--------
+(0 rows)
+
 -- a column added later gets its guard, NOT VALID: the column is NULL in every existing row
 ALTER TABLE vg_t ADD COLUMN n2 numeric(5,1), ADD COLUMN ts2 timestamptz, ADD COLUMN i2 int;
 SELECT conname, convalidated FROM pg_constraint
@@ -1392,9 +1420,35 @@ SELECT count(*) FROM pg_constraint WHERE conrelid = 'vg_bad'::regclass AND conty
 CREATE TABLE vg_named (id int PRIMARY KEY, n numeric(5,2) CONSTRAINT paimon_guard_2 CHECK (n > 0));
 SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
 ERROR:  paimon_slot: constraint name "paimon_guard_2" on public.vg_named is reserved for paimon_slot
-HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum>; rename or drop that constraint first
--- remove_table drops the guards (and only them), after which they are ordinary DDL again
+HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum> and adds every one itself; rename or drop that constraint first
+-- ... and so does one with the guard's very expression, NOT ENFORCED or NOT VALID (neither checked
+-- the rows already there), or one on a column that needs no guard at all
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT ENFORCED;
+INSERT INTO vg_named VALUES (1, 'NaN');
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ERROR:  paimon_slot: constraint name "paimon_guard_2" on public.vg_named is reserved for paimon_slot
+HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum> and adds every one itself; rename or drop that constraint first
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_2 CHECK (n <> 'NaN'::numeric) NOT VALID;
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ERROR:  paimon_slot: constraint name "paimon_guard_2" on public.vg_named is reserved for paimon_slot
+HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum> and adds every one itself; rename or drop that constraint first
+ALTER TABLE vg_named DROP CONSTRAINT paimon_guard_2,
+  ADD CONSTRAINT paimon_guard_1 CHECK (id > 0);
+SELECT paimon.add_table('vg_named'::regclass);                                  -- expect ERROR
+ERROR:  paimon_slot: constraint name "paimon_guard_1" on public.vg_named is reserved for paimon_slot
+HINT:  paimon_slot names the value guard of a column paimon_guard_<attnum> and adds every one itself; rename or drop that constraint first
+SELECT count(*) FROM paimon.table_registry WHERE table_name = 'vg_named';
+ count 
+-------
+     0
+(1 row)
+
+-- remove_table drops the guards (and only them), after which they are ordinary DDL again; a
+-- user's constraint merely NAMED like a guard (on a column that needs none) stays
 ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
+ALTER TABLE vg_t ADD CONSTRAINT paimon_guard_6 CHECK (t <> 'forbidden');
 SELECT paimon.peek_messages() - 'relid';
  ?column? 
 ----------
@@ -1407,10 +1461,11 @@ SELECT paimon.remove_table('vg_t'::regclass);
 (1 row)
 
 SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c';
-  conname  
------------
+    conname     
+----------------
+ paimon_guard_6
  users_own
-(1 row)
+(2 rows)
 
 INSERT INTO vg_t (id, n) VALUES (11, 'NaN');                         -- allowed: not replicated
 DROP TABLE vg_t, vg_bad, vg_named;
