@@ -93,6 +93,7 @@ public class PaimonAdversarialTest {
         run("A13", PaimonAdversarialTest::a13_insertThenDropTable);
         run("A14", PaimonAdversarialTest::a14_otherPublications);
         run("A17", PaimonAdversarialTest::a17_renameInsideATransaction);
+        run("A18", PaimonAdversarialTest::a18_secondReviewBypasses);
         run("A16", PaimonAdversarialTest::a16_secretRotation);
         run("A15", PaimonAdversarialTest::a15_healthStopsTheWriter);
 
@@ -483,6 +484,41 @@ public class PaimonAdversarialTest {
         }
         writerKeepsUp("A17");
         sameRows("A17 every value written before the rename or drop is where PostgreSQL has it", t, "id");
+    }
+
+    // ── A18: the second review's guardrail bypasses ────────────────────────────────────────
+    // B3: the guard's expression re-declared NOT ENFORCED passed for the guard, and the NaN
+    // after it stopped the writer. B4: ALTER COLUMN ... TYPE ... USING inside a procedure, and a
+    // varchar shrink that trims trailing spaces, both left Paimon with the old values. I3: a
+    // table's own (non-superuser) owner could not ALTER it at all.
+    static void a18_secondReviewBypasses() throws Exception {
+        System.out.println("\n── A18: NOT ENFORCED guard, nested rewrite, varchar, owner DDL ─");
+        String t = "dba_b34";
+        try (Connection c = connect()) {
+            createTracked(c, t, "id int PRIMARY KEY, n numeric(10,2), a int, v varchar(10)");
+            exec(c, "INSERT INTO " + t + " VALUES (1, 1.5, 10, 'ab        ')");
+            refused("A18 the guard re-declared NOT ENFORCED", c,
+                "ALTER TABLE " + t + " DROP CONSTRAINT paimon_guard_2, ADD CONSTRAINT paimon_guard_2"
+                + " CHECK (n <> 'NaN'::numeric) NOT ENFORCED", "must stay while the table is replicated");
+            refused("A18 NaN after that attempt", c,
+                "INSERT INTO " + t + " VALUES (2, 'NaN', 0, '')", "paimon_guard_2");
+            exec(c, "CREATE OR REPLACE PROCEDURE dba_migrate() LANGUAGE plpgsql AS $$ BEGIN"
+                + " ALTER TABLE " + t + " ALTER COLUMN a TYPE bigint USING a * 1000; END $$");
+            refused("A18 ALTER COLUMN TYPE USING inside a procedure", c,
+                "CALL dba_migrate()", "must be run as a top-level statement");
+            exec(c, "DROP PROCEDURE dba_migrate()");
+            refused("A18 a varchar shrink", c,
+                "ALTER TABLE " + t + " ALTER COLUMN v TYPE varchar(2)", "trims the trailing spaces");
+            exec(c, "DROP ROLE IF EXISTS dba_owner");
+            exec(c, "CREATE ROLE dba_owner");
+            exec(c, "ALTER TABLE " + t + " OWNER TO dba_owner");
+            exec(c, "SET ROLE dba_owner");
+            exec(c, "ALTER TABLE " + t + " ADD COLUMN by_owner int");
+            exec(c, "INSERT INTO " + t + " VALUES (3, 2.25, 30, 'x', 7)");
+            exec(c, "RESET ROLE");
+        }
+        writerKeepsUp("A18");
+        sameRows("A18 the owner's ADD COLUMN replicated, every value unchanged", t, "id");
     }
 
     // ── A14: another publication on a replicated table ─────────────────────────────────────
