@@ -84,3 +84,27 @@ main tables are unchanged.
 * Wide tables: `before_*` + `after_*` triples the column count of `T_hist`.
 * Column-count and name-length limits for `before_`/`after_` prefixed names must be guarded (the 63-byte PostgreSQL
   identifier limit does not bind Paimon, but the combined Paimon field name rules do).
+
+## 5. Implementation decisions (2026-10-14)
+
+* **Bucketing (rule 7).** Append tables (`T_hist`, key-less `T`) use the registry's fixed bucket
+  count with `bucket-key = _lsn`. Measured on Paimon 1.4.1, 60 commits of 20 rows: `bucket = -1`
+  (unaware) got no in-writer compaction and held 60 live files; fixed buckets compacted to 16. A
+  user column in `bucket-key` -- the "all columns" option above -- is **not** acceptable: Paimon
+  then refuses `DROP COLUMN` of it ("Field names [...] should contains all bucket keys"), a DDL
+  message the writer could never apply.
+* **Rule 4, collision with a Paimon table SQL cannot see.** `add_table()` cannot read the
+  warehouse. It refuses the collisions it can know (tracked names, and history tables retained by
+  `DROP TABLE`/`remove_table()`, recorded in `paimon.retained_history`; `paimon.forget_history()`
+  releases a name). A `T_hist` that exists in Paimon without this registration's id
+  (`pgpaimon.registration`, from `table_registry.registration`) is refused by the writer, which
+  stops with the remedy; renaming that table and restarting resolves it.
+* **Rule 3, re-adding a dropped column's name.** The kept `before_x`/`after_x` pair is renamed to
+  `before_x_retired_<lsn>`/`after_x_retired_<lsn>` in the same schema change that adds the new pair.
+* **Metadata of `R` rows:** `_commit_lsn = _lsn =` the load's consistent point, `_xid = 0`, `_ts` the
+  time the load began. A history that already holds streamed rows is not overwritten by a reload.
+* **`_op_seq`** of a history row is the `_op_seq` of the change's first changelog record (for an
+  UPDATE, its `-U`), so it increases within a transaction but is not contiguous.
+* Key-less `T`: user columns are all nullable (a `T` row is NULL everywhere).
+* Column counts and names: a 3,206-column append table with 62-character names, and a 300-character
+  field name, were created, written and read on 1.4.1; no guard is needed beyond the existing ones.

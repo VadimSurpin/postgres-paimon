@@ -31,6 +31,10 @@ The C++ `extension/` is untouched and stays on the branch so the two write paths
 one workload. Nothing in the README sections on `paimon_heap` (GUCs, `USING paimon_heap`, staging
 directory, S3/HDFS offload GUCs) applies to the logical-slot architecture.
 
+Every tracked table is written twice: its main Paimon table and its history table `<table>_hist`,
+one row per change, never collapsed; a table with no primary key is replicated as an operation log
+(section 2, "History tables").
+
 Data flow: user DML hits an ordinary heap table. The publication `paimon_pub` feeds replication
 slot `paimon` (pgoutput, text mode). The writer decodes it, batches complete transactions, and
 commits them to Paimon in **batches** of several whole transactions, using the commit LSN of the
@@ -48,7 +52,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 318 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 339 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -95,6 +99,7 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per COPY chunk during the **initial load** only (each chunk is a commit of its own). **Not** the streaming batch size: that is `PGPAIMON_BATCH_MAX_ROWS`. The two do not interact |
 | `PGPAIMON_SKIP_LSN` | unset | break-glass for a single poison record: the change LSN of the ONE record to drop. Every known way to create one is now refused before commit; read section 3, "A record the writer can never apply", before setting it |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
+| `PGPAIMON_TEST_HALT_AFTER_COMMIT` | unset | **test only, never in production**: `<schema>.<table>`; the writer halts (as `kill -9` would) right after its first commit to that Paimon table. Used by the crash tests of history tables (section 2, "History tables") |
 
 `_xid` is off by default because it is optional (spec section 6). The acceptance harness sets
 `PGPAIMON_XID_FIELD=_xid` because test T4 asserts the column exists; do not remove that.
@@ -110,7 +115,7 @@ transaction, gave 1,664 and 12,391). The batch is flushed when **any one** of th
 
 | Limit | Default | Counted |
 |---|---|---|
-| `PGPAIMON_BATCH_MAX_ROWS` | 10,000 | change records buffered (an UPDATE is a `-U` and a `+U`: two) |
+| `PGPAIMON_BATCH_MAX_ROWS` | 10,000 | change records buffered (an UPDATE is a `-U` and a `+U`: two; each change's history row counts too) |
 | `PGPAIMON_BATCH_MAX_BYTES` | 16 MiB | an estimate of the buffered text payload: the character count of every non-NULL value plus 48 bytes per record |
 | `PGPAIMON_BATCH_MAX_INTERVAL_MS` | 2,000 | milliseconds since the batch's **first** transaction was added; later traffic does not postpone it |
 
@@ -332,6 +337,138 @@ are no `s3_*` / `hdfs_*` settings in PostgreSQL.
   ```bash
   E2E_MINIO_BIN=/path/to/minio ./test/slot-acceptance/run_acceptance.sh PaimonOffloadTest
   ```
+
+### History tables (`<table>_hist`) and tables without a primary key
+
+Design: [`docs/superpowers/specs/2026-10-14-operation-history-design.md`](superpowers/specs/2026-10-14-operation-history-design.md).
+
+**Every tracked table `T` has a second Paimon table, `T_hist`**, in the same Paimon database. It is
+append-only (no primary key, no merge engine, no deduplication) and holds **one row per row-level
+change PostgreSQL logged, in commit order, never collapsed**: two updates of one row in one
+transaction, or in one commit batch, are two rows.
+
+| column | type | meaning |
+|---|---|---|
+| `_op` | `STRING NOT NULL` | `I` insert, `U` update, `D` delete, `T` truncate, `R` a row of the initial load |
+| `_commit_lsn` | `BIGINT NOT NULL` | LSN of the transaction's commit record |
+| `_lsn` | `BIGINT NOT NULL` | LSN of the change itself |
+| `_op_seq` | `INT NOT NULL` | ordinal of the change inside its transaction |
+| `_xid` | `BIGINT NOT NULL` | the transaction id (`0` for `R`) |
+| `_ts` | `TIMESTAMP(6) WITH LOCAL TIME ZONE NOT NULL` | the transaction's commit time (for `R`: when the load began) |
+| `before_<col>` ... | the column's type, nullable | the old row: NULL for `I`, `R`, `T` |
+| `after_<col>` ... | the column's type, nullable | the new row: NULL for `D`, `T` |
+
+Order a table's history by `(_commit_lsn, _op_seq)`. An `UPDATE` that moves a primary key is still
+one `U` row (the main table's changelog records it as `-D`/`+I`). Read it with any engine: it is an
+ordinary append table, so a plain batch read returns every row as written.
+
+**A table with no primary key** is accepted by `paimon.add_table()` and replicated as an
+**operation log**: its main Paimon table `T` has no key either, and holds the user columns
+(unprefixed, all nullable) followed by the same six metadata columns, one row per operation: the
+new row for `I` and `U`, the deleted row for `D`, NULLs for `T`. There is no `-U`/`-D` in it and no
+"current state": a reader that wants the state reconstructs it from the log, or from `T_hist`,
+which it also has. Two identical rows in PostgreSQL are two `I` rows; a `DELETE` of both is two `D`
+rows. It still gets `REPLICA IDENTITY FULL`, so `UPDATE`/`DELETE` are legal and the before-image is
+complete, and every guardrail of section 5 applies to it as to any table. A key cannot be added to it
+later (`paimon_slot: cannot change the primary key of public.kl_t`): its Paimon layout is fixed.
+On such a table the log's own field names are reserved as column names:
+
+```
+ERROR:  paimon_slot: column name "_lsn" is a field of the operation log a table without a primary key is replicated as
+HINT:  choose a different column name; _op, _commit_lsn, _lsn, _op_seq, _xid and _ts are the log's own fields
+```
+
+**What happens to each operation:**
+
+| PostgreSQL | primary-key table `T` | key-less table `T` (log) | `T_hist` |
+|---|---|---|---|
+| `INSERT` / `UPDATE` / `DELETE` | changelog `+I` / `-U +U` / `-D`, merged | one `I` / `U` / `D` row | one row, both images |
+| `TRUNCATE` | emptied (overwrite) | **not** erased: one `T` row | one `T` row |
+| initial load | loaded as before | `R` rows | `R` rows |
+| `ADD COLUMN x` | `x` added | `x` added | `before_x`, `after_x` added |
+| `RENAME COLUMN x TO y` | renamed | renamed | both renamed |
+| `ALTER COLUMN x TYPE` | changed | changed | both changed |
+| `DROP COLUMN x` | dropped | dropped | **kept**, NULL from then on |
+| `DROP TABLE` | purged | purged | **kept** as the audit trail |
+| `paimon.remove_table()` | kept | kept | kept |
+
+A dropped column's pair is kept because history is not rewritten. If a column of the same name is
+added later, the kept pair is renamed aside to `before_x_retired_<lsn>` / `after_x_retired_<lsn>`
+(the LSN of the DDL that reused the name) in the same schema change, so the old column's values
+stay apart from the new one's.
+
+**A history table outlives its table, so its name is not free again.** `DROP TABLE` and
+`remove_table()` record the history table in `paimon.retained_history`, and `add_table()` refuses a
+table whose main or history Paimon table would be one, or would be another tracked table's:
+
+```
+ERROR:  paimon_slot: cannot replicate public.col_a: Paimon table public.col_a_hist is the retained history of public.col_a, which stopped being replicated by DROP TABLE
+HINT:  a history table is kept as the audit trail when its table is dropped or removed, and a new registration must not append to it. Rename or drop the Paimon table public.col_a_hist by hand (from Spark or Flink, or move its directory), then run SELECT paimon.forget_history('public', 'col_a_hist'); and add the table again
+```
+
+```
+ERROR:  paimon_slot: cannot replicate public.col_a_hist: that name is the history table of replicated table public.col_a
+ERROR:  paimon_slot: cannot replicate public.col_b: its history table public.col_b_hist would be the replicated table public.col_b_hist
+```
+
+Why refuse rather than append: a history table is an audit trail, and a new table of the same name
+continuing it -- with a gap, and different rows -- is silent corruption of the one thing it exists
+to be. Follow the hint: move the Paimon table aside, then `paimon.forget_history()`. The writer keeps
+a second line of defence that SQL cannot: each history table carries the registration it was made
+for (`pgpaimon.registration`), and the writer refuses to adopt one that belongs to another
+registration, or to none (a table it did not make), stopping with
+
+```
+SEVERE: fatal: java.lang.IllegalStateException: Paimon table Identifier{database='public', object='ddl_drop_table_hist'} exists but is not the history table of this registration of public.ddl_drop_table (it belongs to registration cf0582cc-e16f-4a1c-8650-8554f84c57d4, an earlier table of the same name). A history table is an audit trail and is never continued by a different table. Rename or drop Identifier{...} from a compute engine (or move its directory out of the warehouse), then restart the writer: it creates a new, empty history table. Nothing has been written to it.
+```
+
+That is reached only if `forget_history()` was run without moving the table, or the table was made
+by hand. It is an outage with an exact remedy, never mixing.
+
+**Exactly-once.** `T_hist` is a separate Paimon table with its own commit identifier stream, and
+everything in "Commit batching" applies to it unchanged: each Paimon commit carries the batch's
+last commit LSN, rule 4 drops a transaction's records for `T_hist` when `T_hist` already holds it,
+and the writer resumes from the **minimum** over every table, history tables included. The main and
+history commits of one batch are **not atomic with each other**: a crash between them leaves one
+ahead, and the replay completes the other (verified both ways, acceptance tests H2a/H2b, with the
+test-only hook `PGPAIMON_TEST_HALT_AFTER_COMMIT=<schema>.<table>`, which halts the writer right
+after that table's commit; never set it in production). DDL is applied to `T`, then to `T_hist`,
+each gated by its own `pgpaimon.applied-ddl-lsn`.
+
+**Batching is unchanged.** A history row carries its own `_commit_lsn`, `_lsn` and `_op_seq`, so
+several transactions in one commit lose no ordering, and a batch still never spans DDL or a
+truncate. The row limit (`PGPAIMON_BATCH_MAX_ROWS`) counts history records too, so with the
+default a batch closes after roughly half as many changes as before (an UPDATE of a primary-key
+table is now three records: `-U`, `+U`, one history row).
+
+**Bucketing.** `T_hist` and a key-less `T` use the table's fixed bucket count with
+`bucket-key = _lsn`. Measured on Paimon 1.4.1 (60 commits of 20 rows): an unaware-bucket append
+table (`bucket = -1`) got no compaction from the writer and held 60 live files; a fixed-bucket one
+compacted in the writer and held 16. The bucket key is a metadata column because Paimon refuses
+`DROP COLUMN` of a bucket-key column (`Field names [...] should contains all bucket keys`), which
+with a user column in the key would be a DDL message the writer can never apply.
+
+**Field names.** `before_`/`after_` add seven bytes to a name. PostgreSQL's 63-byte limit does not
+bind Paimon: a 300-character field name and a 68-character table name (`<63 bytes>_hist`) were both
+created and written on 1.4.1. Every user column is prefixed, so none can collide with a metadata
+column, Paimon's reserved names or the `_KEY_` prefix.
+
+**What it costs, and the open risks.**
+
+* **Write volume roughly doubles**, and so does storage: every change is written to `T` and to
+  `T_hist`, and a wide table's `T_hist` has twice its column count plus six.
+* **History grows without bound.** Nothing expires or compacts it away; it is an audit log, and
+  retention is the operator's job (delete old rows from a compute engine, or drop and recreate the
+  table by hand -- and expire snapshots, or the files stay).
+* **`T` and `T_hist` can disagree transiently** after a crash, until the replay has caught up.
+* **Changes made in the same transaction as `DROP TABLE`** do not reach `T_hist`: the table stops
+  being tracked when its `drop_table` message is applied, and the main table's rows for that
+  transaction are dropped for the same reason (section 5).
+* **An interrupted re-bootstrap** leaves its `R` rows in a `T_hist` that already held streamed
+  history (an `R` row's `_commit_lsn` is the load's consistent point, so each attempt is
+  distinguishable). A first load into an empty history is overwritten on retry as before.
+* `_ts` comes from pgoutput's commit timestamp, which is the primary's clock.
+
 
 ## 3. Operational hazards
 
@@ -684,7 +821,10 @@ with `$` (Paimon reads it as a system table), `:` (a URI scheme), `/` (it nests 
 another table's directory; dropping the outer table deleted the inner one's data, measured), or equal
 to `.`/`..`; a schema name with `:` or `/`, or `sys` (Paimon's system database). Column names (also on
 `ADD COLUMN` and `RENAME COLUMN`): Paimon's `_KEY_` prefix, a name with no visible character, and the
-writer's own `_seq`, `_op_seq`, `_xid`. Dots, upper case, non-ASCII and 63-byte names all work.
+writer's own `_seq`, `_op_seq`, `_xid` (and, on a table with no primary key, the operation log's
+`_op`, `_commit_lsn`, `_lsn`, `_ts`). Dots, upper case, non-ASCII and 63-byte names all work. A table
+named like another tracked table's history table, or whose own history table would be another
+tracked table or a retained history table, is refused (section 2, "History tables").
 
 **`ALTER COLUMN ... TYPE`: exact widenings only, and never `USING`.** PostgreSQL rewrites the table
 for a type change and *none of the rewritten rows reach the stream*, so Paimon keeps every old value
@@ -963,14 +1103,20 @@ companion boolean column. Nothing detects the collision.
   (`ERROR:  paimon_slot: p is not an ordinary table (relkind p)`); the design calls for
   `publish_via_partition_root` to be set deliberately before partitioned tables are supported, and v1
   does not do that. Track a partitioned table's leaf tables individually, or not at all.
-* A primary key is **required** (main permits PK-less append-only tables). A PK-less table can
-  stream with `REPLICA IDENTITY FULL`, but then a row is identified only by its full old value, which
-  is not a key, and `deduplicate` has nothing to deduplicate on. Deferred to a follow-up spec.
-* `merge-engine` is fixed at `deduplicate`; `changelog-producer = input`.
+* A table with no primary key is replicated as an append-only **operation log**, not a merged
+  table (section 2, "History tables"): with no key, `deduplicate` would have nothing to deduplicate
+  on, and a row is identified only by its full old value. A key cannot be added to it later.
+* `merge-engine` is fixed at `deduplicate`; `changelog-producer = input` (tables with a primary
+  key). History tables and operation logs are append-only.
+* **Every tracked table also writes `<table>_hist`**, which roughly doubles write volume and storage
+  and **grows without bound**: there is no retention, by design (it is an audit trail), so expiring
+  it is the operator's job. `T_hist` survives `DROP TABLE` and `remove_table()`, and its name stays
+  taken (`paimon.retained_history`) until it is moved aside and `paimon.forget_history()` is run.
 * `VACUUM`, `VACUUM FREEZE` and `CHECKPOINT` emit no logical changes, so they produce no Paimon records.
 * `remove_table()` stops tracking, drops the value guards (`paimon_guard_<n>`), and never deletes Paimon data. `DROP TABLE` of a tracked table
-  *does* drop the Paimon table (this fixes main's `gaps.md` item 3), and dropping a column drops it
-  from the Paimon schema too (item 1).
+  *does* drop the main Paimon table (this fixes main's `gaps.md` item 3) and keeps its history table,
+  and dropping a column drops it from the main table's schema too (item 1) and keeps it in the
+  history.
 * Binary-mode pgoutput decoding is not implemented; text mode is exact for the supported types.
 * There is no integrated "offload" step (section 2): the warehouse simply is `s3://` or `hdfs://`.
   The old end-to-end suite for the C++ implementation (`PaimonE2ETest`, PostgreSQL to Paimon to Spark
@@ -981,14 +1127,16 @@ companion boolean column. Nothing detects the collision.
 
 The exact text of the errors a user can actually hit.
 
-**`add_table` on a table without a primary key**
+**`add_table` refuses a name: a retained or colliding history table**
 
 ```
-ERROR:  paimon_slot: doc_nopk has no primary key
-HINT:  a primary key is required; see design spec section 4
+ERROR:  paimon_slot: cannot replicate public.col_a: Paimon table public.col_a_hist is the retained history of public.col_a, which stopped being replicated by DROP TABLE
 ```
 
-Add a primary key first. See section 5 for why PK-less tables are out of scope.
+The table of that name was dropped (or removed) and its history table is kept. Move the Paimon
+table aside by hand, then `SELECT paimon.forget_history('public', 'col_a_hist');` and add the table
+again (section 2, "History tables"). A table without a primary key is no longer refused: it is
+replicated as an operation log.
 
 **`ADD COLUMN ... DEFAULT`**
 
@@ -1022,7 +1170,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 318 unit tests, builds the shaded jar
+cd java/writer && mvn -q package                 # 339 unit tests (2 live ITs skipped), builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
@@ -1032,8 +1180,11 @@ port 5442 (leaving a cluster on 5441 alone), installs the extension from the wor
 jar locally, runs the JDBC suites and exits with their status. With no arguments it runs **every**
 suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDdlTest`,
 `PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`,
-`PaimonAdversarialTest`, named explicitly in the script's `ALL_SUITES` and printed at the start of
-the run — which is **357 checks**. `PaimonAdversarialTest` is the hostile-DBA suite: every hole in
+`PaimonAdversarialTest`, `PaimonHistoryTest`, named explicitly in the script's `ALL_SUITES` and
+printed at the start of the run — which is **551 checks**. `PaimonHistoryTest` is the history-table
+and key-less-log suite: uncollapsed history inside one proven commit batch, a writer halted between
+the main and history commits in both orders, DDL fan-out, `DROP TABLE` and the re-registration
+refusal, the key-less operation log, name collisions and the initial load's `R` rows. `PaimonAdversarialTest` is the hostile-DBA suite: every hole in
 section 5's "Poison records and silent loss", run end to end, each asserting either PostgreSQL's
 refusal followed by a row that still reaches Paimon, or a row-for-row comparison of the two. Name a subset to run just those (plus the smoke suite). A named suite that matches no
 tests, or whose every test is skipped, fails the harness; naming a suite that does not exist, such
@@ -1078,30 +1229,13 @@ workload stopped, stops the writer with SIGTERM, and runs the comparison.
 **BenchBase and its TPC-C schema are used exactly as they ship.** No surrogate key, no added
 column, no DDL edit, no patch: the workload stays recognisably TPC-C.
 
-**`history` is not replicated, and that is the primary-key requirement working as specified.**
-TPC-C's `history` table has no primary key — two foreign keys and nothing else — and `paimon_slot`
-requires one on every replicated table, because the write target is a Paimon primary-key table and
-without a key there is nothing to merge on. `add_table()` refuses such a table on purpose
-(`paimon_slot: history has no primary key`), so eight of the nine tables are registered and
-`history` reaches neither the publication nor the warehouse.
-
-This is a genuine, visible consequence of the design, not an oversight and not a workaround, so
-**do not "fix" it by giving `history` a key.** The harness treats the exclusion as a property to
-test rather than an assumption, in two places:
-
-* `setup.sql` asserts `history` is unregistered, unpublished and still key-less, and then calls
-  `paimon.add_table('history')` and requires it to fail with the primary-key error — so the refusal
-  is exercised, not merely relied upon;
-* the comparison asserts `history` is untracked, absent from `paimon_pub`, absent from the Paimon
-  catalog and absent from `<warehouse>/public.db/`, **while holding rows**. Payment inserts into
-  `history` throughout the run, so this is a live demonstration that a table never passed to
-  `add_table` stays genuinely untouched under a busy workload — the guarantee acceptance test T17
-  checks in miniature, here at TPC-C scale.
-
-What the exclusion costs is one table's breadth, not a class of behaviour: `history` is insert-only
-in TPC-C, and the eight replicated tables exercise inserts, composite-key updates and deletes far
-harder. Their keys are one to four columns wide (`order_line` is four), so composite keys are well
-covered.
+**All nine tables are replicated; `history` as an operation log.** TPC-C's `history` table has no
+primary key -- two foreign keys and nothing else -- so it is replicated the way every key-less table
+is (section 2, "History tables"): an append-only log in Paimon. Payment inserts into it throughout
+the run. Do not give it a key to make it look like the others; the stock schema is the point.
+`setup.sql` asserts it is registered without a key, at `REPLICA IDENTITY FULL`, and that
+`paimon.health()` is clean. Every table also gets its history table, so the warehouse holds 18
+Paimon tables.
 
 **What the comparison asserts** (`java/src/test/java/pro/surpin/pgpaimon/TpccCompare.java`, run as
 `java -cp java/target/paimon-reader-1.0.jar pro.surpin.pgpaimon.TpccCompare <warehouse> <jdbc-url>
@@ -1109,7 +1243,7 @@ covered.
 
 * the Paimon column list is exactly PostgreSQL's plus the writer's metadata columns, and the Paimon
   primary key is PostgreSQL's primary key;
-* **every column of every row** of the eight replicated tables, not row counts. A row count agrees with PostgreSQL in exactly the
+* **every column of every row** of the eight primary-key tables, not row counts. A row count agrees with PostgreSQL in exactly the
   case this branch kept finding: a merged table that looks right while the changelog is wrong. Both
   sides are canonicalised through the *Paimon* column type, so `numeric(12,2)` is compared as a
   scale-2 decimal rather than as two string renderings; PostgreSQL is read ordered by primary key
@@ -1122,6 +1256,20 @@ covered.
   is read off PostgreSQL — the loader gives a carrier id only to orders below 2101, so a delivered
   order above that is proof — and the `oorder` / `order_line` / `new_order` assertions are strict
   only when it did.
+* **every history table** (`<table>_hist`): its columns are the six metadata columns then
+  `before_*`/`after_*`; it has no key; no (commit LSN, `_op_seq`) occurs twice; an I carries only
+  an after image, a D only a before image, every U both (every NOT NULL column set); its I/U/D counts
+  equal the changelog's +I/+U/-D (TPC-C moves no key, so each UPDATE is one -U/+U pair and one U);
+  and, the strongest form, **replaying it from empty in commit order rebuilds PostgreSQL's table
+  exactly**, row for row;
+* **`history`**, which has no key, as a multiset: the log's columns are PostgreSQL's plus the
+  metadata, every log row equals its history row's after image (one for one, by commit LSN and
+  `_op_seq`), and the history rebuilds PostgreSQL's rows with their multiplicities.
+
+Tampering is caught: appending one copy of an existing row to `history_hist` and to `stock_hist`
+of a passing warehouse (a stray replay, under another commit user) failed both tables with
+"duplicated history rows", "the history does not rebuild the table" and "history counts do not
+match the changelog".
 
 A difference fails the harness and the CI job. The job uploads the writer log, the comparison
 output and a warehouse listing whatever the outcome.
@@ -1151,7 +1299,13 @@ table.
 | the comparison (PostgreSQL scan plus every changelog) | 84 s | 16 s |
 
 The two runs are different random workloads, so row counts differ by about 0.2%; the snapshot and
-file counts are what the batch controls. The remaining snapshots are the interval at work: about
+file counts are what the batch controls.
+
+**Measured with history tables** (same configuration, default batch, 2026-10-14): every table and
+its history matched PostgreSQL (`order_line`: 306,963 rows, 6,299 updates, 313,262 history rows;
+`history`: 30,636 log rows). The warehouse was **622 MB** -- main tables about 200 MB, history
+tables about 425 MB: `stock_hist` alone is 206 MB, because a history row of a wide table carries the
+whole row twice. That is the price of the audit trail; size the warehouse for it. The remaining snapshots are the interval at work: about
 one per table every two seconds while the table is being written.
 
 Two consequences for an operator:

@@ -27,6 +27,12 @@ restarted independently of the database.
 * **A faithful changelog.** Tracked tables use `REPLICA IDENTITY FULL` and Paimon's
   `changelog-producer = input`, so every `UPDATE` produces a real `-U` / `+U` pair, including for
   rows whose large (TOASTed) columns were not touched.
+* **An operation history of every table.** Beside each replicated table `T` the writer keeps
+  `T_hist`, an append-only Paimon table with one row per row-level change -- operation, commit and
+  change LSN, transaction id, commit time, and the row before and after -- in commit order and never
+  collapsed, even inside one transaction or one commit batch. It survives `DROP TABLE`.
+* **Tables without a primary key** are replicated as append-only operation logs: one row per
+  insert, update, delete or truncate, with the same metadata.
 * **DDL follows the data:** `ADD`/`DROP`/`RENAME COLUMN`, `ALTER COLUMN TYPE`, `DROP TABLE` and
   `TRUNCATE` are propagated. Changes the writer could not apply faithfully are refused up front by
   guardrails instead of failing later.
@@ -37,7 +43,7 @@ restarted independently of the database.
   table does not produce a snapshot per transaction.
 * **Verified against TPC-C.** A GitHub Actions workflow (`tpcc.yml`, manual dispatch) runs BenchBase
   through the pipeline and compares every replicated row of PostgreSQL against Paimon column by
-  column.
+  column, and checks that replaying each history table rebuilds PostgreSQL's table exactly.
 
 ## Quick start
 
@@ -51,7 +57,8 @@ cd java/writer && mvn -q package                 # -> java/writer/target/paimon-
 make -C sql/paimon_slot install                  # or install-local, see the guide
 psql mydb -c "CREATE EXTENSION paimon_slot"
 
-# 3. Register a table. It needs a primary key. Do this BEFORE starting the writer.
+# 3. Register a table (with a primary key it is merged; without one it is an operation log).
+#    Do this BEFORE starting the writer, or while it is still empty.
 psql mydb -c "CREATE TABLE orders (id int PRIMARY KEY, customer text, amount numeric(12,2))"
 psql mydb -c "SELECT paimon.add_table('orders'::regclass)"
 
@@ -71,8 +78,11 @@ running this anywhere that matters.
 
 Each is deliberate and explained, with its reason, in section 5 of the guide:
 
-* every replicated table needs a **primary key** (the `history` table of TPC-C has none and is
-  therefore not replicated), and the key must not be `DEFERRABLE`;
+* a table **without a primary key** is replicated as an operation log, not as a merged table, and a
+  key cannot be added to a replicated table later; a primary key must not be `DEFERRABLE`;
+* the history tables (`<table>_hist`) roughly **double write volume** and **grow without bound**:
+  retention is yours to run; a dropped table's history is kept and its name stays taken until you
+  move it aside and call `paimon.forget_history()`;
 * `numeric` columns need an explicit precision of at most 38;
 * `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET NOT NULL` are refused;
 * a **non-empty** table cannot be added once the writer's slot exists;

@@ -12,14 +12,16 @@ is active does it run `mvn test` in `java/pom.xml`, always with an explicit `-Dt
 The script's exit status is Maven's. Teardown runs on any exit.
 
 **What a bare run covers.** With no argument it names every suite — the `ALL_SUITES` list in the
-script — and runs all nine:
+script — and runs all ten:
 
     SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
     PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
-    PaimonAdversarialTest
+    PaimonAdversarialTest PaimonHistoryTest
 
-That is **357 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
-the writer on purpose in its last case (A15, `paimon.health()`). It prints the list it is about to run.
+That is **551 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
+the writer on purpose in its last case (A15, `paimon.health()`); `PaimonHistoryTest` restarts it
+several times, with batch limits that hold a batch open and with the test-only crash hook
+`PGPAIMON_TEST_HALT_AFTER_COMMIT`. It prints the list it is about to run.
 The old `PaimonE2ETest` was removed with the C++ implementation it exercised; naming a suite that
 does not exist fails the run by design. The selection is never left to Surefire's default includes — doing so
 picked up only the two `*IT` suites, 24 of the 238 checks, and still printed `ALL SUITES PASSED`.

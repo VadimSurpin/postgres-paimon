@@ -127,9 +127,18 @@ CREATE TABLE paimon.table_registry (
     backfill_due boolean NOT NULL DEFAULT true,
     replica_identity text NOT NULL DEFAULT 'full',   -- 'full' | 'default', §5 escape
     changelog_producer text NOT NULL DEFAULT 'input',-- 'input' | 'lookup',  §5 escape
-    registered_at timestamptz NOT NULL DEFAULT now()
+    registered_at timestamptz NOT NULL DEFAULT now(),
+    hist_table   text    NOT NULL,   -- table_name || '_hist'   (amended 2026-10-14)
+    registration uuid    NOT NULL DEFAULT gen_random_uuid()  -- stamped on the history table
 );
 ```
+
+*Amended 2026-10-14* (docs/superpowers/specs/2026-10-14-operation-history-design.md): every
+tracked table also has a history table in Paimon, recorded here, and
+`paimon.retained_history` records history tables left behind by `DROP TABLE` and
+`remove_table()`, so that `add_table()` can refuse a name whose main or history table would land
+on one. As implemented the registry also carries `cols` (the columns with their PostgreSQL
+`typid`/`typmod`) and `buckets`.
 
 The registry is the extension's memory of last-known schema, which the guardrails diff
 against. Publication membership is the source of truth for *which* tables are tracked;
@@ -140,10 +149,14 @@ the registry records *what they looked like*.
 - `paimon.add_table(regclass, replica_identity => 'full', changelog_producer => 'input')`
   — sets `REPLICA IDENTITY FULL` unless the escape says otherwise, adds the table to
   `paimon_pub`, inserts the registry row, emits a `create` message carrying the Paimon
-  table options. Raises if the table has no primary key. The two escape arguments are
+  table options. *Amended 2026-10-14:* a table with no primary key is accepted and replicated
+  as an operation log (below); a name whose `T` or `T_hist` would collide with another tracked
+  table's, or with a retained history table, is refused. The two escape arguments are
   accepted and recorded in v1 but only their default values are implemented (§5).
 - `paimon.remove_table(regclass)` — drops from publication, deletes the registry row.
-  Does not delete Paimon data.
+  Does not delete Paimon data; the history table is recorded as retained.
+- `paimon.forget_history(schema, hist_table)` — *added 2026-10-14*: the operator's statement
+  that a retained history table has been renamed or dropped in Paimon by hand.
 
 ### Guardrails: `ddl_command_end`, not `ddl_command_start`
 
@@ -180,11 +193,18 @@ silently, the guardrail stays and `gaps.md` item 2 is carried over rather than f
 documented workaround is the one main already requires: add the column without a default,
 then `UPDATE` it, which streams as ordinary DML.
 
-### Primary key is required
+### Primary key is required — *superseded 2026-10-14*
 
-`paimon.add_table()` raises if the table has no primary key. This is a deliberate scope
-reduction from main, which permits `pk_count = 0` (`legacy:extension/paimon_client.cpp:105`) and
-produces an append-only Paimon table.
+**Superseded** by docs/superpowers/specs/2026-10-14-operation-history-design.md: a table with no
+primary key is now accepted, still at `REPLICA IDENTITY FULL`, and replicated as an append-only
+*operation log* (the user columns plus `_op`, `_commit_lsn`, `_lsn`, `_op_seq`, `_xid`, `_ts`; one
+row per operation, never merged). That is the "second write path onto an append table with
+`(commit_lsn, op_index)` identity" the paragraph below deferred; the reasoning below about why a
+key-less table cannot be a Paimon primary-key table still holds and is why it is a log instead.
+
+The original text: `paimon.add_table()` raises if the table has no primary key. This is a
+deliberate scope reduction from main, which permits `pk_count = 0`
+(`legacy:extension/paimon_client.cpp:105`) and produces an append-only Paimon table.
 
 PostgreSQL refuses `UPDATE` and `DELETE` on a published table that has no replica
 identity. `REPLICA IDENTITY FULL` lifts that restriction, so a PK-less table *can* stream
@@ -595,7 +615,12 @@ transaction.
    starts a new buffer) and before a changed relation description is accepted.
 4. At assembly, a transaction's records for a table are **dropped if its commit LSN is at or below
    that table's highest committed identifier** (per table; read from Paimon once and kept current
-   in memory, re-read after any DDL). See "Why a timeout needs rule 4" below.
+   in memory, re-read after any DDL). See "Why a timeout needs rule 4" below. *Amended
+   2026-10-14:* "table" means each Paimon table the writer commits to: a relation's history table
+   `T_hist` (and a key-less relation's log `T`) is a separate table with its own identifier
+   stream, filtered on its own, and the resume position is the MIN over all of them. The main and
+   history commits of a batch are not atomic with each other; a crash between them is repaired by
+   replay, each table filtering independently.
 5. `PaimonSink` commits the batch with `commitIdentifier` = the commit LSN of the **last**
    transaction in it, under a fixed `commitUser`, through
    `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
@@ -873,7 +898,10 @@ startup cost is one query, independent of how much WAL the slot is holding.
   widenings without `USING` (§8, "What replayed on retry does not cover").
 - Partitioned tables are **refused outright** in v1. `publish_via_partition_root` would be the route to supporting them, and is not taken here.
 - `wal_level = logical` is mandatory.
-- `merge-engine` is fixed at `deduplicate` for tracked tables.
+- `merge-engine` is fixed at `deduplicate` for tracked tables with a primary key. *Amended
+  2026-10-14:* a table without one is an append-only operation log, and every tracked table has an
+  append-only history table `T_hist` beside it, which roughly doubles the writer's Paimon writes
+  and grows without bound (retention is the operator's job).
 - Tracked tables are switched to `REPLICA IDENTITY FULL`, which adds the old row to the
   WAL written by every UPDATE and DELETE and is visible to any other logical consumer of
   the same table. The §5 escape exists for tables that cannot afford it.
