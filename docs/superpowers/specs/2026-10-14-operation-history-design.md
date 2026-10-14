@@ -108,3 +108,71 @@ main tables are unchanged.
 * Key-less `T`: user columns are all nullable (a `T` row is NULL everywhere).
 * Column counts and names: a 3,206-column append table with 62-character names, and a 300-character
   field name, were created, written and read on 1.4.1; no guard is needed beyond the existing ones.
+
+---
+
+# Amendment A (2026-10-14, owner request) -- row-per-image history and DDL rotation
+
+> In the history table keep two rows for before and after values with exactly +U and -U markers. In case of DDL
+> rename the old history table to [table_name]_hist_[lsn] and start a new history table with [table name]_hist name.
+
+This AMENDS sections 1-3 above; where they disagree, this amendment wins, and the implementer must rewrite those
+sections so the document no longer contradicts itself.
+
+## A1. Layout: one row per row image, Paimon row-kind markers
+
+`T_hist` has NO `before_*` / `after_*` columns any more. Its columns are the table's own columns (same names, same
+Paimon types, all nullable) followed by the metadata columns (`_op`, `_commit_lsn`, `_lsn`, `_op_seq`, `_xid`, `_ts`,
+exactly as in section 2). One PostgreSQL row change becomes:
+
+| PostgreSQL change | rows appended | `_op` | values |
+|---|---|---|---|
+| INSERT | 1 | `+I` | the new row |
+| UPDATE | 2, consecutive | `-U` then `+U` | the old row, then the new row |
+| DELETE | 1 | `-D` | the deleted (old) row |
+| TRUNCATE | 1 | `T` | all NULL |
+| initial load | 1 per row | `R` | the loaded row |
+
+The markers are exactly Paimon's `RowKind.shortString()` strings (`+I`, `-U`, `+U`, `-D`); `T` and `R` are unchanged.
+The two rows of an update share `_commit_lsn`, `_lsn` and `_xid` and have distinct, increasing `_op_seq` (`-U` first).
+Nothing is collapsed: an update that changes nothing still yields its `-U`/`+U` pair.
+A user column whose name equals a metadata column (`_op`, `_commit_lsn`, `_lsn`, `_op_seq`, `_xid`, `_ts`) is now a
+possible collision (there is no prefix any more): the existing reserved-name guardrail must cover all six, in
+`add_table`, `ADD COLUMN` and `RENAME COLUMN`. The key-less main log table `T` keeps its layout (section 1.K).
+
+## A2. DDL rotates the history table
+
+For every DDL message the writer applies to a tracked table -- `add_col`, `drop_col`, `rename_col`, `alter_col` (not
+`create`, not `drop_table`) -- the history table is rotated, atomically with respect to replay:
+
+1. the current `T_hist` is renamed to `T_hist_<lsn>`, where `<lsn>` is the DDL message's LSN (the same value as the
+   DDL commit identifier `pgpaimon.applied-ddl-lsn`), rendered as 16 upper-case zero-padded hex digits so the
+   archived names sort chronologically (implementer may choose another sortable, name-safe rendering if hex
+   proves unsuitable; document it);
+2. a new, empty `T_hist` is created with the table's NEW schema;
+3. the main table `T` is altered as today.
+
+Consequences the implementation and tests must honour:
+
+* Every row in `T_hist_<lsn>` was written under exactly one schema; `T_hist` always matches the current schema.
+  Archived tables are never written again.
+* Replay safety: a crash between any two of the steps above, followed by a replay of the DDL message, must converge
+  to the same final state (rename done / not done, create done / not done, main altered / not). The new `T_hist`
+  records the DDL LSN as its baseline (like the main table's `pgpaimon.applied-ddl-lsn`) so that transactions that
+  committed BEFORE the DDL and are replayed after a crash are NOT written into the new table; they belong to the
+  archive.
+* A transaction that straddles the DDL (`BEGIN; INSERT; ALTER TABLE ... ADD COLUMN; INSERT; COMMIT`): the first
+  insert was decoded under the old schema and belongs in the archived table, the second in the new `T_hist`. Records
+  already carry the `RelationMeta` they were decoded under (commit 1d5d302); route each history row by its schema
+  generation. The same transaction therefore commits to both tables, each with its own commit identifier rules.
+* Resume position = MIN over all tables is computed over the CURRENT tables; archived tables never constrain it.
+* Names: `T_hist_<lsn>` must not collide with a tracked table. The `add_table` / `ADD COLUMN`-free collision
+  guardrail extends to the pattern `<tracked>_hist` and `<tracked>_hist_<hex>`; the writer re-checks.
+* `drop_table` / `remove_table` leave `T_hist` and every `T_hist_<lsn>` (retained audit trail; section 3.3 applies to
+  all of them, including the re-add refusal).
+* The key-less main log `T` still evolves in place (only `T_hist` rotates).
+* Cost to document: every DDL creates one more Paimon table per tracked table touched; the number of archived tables
+  is unbounded, and nothing cleans them up. `paimon.health()` / docs should tell operators how to list them.
+* Paimon's `renameTable` on the filesystem catalog is a directory rename: atomic on HDFS/local, NOT atomic on
+  S3-like stores (copy + delete). State this; the implementer must verify what 1.4.1 does and make the replay logic
+  robust to a half-done rename.
