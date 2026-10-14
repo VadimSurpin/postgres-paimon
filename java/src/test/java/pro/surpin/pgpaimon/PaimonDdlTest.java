@@ -40,7 +40,7 @@ import java.util.*;
  *   D4  DROP COLUMN        — pre-execute capture; column removed from Paimon schema
  *   D5  RENAME COLUMN      — pre-execute capture; new name reflected in Paimon schema
  *   D6  ALTER COLUMN TYPE  — post-execute capture; new type reflected in Paimon schema
- *   D7  key-less table     — add_table refuses it (the guardrail replaces ADD PRIMARY KEY)
+ *   D7  key-less table     — accepted as an operation log; a key cannot be added later
  *   D8  DROP PRIMARY KEY   — blocked with ERROR before any execution
  *   D9  Non-paimon passthrough — regular heap tables are unaffected by the hook
  *
@@ -169,10 +169,29 @@ public class PaimonDdlTest {
         check("D1 drop table: the writer removed the Paimon table from the warehouse",
               !dir.exists());
 
-        // Re-create the table and verify DML capture still works
-        boolean recreateOk = true;
+        // ... and LEAVES its history table: the audit trail of the dropped table.
+        File hist = new File(tableDir(tbl + "_hist"));
+        check("D1 drop table: the history table " + tbl + "_hist is kept", hist.isDirectory());
+
+        // Re-creating the name: add_table refuses, because the new table's history would be
+        // appended to the dropped one's. The hint names the remedy.
+        String refusal = null;
         try (Connection conn = connect()) {
             createTracked(conn, tbl, "id INT PRIMARY KEY, v TEXT");
+        } catch (SQLException e) {
+            refusal = e.getMessage();
+        }
+        check("D1 drop table: re-registering the name is refused while its history is retained",
+              refusal != null && refusal.contains("retained history") && refusal.contains("forget_history"));
+
+        // The documented remedy: move the old history aside in Paimon, then forget it.
+        File archived = new File(tableDir(tbl + "_hist_archived"));
+        boolean moved = hist.renameTo(archived);
+        check("D1 drop table: the retained history moved aside by hand", moved);
+        boolean recreateOk = true;
+        try (Connection conn = connect()) {
+            exec(conn, "SELECT paimon.forget_history('public', '" + tbl + "_hist')");
+            exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
             exec(conn, "INSERT INTO " + tbl + " VALUES (1,'re-a'),(2,'re-b'),(3,'re-c')");
         } catch (Exception e) {
             recreateOk = false;
@@ -477,54 +496,52 @@ public class PaimonDdlTest {
         }
     }
 
-    // ── D7: a table without a primary key cannot be tracked ──────────────────
-    // The original implementation blocked ADD PRIMARY KEY on a tracked table so that Paimon's key
-    // semantics never changed mid-life.  Here a table can only be tracked if it
-    // already has a key, and the key is frozen once tracked (D8).  The guardrail
-    // therefore moves to the door: paimon.add_table() must refuse a key-less table,
-    // and that refusal is the assertion.  The table must stay untracked and usable.
+    // ── D7: a table without a primary key is replicated as an operation log ─────
+    // The key is frozen once tracked (D8). A table that never had one is accepted and replicated
+    // as an append-only log (spec 2026-10-14): its Paimon table has no key and one row per
+    // operation. PaimonHistoryTest H4 covers it in depth; this is the door.
     static void testD7_addPkBlocked() throws Exception {
-        System.out.println("\n── D7: key-less table refused by add_table ──────────");
+        System.out.println("\n── D7: key-less table accepted as an operation log ──");
         String tbl = "ddl_add_pk_blocked";
         cleanup(tbl);
+        String error = null;
         try (Connection conn = connect()) {
             exec(conn, "DROP TABLE IF EXISTS " + tbl);
             exec(conn, "CREATE TABLE " + tbl + " (id INT, v TEXT)");
-        }
-
-        boolean errorThrown = false;
-        String errorMsg = "";
-        try (Connection conn = connect()) {
             exec(conn, "SELECT paimon.add_table('" + tbl + "'::regclass)");
         } catch (SQLException e) {
-            errorThrown = true;
-            errorMsg = e.getMessage();
+            error = e.getMessage();
         }
-        check("D7 no pk: add_table on a key-less table is rejected", errorThrown);
-        check("D7 no pk: error message mentions paimon_slot",
-              errorMsg.toLowerCase().contains("paimon_slot"));
-        check("D7 no pk: error message says there is no primary key",
-              errorMsg.toLowerCase().contains("no primary key"));
-
-        long registered = -1;
+        check("D7 no pk: add_table accepts a key-less table" + (error == null ? "" : " (" + error + ")"),
+              error == null);
+        String pk = null;
         try (Connection conn = connect();
              Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery(
-                 "SELECT count(*) FROM paimon.table_registry WHERE relid = '" + tbl + "'::regclass")) {
-            rs.next();
-            registered = rs.getLong(1);
+                 "SELECT pk_cols::text FROM paimon.table_registry WHERE relid = '" + tbl + "'::regclass")) {
+            if (rs.next()) pk = rs.getString(1);
         }
-        check("D7 no pk: refused table is not in the registry", registered == 0);
-
-        // The table must still accept DML after the refused add_table
-        boolean dmlOk = true;
+        check("D7 no pk: registered with an empty key", "{}".equals(pk));
+        refusedD7("D7 no pk: adding a key later is refused (the Paimon layout is fixed)",
+                  "ALTER TABLE " + tbl + " ADD PRIMARY KEY (id)", "cannot change the primary key");
         try (Connection conn = connect()) {
-            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(2,'b')");
-        } catch (Exception e) {
-            dmlOk = false;
-            System.err.println("  Post-error DML failed: " + e.getMessage());
+            exec(conn, "INSERT INTO " + tbl + " VALUES (1,'a'),(1,'a')");
         }
-        check("D7 no pk: DML still works after refused add_table", dmlOk);
+        waitForParquet(tbl, 1);
+        TableSchema schema = readSchema(tbl);
+        check("D7 no pk: the Paimon table has no primary key", schema.primaryKeys().isEmpty());
+        check("D7 no pk: it is an operation log (" + schema.fieldNames() + ")",
+              schema.fieldNames().equals(List.of("id", "v", "_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts")));
+    }
+
+    static void refusedD7(String name, String sql, String expected) throws Exception {
+        String msg = null;
+        try (Connection conn = connect()) {
+            exec(conn, sql);
+        } catch (SQLException e) {
+            msg = e.getMessage();
+        }
+        check(name, msg != null && msg.contains(expected));
     }
 
     // ── D8: DROP PRIMARY KEY blocked ──────────────────────────────────────────
