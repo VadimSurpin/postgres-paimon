@@ -589,8 +589,10 @@ public class PaimonHistoryTest {
         try (Connection c = connect(); Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT extract(hour FROM now() AT TIME ZONE 'UTC')::int")) {
             rs.next();
-            // A zone whose calendar date differs from UTC's right now.
-            zone = rs.getInt(1) >= 12 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
+            // A zone whose calendar date differs from UTC's right now: Kiritimati (UTC+14) from
+            // 10:00 UTC on, Pago Pago (UTC-11) before 11:00 UTC. The switch at 11 is inside both
+            // ranges; at 12 it left 11:00-11:59 UTC with Pago Pago on UTC's date (review m6).
+            zone = rs.getInt(1) >= 11 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
         }
         restartWriter("H7", Map.of("JAVA_TOOL_OPTIONS", "-Duser.timezone=" + zone));
         check("H7 the writer JVM runs in " + zone,
