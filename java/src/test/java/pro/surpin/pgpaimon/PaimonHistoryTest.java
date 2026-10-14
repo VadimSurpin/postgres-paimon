@@ -32,21 +32,24 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * Operation history tables ({@code <table>_hist}) and key-less operation logs, end to end on a
  * real PostgreSQL 18 and the real writer (spec docs/superpowers/specs/2026-10-14-operation-history-design.md).
  *
- *   H1  BEGIN; INSERT; UPDATE twice; DELETE; COMMIT, five times, in ONE mini-batch: four history
- *       rows per transaction, in order, both images, one _commit_lsn, increasing _op_seq, the
- *       transaction's xid; the same for a key-less table, whose main table is the log. The batch
- *       is proven: nothing is committed while the transactions are buffered, then one snapshot.
+ *   H6  The initial load: R rows, _ts = PostgreSQL's now() of the load, _dt its UTC date.
+ *   H1  BEGIN; INSERT; UPDATE twice; DELETE; COMMIT, five times, in ONE proven mini-batch: six
+ *       history rows per transaction (+I, -U, +U, -U, +U, -D), each pair sharing _lsn, one
+ *       _commit_lsn, increasing _op_seq, the transaction's xid, _dt = UTC date of the commit; the
+ *       same for a key-less table, whose main table is the log (I, U, U, D).
  *  H2a  The writer halts right after the main table's commit, before the history's.
  *  H2b  ... right after the history table's commit, before the main table's. After a restart both
  *       tables hold every change exactly once.
- *   H3  DDL: add / rename / alter type / drop column keep both tables consistent; history keeps a
- *       dropped column's values; re-adding the name keeps them apart; DROP TABLE leaves T_hist;
- *       registering a new table of the same name is refused with the hint.
- *   H4  A key-less table: add_table works, INSERT/UPDATE/DELETE/TRUNCATE (and duplicate rows, and
- *       an unchanged TOASTed value) produce the documented log in T and T_hist; the writer stays up.
+ *   H3  Every DDL archives T_hist as T_hist_<lsn> and starts a new one with the new schema; each
+ *       generation holds exactly its rows; DROP TABLE leaves all of them; re-adding is refused.
+ *  H3b  A transaction straddling a DDL writes to the archive and the new table; read together by
+ *       _dt every change appears once.
+ *  H3c  kill -9 (Runtime.halt) after each step of a rotation; the restart converges.
+ *   H4  A key-less table: the documented log in T, a row per image in T_hist, TRUNCATE, TOAST.
  *  H4b  A key-less log committed but not confirmed, then the writer dies: the replay adds nothing.
  *   H5  Name collisions: X and X_hist cannot both be tracked, in either order.
- *   H6  The initial load: R rows in T_hist with the loaded values.
+ *   H7  A writer JVM and a PostgreSQL session in a zone whose date differs from UTC's: _dt is UTC.
+ *   H8  hist_buckets => N reaches the history table and survives a rotation.
  *
  * Row kinds of main tables come from $audit_log over a streaming scan, never from a merged read.
  * History tables and logs are append-only: every stored row is read back as it is.
@@ -97,9 +100,15 @@ public class PaimonHistoryTest {
         run("H2a", () -> h2_crashBetweenTheTwoCommits("h2_main", "public.h2_main"));
         run("H2b", () -> h2_crashBetweenTheTwoCommits("h2_hist", "public.h2_hist_hist"));
         run("H3", PaimonHistoryTest::h3_ddl);
+        run("H3b", PaimonHistoryTest::h3b_straddle);
+        for (String step : List.of("rotate-renamed", "rotate-created", "rotate-altered")) {
+            run("H3c " + step, () -> h3c_rotationCrash(step));
+        }
         run("H4", PaimonHistoryTest::h4_keylessLog);
         run("H4b", PaimonHistoryTest::h4b_keylessReplay);
         run("H5", PaimonHistoryTest::h5_collisions);
+        run("H7", PaimonHistoryTest::h7_timeZones);
+        run("H8", PaimonHistoryTest::h8_histBuckets);
 
         System.out.println();
         System.out.printf("  Results: %d passed, %d failed%n", passed, failed);
@@ -116,22 +125,22 @@ public class PaimonHistoryTest {
         check("H6 exactly the two loaded rows are R rows (" + r.size() + ")", r.size() == 2);
         Set<String> got = new TreeSet<>();
         for (Map<String, String> m : r) {
-            got.add(m.get("after_id") + "|" + m.get("after_label") + "|" + m.get("after_amt"));
+            got.add(m.get("id") + "|" + m.get("label") + "|" + m.get("amt"));
         }
         check("H6 R rows carry the loaded values " + got,
               got.equals(new TreeSet<>(List.of("1|one|1.50", "2|two|2.25"))));
-        check("H6 R rows have no before image",
-              r.stream().allMatch(m -> m.get("before_id") == null && m.get("before_label") == null));
         check("H6 R rows: _commit_lsn = _lsn = the load's consistent point, _xid 0",
-              r.stream().allMatch(m -> m.get("_commit_lsn").equals(m.get("_lsn"))
+              r.size() == 2 && r.stream().allMatch(m -> m.get("_commit_lsn").equals(m.get("_lsn"))
                                        && m.get("_xid").equals("0"))
               && r.get(0).get("_lsn").equals(r.get(1).get("_lsn")));
+        check("H6 R rows: one _ts (PostgreSQL's now() of the load), _dt its UTC date, in that partition",
+              r.size() == 2 && r.get(0).get("_ts").equals(r.get(1).get("_ts"))
+              && r.get(0).get("_dt").equals(utcDate(r.get(0).get("_ts")))
+              && new File(tableDir(PG_SCHEMA, "harness_smoke_hist") + "/_dt=" + r.get(0).get("_dt")).isDirectory());
         for (String nsp : List.of("public", "billing")) {
             List<Map<String, String>> t = rowsNow(nsp, "twin_hist");
-            check("H6 " + nsp + ".twin_hist holds its own R row ("
-                  + t.stream().filter(m -> "R".equals(m.get("_op"))).map(m -> m.get("after_who")).toList() + ")",
-                  t.stream().filter(m -> "R".equals(m.get("_op"))).map(m -> m.get("after_who")).toList()
-                      .equals(List.of(nsp + "-one")));
+            List<String> who = t.stream().filter(m -> "R".equals(m.get("_op"))).map(m -> m.get("who")).toList();
+            check("H6 " + nsp + ".twin_hist holds its own R row (" + who + ")", who.equals(List.of(nsp + "-one")));
         }
         try (Connection c = connect(); Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT schema_name, table_name, hist_table FROM paimon.table_registry")) {
@@ -146,7 +155,7 @@ public class PaimonHistoryTest {
         }
     }
 
-    // ── H1: four rows per transaction, never collapsed, across one mini-batch ─────────────
+    // ── H1: a row per row image, never collapsed, across one mini-batch ───────────────────
     static void h1_neverCollapsedInOneMiniBatch() throws Exception {
         System.out.println("\n── H1: I, U, U, D in one transaction, five in one batch ─");
         if (launcher == null) { check("H1 harness exports the writer launcher", false); return; }
@@ -191,39 +200,41 @@ public class PaimonHistoryTest {
         long t1 = System.currentTimeMillis();
 
         for (String table : List.of("h1_pk_hist", "h1_log_hist", "h1_log")) {
-            List<Map<String, String>> rows = waitRows(table, rs -> rs.size() >= 21);
-            check("H1 " + table + ": 21 rows (1 warm-up + 5 x 4), got " + rows.size(), rows.size() == 21);
+            boolean history = table.endsWith("_hist");
+            int per = history ? 6 : 4;
+            List<Map<String, String>> rows = waitRows(table, rs -> rs.size() >= 1 + 5 * per);
+            check("H1 " + table + ": " + (1 + 5 * per) + " rows (1 warm-up + 5 x " + per + "), got " + rows.size(),
+                  rows.size() == 1 + 5 * per);
             check("H1 " + table + ": ONE snapshot for the six transactions (" + snapshots(table) + ")",
                   snapshots(table) == 1);
-            boolean history = table.endsWith("_hist");
             Map<String, List<Map<String, String>>> byCommit = new LinkedHashMap<>();
             for (Map<String, String> r : rows) byCommit.computeIfAbsent(r.get("_commit_lsn"), k -> new ArrayList<>()).add(r);
             check("H1 " + table + ": six distinct _commit_lsn, one per transaction", byCommit.size() == 6);
             List<List<Map<String, String>>> txns = new ArrayList<>(byCommit.values());
-            for (int i = 1; i <= 5; i++) {
+            for (int i = 1; i <= 5 && i < txns.size(); i++) {
                 List<Map<String, String>> t = txns.get(i);
                 String id = "" + i;
                 List<String> ops = t.stream().map(m -> m.get("_op")).toList();
-                check("H1 " + table + " txn " + i + ": I, U, U, D in order " + ops,
-                      ops.equals(List.of("I", "U", "U", "D")));
-                List<List<String>> images = new ArrayList<>();
-                for (Map<String, String> m : t) {
-                    images.add(history
-                        ? Arrays.asList(m.get("before_id"), m.get("before_v"), m.get("after_id"), m.get("after_v"))
-                        : Arrays.asList(m.get("id"), m.get("v")));
+                List<String> wantOps = history ? List.of("+I", "-U", "+U", "-U", "+U", "-D")
+                                               : List.of("I", "U", "U", "D");
+                check("H1 " + table + " txn " + i + ": " + wantOps + " in order " + ops, ops.equals(wantOps));
+                List<String> vals = t.stream().map(m -> m.get("id") + ":" + m.get("v")).toList();
+                List<String> wantVals = history
+                    ? List.of(id + ":a", id + ":a", id + ":b", id + ":b", id + ":null", id + ":null")
+                    : List.of(id + ":a", id + ":b", id + ":null", id + ":null");
+                check("H1 " + table + " txn " + i + ": row images " + vals, vals.equals(wantVals));
+                if (history) {
+                    check("H1 " + table + " txn " + i + ": each -U/+U pair shares _lsn and is consecutive",
+                          t.size() == 6 && t.get(1).get("_lsn").equals(t.get(2).get("_lsn"))
+                          && t.get(3).get("_lsn").equals(t.get(4).get("_lsn"))
+                          && !t.get(2).get("_lsn").equals(t.get(3).get("_lsn")));
                 }
-                List<List<String>> want = history
-                    ? List.of(Arrays.asList(null, null, id, "a"), Arrays.asList(id, "a", id, "b"),
-                              Arrays.asList(id, "b", id, null), Arrays.asList(id, null, null, null))
-                    : List.of(Arrays.asList(id, "a"), Arrays.asList(id, "b"),
-                              Arrays.asList(id, null), Arrays.asList(id, null));
-                check("H1 " + table + " txn " + i + ": images " + images, images.equals(want));
                 boolean seq = true, lsn = true;
                 for (int k = 1; k < t.size(); k++) {
                     seq &= Integer.parseInt(t.get(k).get("_op_seq")) > Integer.parseInt(t.get(k - 1).get("_op_seq"));
-                    lsn &= Long.parseLong(t.get(k).get("_lsn")) > Long.parseLong(t.get(k - 1).get("_lsn"));
+                    lsn &= Long.parseLong(t.get(k).get("_lsn")) >= Long.parseLong(t.get(k - 1).get("_lsn"));
                 }
-                check("H1 " + table + " txn " + i + ": _op_seq and _lsn increase", seq && lsn);
+                check("H1 " + table + " txn " + i + ": _op_seq increases, _lsn never decreases", seq && lsn);
                 long commit = Long.parseLong(t.get(0).get("_commit_lsn"));
                 check("H1 " + table + " txn " + i + ": every change LSN is below the commit LSN",
                       t.stream().allMatch(m -> Long.parseLong(m.get("_lsn")) < commit));
@@ -233,6 +244,11 @@ public class PaimonHistoryTest {
                 check("H1 " + table + " txn " + i + ": one commit timestamp, inside the test's window",
                       t.stream().map(m -> m.get("_ts")).distinct().count() == 1
                       && tsWithin(t.get(0).get("_ts"), t0 - 60_000, t1 + 60_000));
+                if (history) {
+                    check("H1 " + table + " txn " + i + ": _dt is the UTC date of the commit, and its directory exists",
+                          t.stream().allMatch(m -> m.get("_dt").equals(utcDate(m.get("_ts"))))
+                          && new File(tableDir(PG_SCHEMA, table) + "/_dt=" + t.get(0).get("_dt")).isDirectory());
+                }
             }
             List<Long> commits = byCommit.keySet().stream().map(Long::parseLong).toList();
             check("H1 " + table + ": commit LSNs ascend in commit order",
@@ -274,21 +290,22 @@ public class PaimonHistoryTest {
         }
         startWriter(test, Map.of());
         writerKeepsUp(test);
-        List<Map<String, String>> h = waitRows(table + "_hist", rs -> rs.size() >= 45);
+        waitRows(table + "_hist", rs -> rs.size() >= 60);
         Thread.sleep(3000);
-        h = rowsNow(PG_SCHEMA, table + "_hist");
-        check(test + " history: 45 rows (15 transactions x I, I, U), got " + h.size(), h.size() == 45);
+        List<Map<String, String>> h = rowsNow(PG_SCHEMA, table + "_hist");
+        check(test + " history: 60 rows (15 transactions x +I, +I, -U, +U), got " + h.size(), h.size() == 60);
         Set<String> keys = new HashSet<>();
         for (Map<String, String> m : h) keys.add(m.get("_commit_lsn") + "/" + m.get("_op_seq"));
-        check(test + " history: no change twice (distinct _commit_lsn/_op_seq)", keys.size() == h.size());
+        check(test + " history: no row twice (distinct _commit_lsn/_op_seq)", keys.size() == h.size());
         Map<String, Long> want = new TreeMap<>(), got = new TreeMap<>();
         for (int k = 1; k <= 15; k++) {
-            want.merge("I|" + (2 * k - 1) + "|r", 1L, Long::sum);
-            want.merge("I|" + (2 * k) + "|r", 1L, Long::sum);
-            want.merge("U|" + (2 * k - 1) + "|u" + k, 1L, Long::sum);
+            want.merge("+I|" + (2 * k - 1) + "|r", 1L, Long::sum);
+            want.merge("+I|" + (2 * k) + "|r", 1L, Long::sum);
+            want.merge("-U|" + (2 * k - 1) + "|r", 1L, Long::sum);
+            want.merge("+U|" + (2 * k - 1) + "|u" + k, 1L, Long::sum);
         }
-        for (Map<String, String> m : h) got.merge(m.get("_op") + "|" + m.get("after_id") + "|" + m.get("after_v"), 1L, Long::sum);
-        check(test + " history: exactly the changes PostgreSQL made", want.equals(got));
+        for (Map<String, String> m : h) got.merge(m.get("_op") + "|" + m.get("id") + "|" + m.get("v"), 1L, Long::sum);
+        check(test + " history: exactly the row images PostgreSQL made", want.equals(got));
         Map<String, Long> kinds = auditKinds(table);
         check(test + " main changelog exactly once " + kinds,
               kinds.equals(Map.of("+I", 30L, "-U", 15L, "+U", 15L)));
@@ -299,9 +316,9 @@ public class PaimonHistoryTest {
             + " UPDATE " + table + " SET v = 'u" + k + "' WHERE id = " + (2 * k - 1) + "; COMMIT");
     }
 
-    // ── H3: DDL keeps both tables consistent ──────────────────────────────────────────────
+    // ── H3: DDL rotates the history ───────────────────────────────────────────────────────
     static void h3_ddl() throws Exception {
-        System.out.println("\n── H3: DDL on T and T_hist ─────────────────────────");
+        System.out.println("\n── H3: every DDL archives T_hist and starts a new one ─");
         String t = "h3_t";
         try (Connection c = connect()) {
             exec(c, "CREATE TABLE " + t + " (id int PRIMARY KEY, a int, b text)");
@@ -317,40 +334,41 @@ public class PaimonHistoryTest {
             exec(c, "INSERT INTO " + t + " VALUES (4, 'w', 400)");
             exec(c, "UPDATE " + t + " SET b = 'y2' WHERE id = 2");
         }
-        List<Map<String, String>> h = waitRows(t + "_hist", rs -> rs.size() >= 6);
-        List<String> mainCols = fields(t);
-        List<String> histCols = fields(t + "_hist");
-        check("H3 main: a2 dropped, c is BIGINT " + mainCols,
-              mainCols.containsAll(List.of("id", "b", "c")) && !mainCols.contains("a2")
-              && !mainCols.contains("a") && "BIGINT".equals(type(t, "c")));
-        check("H3 history: kept before_a2/after_a2, no before_a, c BIGINT " + histCols,
-              histCols.containsAll(List.of("before_a2", "after_a2", "before_c", "after_c"))
-              && !histCols.contains("before_a") && "BIGINT".equals(type(t + "_hist", "after_c"))
-              && "BIGINT".equals(type(t + "_hist", "before_c")));
-        List<String> a2 = h.stream().map(m -> m.get("_op") + ":" + m.get("before_a2") + ">" + m.get("after_a2")).toList();
-        check("H3 history keeps the values of the renamed-then-dropped column " + a2,
-              a2.equals(List.of("I:null>10", "I:null>20", "U:10>10", "I:null>30", "I:null>null", "U:null>null")));
-        List<String> c = h.stream().map(m -> m.get("before_c") + ">" + m.get("after_c")).toList();
-        check("H3 history follows the added column " + c,
-              c.equals(List.of("null>null", "null>200", "null>100", "null>300", "null>400", "200>200")));
-        // the dropped name, re-added: the kept values stay apart from the new column's
-        try (Connection cn = connect()) {
-            exec(cn, "ALTER TABLE " + t + " ADD COLUMN a2 text");
-            exec(cn, "INSERT INTO " + t + " VALUES (5, 'v', 500, 'new')");
+        waitRows(t + "_hist", rs -> rs.size() >= 3);
+        List<String> arch = archives(PG_SCHEMA, t);
+        check("H3 four DDL messages, four archives, named <t>_hist_<16 hex>, chronological " + arch, arch.size() == 4);
+        if (arch.size() != 4) return;
+        List<List<String>> schemas = List.of(List.of("id", "a", "b"), List.of("id", "a", "b", "c"),
+            List.of("id", "a2", "b", "c"), List.of("id", "a2", "b", "c"), List.of("id", "b", "c"));
+        List<String> names = new ArrayList<>(arch);
+        names.add(t + "_hist");
+        for (int i = 0; i < 5; i++) {
+            List<String> f = fields(names.get(i));
+            List<String> want = new ArrayList<>(schemas.get(i));
+            want.addAll(List.of("_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts", "_dt"));
+            check("H3 " + names.get(i) + " has the schema of its generation " + f, f.equals(want));
         }
-        h = waitRows(t + "_hist", rs -> rs.size() >= 7);
-        histCols = fields(t + "_hist");
-        String retired = histCols.stream().filter(n -> n.startsWith("after_a2_retired_")).findFirst().orElse(null);
-        check("H3 re-adding a dropped name renames the kept pair aside " + histCols,
-              retired != null && histCols.contains("after_a2") && "STRING".equals(type(t + "_hist", "after_a2")));
-        if (retired != null) {
-            final String rc = retired;
-            check("H3 old values under " + rc + ", new under after_a2",
-                  "10".equals(h.get(0).get(rc)) && h.get(0).get("after_a2") == null
-                  && "new".equals(h.get(6).get("after_a2")) && h.get(6).get(rc) == null);
+        check("H3 the alter_col archive keeps c INT, the next one has BIGINT",
+              "INT".equals(type(arch.get(2), "c")) && "BIGINT".equals(type(arch.get(3), "c")));
+        List<List<String>> want = List.of(
+            List.of("+I|1|10|x|null"),
+            List.of("+I|2|20|y|200", "-U|1|10|x|null", "+U|1|10|x|100"),
+            List.of(),
+            List.of("+I|3|30|z|300"),
+            List.of("+I|4|-|w|400", "-U|2|-|y|200", "+U|2|-|y2|200"));
+        long total = 0;
+        for (int i = 0; i < 5; i++) {
+            final String a = i == 0 || i == 1 ? "a" : "a2";
+            List<String> got = rowsNow(PG_SCHEMA, names.get(i)).stream().map(m -> m.get("_op") + "|" + m.get("id") + "|"
+                + (m.containsKey(a) ? m.get(a) : "-") + "|" + m.get("b") + "|" + m.get("c")).toList();
+            if (i == 4) {
+                got = waitRows(names.get(i), rs -> rs.size() >= 3).stream().map(m -> m.get("_op") + "|" + m.get("id") + "|-|"
+                    + m.get("b") + "|" + m.get("c")).toList();
+            }
+            check("H3 " + names.get(i) + " holds exactly its generation's rows " + got, got.equals(want.get(i)));
+            total += got.size();
         }
         sameKeyed("H3 main table = PostgreSQL", t);
-        // DROP TABLE: the main table goes, the history stays, readable and complete
         try (Connection cn = connect()) {
             exec(cn, "DROP TABLE " + t);
         }
@@ -358,15 +376,105 @@ public class PaimonHistoryTest {
         long deadline = System.currentTimeMillis() + TIMEOUT_MS;
         while (mainDir.exists() && System.currentTimeMillis() < deadline) Thread.sleep(250);
         check("H3 DROP TABLE purged the main Paimon table", !mainDir.exists());
-        check("H3 DROP TABLE left " + t + "_hist with all 7 rows",
-              new File(tableDir(PG_SCHEMA, t + "_hist")).isDirectory() && rowsNow(PG_SCHEMA, t + "_hist").size() == 7);
+        long after = 0;
+        for (String n : names) after += rowsNow(PG_SCHEMA, n).size();
+        check("H3 DROP TABLE left " + t + "_hist and all four archives, with all " + total + " rows",
+              archives(PG_SCHEMA, t).size() == 4 && after == total);
         try (Connection cn = connect()) {
             exec(cn, "CREATE TABLE " + t + " (id int PRIMARY KEY, other text)");
             refused("H3 registering a new table of the same name", cn,
                 "SELECT paimon.add_table('" + t + "'::regclass)", "forget_history");
         }
         writerKeepsUp("H3");
-        check("H3 the retained history was not touched", rowsNow(PG_SCHEMA, t + "_hist").size() == 7);
+    }
+
+    // ── H3b: a transaction that straddles the DDL ─────────────────────────────────────────
+    static void h3b_straddle() throws Exception {
+        System.out.println("\n── H3b: BEGIN; INSERT; ALTER TABLE; INSERT; COMMIT ─────");
+        String t = "h3b_t";
+        try (Connection c = connect()) {
+            exec(c, "CREATE TABLE " + t + " (id int PRIMARY KEY, v text)");
+            exec(c, "SELECT paimon.add_table('" + t + "'::regclass)");
+            exec(c, "INSERT INTO " + t + " VALUES (1, 'before')");
+            exec(c, "BEGIN; INSERT INTO " + t + " VALUES (2, 'old schema'); ALTER TABLE " + t
+                + " ADD COLUMN w int; INSERT INTO " + t + " VALUES (3, 'new schema', 7); COMMIT");
+            exec(c, "INSERT INTO " + t + " VALUES (4, 'after', 8)");
+        }
+        List<Map<String, String>> cur = waitRows(t + "_hist", rs -> rs.size() >= 2);
+        List<String> arch = archives(PG_SCHEMA, t);
+        check("H3b one archive " + arch, arch.size() == 1);
+        if (arch.isEmpty()) return;
+        List<Map<String, String>> old = rowsNow(PG_SCHEMA, arch.get(0));
+        check("H3b the archive holds the rows decoded under the old schema: ids 1 and 2 "
+              + old.stream().map(m -> m.get("id")).toList(),
+              old.stream().map(m -> m.get("id")).toList().equals(List.of("1", "2")));
+        check("H3b the new history holds the rest: ids 3 and 4, with w "
+              + cur.stream().map(m -> m.get("id") + ":" + m.get("w")).toList(),
+              cur.stream().map(m -> m.get("id") + ":" + m.get("w")).toList().equals(List.of("3:7", "4:8")));
+        check("H3b the straddling transaction is in both, with one commit LSN",
+              old.size() == 2 && cur.size() == 2
+              && old.get(1).get("_commit_lsn").equals(cur.get(0).get("_commit_lsn")));
+        // read both by a _dt range: every change exactly once
+        String day = cur.get(0).get("_dt");
+        Set<String> keys = new HashSet<>();
+        long n = 0;
+        for (List<Map<String, String>> x : List.of(old, cur)) {
+            for (Map<String, String> m : x) {
+                if (m.get("_dt").compareTo(day) <= 0) {
+                    keys.add(m.get("_commit_lsn") + "/" + m.get("_op_seq"));
+                    n++;
+                }
+            }
+        }
+        check("H3b reading the archive and T_hist together by _dt <= " + day + ": 4 changes, each once",
+              n == 4 && keys.size() == 4);
+    }
+
+    // ── H3c: kill -9 at each step of a rotation ───────────────────────────────────────────
+    static void h3c_rotationCrash(String step) throws Exception {
+        String test = "H3c[" + step + "]";
+        System.out.println("\n── " + test + ": the writer dies after rotation step " + step + " ─");
+        if (launcher == null) { check(test + " harness exports the writer launcher", false); return; }
+        String t = "h3c_" + step.replace("rotate-", "");
+        try (Connection c = connect()) {
+            exec(c, "CREATE TABLE " + t + " (id int PRIMARY KEY, v text)");
+            exec(c, "SELECT paimon.add_table('" + t + "'::regclass)");
+            exec(c, "INSERT INTO " + t + " VALUES (1, 'a'), (2, 'b')");
+            exec(c, "UPDATE " + t + " SET v = 'a2' WHERE id = 1");
+        }
+        waitRows(t + "_hist", rs -> rs.size() >= 4);
+        restartWriter(test, Map.of("PGPAIMON_TEST_HALT_AT_STEP", step));
+        String pid = writerPid();
+        try (Connection c = connect()) {
+            exec(c, "INSERT INTO " + t + " VALUES (3, 'c')");
+            exec(c, "ALTER TABLE " + t + " ADD COLUMN w int");
+            exec(c, "INSERT INTO " + t + " VALUES (4, 'd', 4)");
+        }
+        check(test + " the writer halted at the step", waitProcessGone(pid, 60_000)
+              && writerLog().contains("halting right after rotation step " + step));
+        try (Connection c = connect()) {
+            exec(c, "UPDATE " + t + " SET w = 2 WHERE id = 2");           // while it is down
+        }
+        startWriter(test, Map.of());
+        writerKeepsUp(test);
+        List<Map<String, String>> cur = waitRows(t + "_hist", rs -> rs.size() >= 3);
+        Thread.sleep(2000);
+        cur = rowsNow(PG_SCHEMA, t + "_hist");
+        List<String> arch = archives(PG_SCHEMA, t);
+        check(test + " exactly one archive " + arch, arch.size() == 1);
+        if (arch.size() != 1) return;
+        List<String> old = rowsNow(PG_SCHEMA, arch.get(0)).stream()
+            .map(m -> m.get("_op") + "|" + m.get("id") + "|" + m.get("v")).toList();
+        check(test + " the archive holds the pre-DDL images exactly once " + old,
+              old.equals(List.of("+I|1|a", "+I|2|b", "-U|1|a", "+U|1|a2", "+I|3|c")));
+        List<String> now = cur.stream().map(m -> m.get("_op") + "|" + m.get("id") + "|" + m.get("v") + "|" + m.get("w")).toList();
+        check(test + " the new history holds the post-DDL images exactly once " + now,
+              now.equals(List.of("+I|4|d|4", "-U|2|b|null", "+U|2|b|2")));
+        check(test + " the main table has w once and equals PostgreSQL", fields(t).stream().filter("w"::equals).count() == 1);
+        sameKeyed(test + " main table = PostgreSQL", t);
+        Map<String, Long> kinds = auditKinds(t);
+        check(test + " main changelog exactly once " + kinds,
+              kinds.equals(Map.of("+I", 4L, "-U", 2L, "+U", 2L)));
     }
 
     // ── H4: a key-less table is an operation log ──────────────────────────────────────────
@@ -408,31 +516,22 @@ public class PaimonHistoryTest {
         check("H4 the log holds every operation, after values (deleted row for D), not erased by TRUNCATE " + got,
               got.equals(want));
         List<String> schema = fields(t);
-        check("H4 the log's columns " + schema,
+        check("H4 the log's columns: no _dt, not partitioned " + schema,
               schema.equals(List.of("id", "v", "big", "_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts")));
-        List<Map<String, String>> h = waitRows(t + "_hist", rs -> rs.size() >= want.size());
-        List<String> hg = h.stream().map(m -> m.get("_op") + "|" + m.get("before_id") + ">" + m.get("after_id") + "|"
-            + m.get("before_v") + ">" + m.get("after_v") + "|"
-            + (m.get("before_big") == null ? "-" : m.get("before_big").equals(big) ? "B" : "?") + ">"
-            + (m.get("after_big") == null ? "-" : m.get("after_big").equals(big) ? "B" : "?")).toList();
         List<String> hw = List.of(
-            "I|null>1|null>a|->-", "I|null>2|null>b|->-", "I|null>3|null>c|->B", "U|3>3|c>c2|B>B",
-            "U|1>1|a>a!|->-", "U|2>2|b>b!|->-", "D|3>null|c2>null|B>-", "I|null>4|null>dup|->-",
-            "I|null>4|null>dup|->-", "D|4>null|dup>null|->-", "D|4>null|dup>null|->-",
-            "T|null>null|null>null|->-", "I|null>5|null>after|->-");
-        check("H4 the history holds both images of each, the TOASTed value in both " + hg, hg.equals(hw));
-        check("H4 log and history agree on _commit_lsn/_lsn/_op_seq, row for row",
-              log.size() == h.size() && sameMeta(log, h));
+            "+I|1|a|-", "+I|2|b|-", "+I|3|c|B", "-U|3|c|B", "+U|3|c2|B",
+            "-U|1|a|-", "+U|1|a!|-", "-U|2|b|-", "+U|2|b!|-", "-D|3|c2|B", "+I|4|dup|-",
+            "+I|4|dup|-", "-D|4|dup|-", "-D|4|dup|-", "T|null|null|-", "+I|5|after|-");
+        List<Map<String, String>> h = waitRows(t + "_hist", rs -> rs.size() >= hw.size());
+        List<String> hg = h.stream().map(m -> m.get("_op") + "|" + m.get("id") + "|" + m.get("v") + "|"
+            + (m.get("big") == null ? "-" : m.get("big").equals(big) ? "B" : "?")).toList();
+        check("H4 the history has a row per image, the TOASTed value in both of an update's " + hg, hg.equals(hw));
+        Set<String> histKeys = new HashSet<>();
+        h.forEach(m -> histKeys.add(m.get("_commit_lsn") + "/" + m.get("_op_seq") + "/" + m.get("_xid") + "/" + m.get("_ts")));
+        check("H4 every log row's (_commit_lsn, _op_seq, _xid, _ts) is its change's first history row",
+              log.stream().allMatch(m -> histKeys.contains(m.get("_commit_lsn") + "/" + m.get("_op_seq") + "/"
+                                                           + m.get("_xid") + "/" + m.get("_ts"))));
         writerKeepsUp("H4");
-    }
-
-    static boolean sameMeta(List<Map<String, String>> a, List<Map<String, String>> b) {
-        for (int i = 0; i < a.size(); i++) {
-            for (String k : List.of("_op", "_commit_lsn", "_lsn", "_op_seq", "_xid", "_ts")) {
-                if (!Objects.equals(a.get(i).get(k), b.get(i).get(k))) return false;
-            }
-        }
-        return true;
     }
 
     // ── H4b: a key-less log replayed after a crash adds nothing ───────────────────────────
@@ -466,8 +565,72 @@ public class PaimonHistoryTest {
         Map<String, Long> ops = new TreeMap<>();
         for (Map<String, String> m : log) ops.merge(m.get("_op"), 1L, Long::sum);
         check("H4b the replay duplicated nothing in the log " + ops, ops.equals(Map.of("I", 16L, "U", 16L)));
-        List<Map<String, String>> h = rowsNow(PG_SCHEMA, t + "_hist");
-        check("H4b ... nor in its history (" + h.size() + " rows)", h.size() == 32);
+        Map<String, Long> hops = new TreeMap<>();
+        for (Map<String, String> m : rowsNow(PG_SCHEMA, t + "_hist")) hops.merge(m.get("_op"), 1L, Long::sum);
+        check("H4b ... nor in its history " + hops, hops.equals(Map.of("+I", 16L, "-U", 16L, "+U", 16L)));
+    }
+
+    // ── H7: _dt follows the UTC date whatever the time zones ──────────────────────────────
+    static void h7_timeZones() throws Exception {
+        System.out.println("\n── H7: non-UTC writer JVM and PostgreSQL session ──");
+        if (launcher == null) { check("H7 harness exports the writer launcher", false); return; }
+        String zone;
+        try (Connection c = connect(); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT extract(hour FROM now() AT TIME ZONE 'UTC')::int")) {
+            rs.next();
+            // A zone whose calendar date differs from UTC's right now.
+            zone = rs.getInt(1) >= 12 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
+        }
+        restartWriter("H7", Map.of("JAVA_TOOL_OPTIONS", "-Duser.timezone=" + zone));
+        check("H7 the writer JVM runs in " + zone,
+              writerLog().contains("Picked up JAVA_TOOL_OPTIONS: -Duser.timezone=" + zone));
+        String t = "h7_t";
+        String utcDay, localDay;
+        try (Connection c = connect()) {
+            exec(c, "CREATE TABLE " + t + " (id int PRIMARY KEY)");
+            exec(c, "SELECT paimon.add_table('" + t + "'::regclass)");
+            c.setAutoCommit(false);
+            exec(c, "SET TimeZone = '" + zone + "'");
+            exec(c, "INSERT INTO " + t + " VALUES (1)");
+            try (Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT (now() AT TIME ZONE 'UTC')::date::text, now()::date::text")) {
+                rs.next();
+                utcDay = rs.getString(1);
+                localDay = rs.getString(2);
+            }
+            c.commit();
+        }
+        check("H7 the session's local date (" + localDay + ") differs from the UTC date (" + utcDay + ")",
+              !localDay.equals(utcDay));
+        List<Map<String, String>> h = waitRows(t + "_hist", rs -> rs.size() >= 1);
+        check("H7 _dt is the UTC date of the commit (" + (h.isEmpty() ? "none" : h.get(0).get("_dt")) + ")",
+              h.size() == 1 && h.get(0).get("_dt").equals(utcDay)
+              && h.get(0).get("_dt").equals(utcDate(h.get(0).get("_ts"))));
+        check("H7 the row is in the directory _dt=" + utcDay,
+              new File(tableDir(PG_SCHEMA, t + "_hist") + "/_dt=" + utcDay).isDirectory()
+              && !new File(tableDir(PG_SCHEMA, t + "_hist") + "/_dt=" + localDay).exists());
+        restartWriter("H7", Map.of());
+    }
+
+    // ── H8: the history's bucket count ─────────────────────────────────────────────────────
+    static void h8_histBuckets() throws Exception {
+        System.out.println("\n── H8: hist_buckets reaches the history table ──────");
+        try (Connection c = connect()) {
+            exec(c, "CREATE TABLE h8_t (id int PRIMARY KEY)");
+            exec(c, "SELECT paimon.add_table('h8_t'::regclass, hist_buckets => 3)");
+            exec(c, "INSERT INTO h8_t VALUES (1)");
+        }
+        waitRows("h8_t_hist", rs -> rs.size() >= 1);
+        String b = option("h8_t_hist", "bucket");
+        check("H8 h8_t_hist has the 3 buckets per partition asked for (" + b + "), h8_t its own ("
+              + option("h8_t", "bucket") + ")", "3".equals(b) && "4".equals(option("h8_t", "bucket")));
+        try (Connection c = connect()) {
+            exec(c, "ALTER TABLE h8_t ADD COLUMN x int");
+            exec(c, "INSERT INTO h8_t VALUES (2, 2)");
+        }
+        waitRows("h8_t_hist", rs -> rs.size() >= 1 && fieldsQuiet("h8_t_hist").contains("x"));
+        check("H8 the user's count survives a rotation (" + option("h8_t_hist", "bucket") + ")",
+              "3".equals(option("h8_t_hist", "bucket")));
     }
 
     // ── H5: name collisions ───────────────────────────────────────────────────────────────
@@ -478,7 +641,7 @@ public class PaimonHistoryTest {
             exec(c, "CREATE TABLE h5_x_hist (id int PRIMARY KEY)");
             exec(c, "SELECT paimon.add_table('h5_x'::regclass)");
             refused("H5 X tracked, then X_hist", c, "SELECT paimon.add_table('h5_x_hist'::regclass)",
-                    "is the history table of replicated table");
+                    "is a history table of replicated table");
             exec(c, "CREATE TABLE h5_y_hist (id int PRIMARY KEY)");
             exec(c, "CREATE TABLE h5_y (id int PRIMARY KEY)");
             exec(c, "SELECT paimon.add_table('h5_y_hist'::regclass)");
@@ -538,7 +701,7 @@ public class PaimonHistoryTest {
         long deadline = System.currentTimeMillis() + TIMEOUT_MS;
         boolean seen;
         do {
-            seen = rowsNow(PG_SCHEMA, "hist_sentinel_hist").stream().anyMatch(m -> ("" + id).equals(m.get("after_id")));
+            seen = rowsNow(PG_SCHEMA, "hist_sentinel_hist").stream().anyMatch(m -> ("" + id).equals(m.get("id")));
             if (!seen) Thread.sleep(250);
         } while (!seen && System.currentTimeMillis() < deadline);
         check(test + ": a row written afterwards reaches Paimon", seen);
@@ -587,8 +750,44 @@ public class PaimonHistoryTest {
         return out;
     }
 
+    /** The UTC calendar date of a {@code _ts} rendered as epoch microseconds. */
+    static String utcDate(String micros) {
+        return java.time.LocalDate.ofEpochDay(Math.floorDiv(Long.parseLong(micros), 86_400_000_000L)).toString();
+    }
+
+    /** The archives of a table's history, {@code <t>_hist_<16 hex>}, sorted (= chronological). */
+    static List<String> archives(String schema, String t) throws Exception {
+        List<String> out = new ArrayList<>();
+        Options o = new Options();
+        o.set("warehouse", warehouse);
+        try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+            for (String n : catalog.listTables(schema)) {
+                if (n.matches(java.util.regex.Pattern.quote(t + "_hist_") + "[0-9A-F]{16}")) out.add(n);
+            }
+        }
+        Collections.sort(out);
+        return out;
+    }
+
+    static String option(String table, String key) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", warehouse);
+        try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+            return catalog.getTable(Identifier.create(PG_SCHEMA, table)).options().get(key);
+        }
+    }
+
+    static List<String> fieldsQuiet(String table) {
+        try {
+            return fields(table);
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     static String render(DataField f, Object v) {
         switch (f.type().getTypeRoot()) {
+            case DATE: return java.time.LocalDate.ofEpochDay((Integer) v).toString();
             case DECIMAL: return ((org.apache.paimon.data.Decimal) v).toBigDecimal().toPlainString();
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
