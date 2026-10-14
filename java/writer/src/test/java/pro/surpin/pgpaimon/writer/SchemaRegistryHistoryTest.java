@@ -256,19 +256,20 @@ class SchemaRegistryHistoryTest {
     @Test
     void aRotationResizesTheNewHistoryFromMeasuredPartitions() throws Exception {
         String addX = "{\"v\":1,\"op\":\"add_col\",\"relid\":%d,\"col\":{\"id\":3,\"name\":\"x\",\"type\":\"INT\"}}";
-        // three small days: measured, ceil(small / 1 GiB) = 1, replacing the estimate of 9
+        // five small days (three full, between a partial first and last): measured,
+        // ceil(small / 1 GiB) = 1, replacing the estimate of 9
         send(create(50301, "bk3", "[\"id\"]", "r301", "9"));
         assertEquals("9", get("bk3_hist").options().get("bucket"));
-        writeRows("bk3_hist", 5, 3);
+        writeRows("bk3_hist", 5, 5);
         send(addX.formatted(50301));
-        assertEquals("1", get("bk3_hist").options().get("bucket"), "measured from 3 days");
+        assertEquals("1", get("bk3_hist").options().get("bucket"), "measured from 3 full days");
         assertEquals("9", get(archives("bk3").get(0)).options().get("bucket"),
                      "the archived table keeps its count");
-        // two days: not enough, the estimate stays
+        // four days, two of them full: not enough, the estimate stays
         send(create(50302, "bk2", "[\"id\"]", "r302", "9"));
-        writeRows("bk2_hist", 5, 2);
+        writeRows("bk2_hist", 5, 4);
         send(addX.formatted(50302));
-        assertEquals("9", get("bk2_hist").options().get("bucket"), "two days: estimate kept");
+        assertEquals("9", get("bk2_hist").options().get("bucket"), "two full days: estimate kept");
         // the user's count wins over any measurement
         send(create(50303, "bku", "[\"id\"]", "r303", "7")
             .replace("\"hist-bucket-user\":\"false\"", "\"hist-bucket-user\":\"true\""));

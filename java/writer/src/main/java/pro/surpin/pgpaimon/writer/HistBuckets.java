@@ -39,16 +39,24 @@ public final class HistBuckets {
     /**
      * The bucket count measured from history already written: {@code bytesByDay} maps a
      * {@code _dt} (days since the epoch) to the data bytes of that day. The average over the most
-     * recent {@link #WINDOW} days present; empty when fewer than {@link #MIN_DAYS} days exist.
+     * recent {@link #WINDOW} FULL days present; empty when fewer than {@link #MIN_DAYS} full days
+     * exist.
+     *
+     * <p>The oldest and the newest day present are left out: the oldest starts when the table
+     * did (add_table or the previous rotation) and the newest is the day of this rotation, so
+     * both are partial, and averaging them in biased the count low (review of the history tables,
+     * m5).
      */
     public static OptionalInt measured(Map<Integer, Long> bytesByDay) {
-        if (bytesByDay.size() < MIN_DAYS) {
+        if (bytesByDay.size() < MIN_DAYS + 2) {
             return OptionalInt.empty();
         }
-        TreeMap<Integer, Long> sorted = new TreeMap<>(bytesByDay);
+        TreeMap<Integer, Long> full = new TreeMap<>(bytesByDay);
+        full.pollFirstEntry();
+        full.pollLastEntry();
         long sum = 0;
         int n = 0;
-        for (Long b : sorted.descendingMap().values()) {
+        for (Long b : full.descendingMap().values()) {
             if (n == WINDOW) {
                 break;
             }
