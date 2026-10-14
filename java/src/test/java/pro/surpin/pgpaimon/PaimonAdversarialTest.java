@@ -94,6 +94,7 @@ public class PaimonAdversarialTest {
         run("A14", PaimonAdversarialTest::a14_otherPublications);
         run("A17", PaimonAdversarialTest::a17_renameInsideATransaction);
         run("A18", PaimonAdversarialTest::a18_secondReviewBypasses);
+        run("A19", PaimonAdversarialTest::a19_lockDoesNotStallReplication);
         run("A16", PaimonAdversarialTest::a16_secretRotation);
         run("A15", PaimonAdversarialTest::a15_healthStopsTheWriter);
 
@@ -519,6 +520,48 @@ public class PaimonAdversarialTest {
         }
         writerKeepsUp("A18");
         sameRows("A18 the owner's ADD COLUMN replicated, every value unchanged", t, "id");
+    }
+
+    // ── A19: a lock on a replicated table does not hold up replication ────────────────────
+    // Review finding I1: the periodic paimon.health() runs on the consumer's thread and waited
+    // behind any ACCESS EXCLUSIVE lock on a replicated table (VACUUM FULL, CLUSTER, a long ALTER):
+    // a row of an UNRELATED table waited for the whole lock. It now gives up after lock_timeout.
+    static void a19_lockDoesNotStallReplication() throws Exception {
+        System.out.println("\n── A19: a held lock and the health check ───────────");
+        String launcher = System.getenv("PGPAIMON_WRITER_LAUNCHER");
+        String pidFile = System.getenv("PGPAIMON_WRITER_PID_FILE");
+        String t = "dba_locked";
+        try (Connection c = connect()) {
+            createTracked(c, t, "id int PRIMARY KEY");
+        }
+        stopWriter(pidFile);
+        startWriter("A19", launcher, Map.of("PGPAIMON_HEALTH_INTERVAL_MS", "1000"), true);
+        writerKeepsUp("A19 before the lock");
+        try (Connection locker = connect()) {
+            locker.setAutoCommit(false);
+            exec(locker, "LOCK TABLE " + t + " IN ACCESS EXCLUSIVE MODE");
+            Thread.sleep(3000);            // several health intervals inside the lock
+            int id = ++sentinelId;
+            long start = System.currentTimeMillis();
+            try (Connection c = connect()) {
+                exec(c, "INSERT INTO dba_sentinel VALUES (" + id + ", 'A19 under the lock')");
+            }
+            boolean seen = false;
+            while (!seen && System.currentTimeMillis() - start < 15_000) {
+                seen = paimonRowsNow("dba_sentinel", "id").containsKey(String.valueOf(id));
+                if (!seen) Thread.sleep(200);
+            }
+            long took = System.currentTimeMillis() - start;
+            check("A19 a row of another table replicates while the lock is held (" + took + " ms)",
+                  seen);
+            check("A19 the writer is still running under the lock", processAlive(writerPid(pidFile)));
+            locker.rollback();
+        }
+        check("A19 the timed-out checks were logged as such, not as problems",
+              writerLog().contains("lock timeout") || writerLog().contains("could not run paimon.health()"));
+        stopWriter(pidFile);
+        startWriter("A19 restart", launcher, Map.of(), true);
+        writerKeepsUp("A19 after the lock");
     }
 
     // ── A14: another publication on a replicated table ─────────────────────────────────────
