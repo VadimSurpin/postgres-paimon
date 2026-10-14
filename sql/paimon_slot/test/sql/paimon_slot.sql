@@ -778,6 +778,26 @@ ALTER TABLE srr_t DROP COLUMN unseen;
 ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
 ALTER EVENT TRIGGER paimon_sql_drop ENABLE ALWAYS;
 SELECT * FROM paimon.health();
+-- every other kind of row health() reports, each made behind the guardrails' back
+ALTER EXTENSION paimon_slot DROP EVENT TRIGGER paimon_table_rewrite;
+DROP EVENT TRIGGER paimon_table_rewrite;
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+CREATE TABLE srr_child () INHERITS (srr_t);
+ALTER TABLE srr_t ADD COLUMN amt numeric(5,2);  -- the registry goes stale and the column unguarded
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+INSERT INTO paimon.table_registry (relid, schema_name, table_name, pk_cols, cols, hist_table)
+VALUES (1, 'public', 'ghost', '{id}', '[]', 'ghost_hist');
+SELECT * FROM paimon.health();
+DELETE FROM paimon.table_registry WHERE relid = 1;
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+DROP TABLE srr_child;
+ALTER TABLE srr_t DROP COLUMN amt;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+CREATE EVENT TRIGGER paimon_table_rewrite ON table_rewrite
+    EXECUTE FUNCTION paimon.on_table_rewrite();
+ALTER EVENT TRIGGER paimon_table_rewrite ENABLE ALWAYS;
+ALTER EXTENSION paimon_slot ADD EVENT TRIGGER paimon_table_rewrite;
+SELECT * FROM paimon.health();
 DROP TABLE srr_t;
 SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 

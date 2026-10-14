@@ -2134,6 +2134,39 @@ SELECT * FROM paimon.health();
 --------
 (0 rows)
 
+-- every other kind of row health() reports, each made behind the guardrails' back
+ALTER EXTENSION paimon_slot DROP EVENT TRIGGER paimon_table_rewrite;
+DROP EVENT TRIGGER paimon_table_rewrite;
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+CREATE TABLE srr_child () INHERITS (srr_t);
+ALTER TABLE srr_t ADD COLUMN amt numeric(5,2);  -- the registry goes stale and the column unguarded
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+INSERT INTO paimon.table_registry (relid, schema_name, table_name, pk_cols, cols, hist_table)
+VALUES (1, 'public', 'ghost', '{id}', '[]', 'ghost_hist');
+SELECT * FROM paimon.health();
+                                                               health                                                               
+------------------------------------------------------------------------------------------------------------------------------------
+ event trigger paimon_table_rewrite is missing: DDL on replicated tables is no longer checked or replicated
+ registry row for public.ghost names relation 1, which no longer exists
+ replicated table public.srr_t has changed without its DDL being replicated: paimon.table_registry.cols no longer matches the table
+ replicated table public.srr_t has lost value guard paimon_guard_4 on column amt
+ replicated table public.srr_t has inheritance children, whose rows are not replicated
+(5 rows)
+
+DELETE FROM paimon.table_registry WHERE relid = 1;
+ALTER EVENT TRIGGER paimon_ddl_end DISABLE;
+DROP TABLE srr_child;
+ALTER TABLE srr_t DROP COLUMN amt;
+ALTER EVENT TRIGGER paimon_ddl_end ENABLE ALWAYS;
+CREATE EVENT TRIGGER paimon_table_rewrite ON table_rewrite
+    EXECUTE FUNCTION paimon.on_table_rewrite();
+ALTER EVENT TRIGGER paimon_table_rewrite ENABLE ALWAYS;
+ALTER EXTENSION paimon_slot ADD EVENT TRIGGER paimon_table_rewrite;
+SELECT * FROM paimon.health();
+ health 
+--------
+(0 rows)
+
 DROP TABLE srr_t;
 SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
  drained 
