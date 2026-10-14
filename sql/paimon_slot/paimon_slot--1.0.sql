@@ -11,9 +11,40 @@ CREATE TABLE paimon.table_registry (
     replica_identity   text        NOT NULL DEFAULT 'full',
     changelog_producer text        NOT NULL DEFAULT 'input',
     buckets            int         NOT NULL DEFAULT 4,
-    registered_at      timestamptz NOT NULL DEFAULT now()
+    registered_at      timestamptz NOT NULL DEFAULT now(),
+    -- The operation history table the writer keeps beside the main one, in the same Paimon
+    -- database (= this schema): every row-level change, before and after, never collapsed.
+    -- Always table_name || '_hist'; recorded rather than derived so that health() and
+    -- the collision checks in add_table() read one place. See docs/superpowers/specs/
+    -- 2026-10-14-operation-history-design.md.
+    hist_table         text        NOT NULL,
+    -- Identifies this registration. The writer stamps it on the history table it creates and
+    -- refuses to append to a history table carrying another one: a table dropped and
+    -- re-created under the same name must not continue someone else's audit trail.
+    registration       uuid        NOT NULL DEFAULT gen_random_uuid()
 );
 SELECT pg_catalog.pg_extension_config_dump('paimon.table_registry', '');
+
+/*
+ * History tables left behind. DROP TABLE and paimon.remove_table() stop replicating a table but
+ * deliberately leave its history table in Paimon as the retained audit trail (the main table is
+ * purged by DROP TABLE and kept by remove_table, as before). One row per such table, so that
+ * add_table() can refuse a table whose main or history Paimon table would land on it: appending
+ * a different table's changes to a retained audit trail, or a gap in one, is silent corruption
+ * of the one thing the history exists to be. paimon.forget_history() removes a row once the
+ * operator has renamed or dropped that Paimon table by hand.
+ */
+CREATE TABLE paimon.retained_history (
+    schema_name  text        NOT NULL,
+    hist_table   text        NOT NULL,
+    relid        oid         NOT NULL,
+    table_name   text        NOT NULL,
+    registration uuid        NOT NULL,
+    reason       text        NOT NULL,
+    retained_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (schema_name, hist_table)
+);
+SELECT pg_catalog.pg_extension_config_dump('paimon.retained_history', '');
 
 -- Mirror of legacy:extension/type_map_pg.h.  Returns a Paimon type string.
 -- quiet => true suppresses the unmapped-type WARNING, for health(), which re-derives every
@@ -591,6 +622,7 @@ DECLARE
     v_kind   "char";
     v_has_rows boolean;
     v_buckets  int;
+    v_registration uuid;
 BEGIN
     IF replica_identity <> 'full' THEN
         RAISE EXCEPTION 'paimon_slot: replica_identity => % is not implemented in v1',
@@ -625,11 +657,15 @@ BEGIN
     -- Lock before reading pk/cols so a concurrent ADD COLUMN cannot leave stale cols in the registry.
     EXECUTE format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE', rel::text);
 
+    /*
+     * A table with no primary key is accepted: its main Paimon table is an append-only
+     * operation log (op type, LSNs, xid, commit time, the row's values) instead of a
+     * primary-key table, because without a key there is nothing to merge on. It still needs
+     * REPLICA IDENTITY FULL, set below like every other table, so that UPDATE and DELETE are
+     * legal and carry the whole old row. docs/superpowers/specs/2026-10-14-operation-history-design.md.
+     */
     v_pk := paimon.pk_cols(v_relid);
-    IF cardinality(v_pk) = 0 THEN
-        RAISE EXCEPTION 'paimon_slot: % has no primary key', rel
-              USING HINT = 'a primary key is required; see design spec section 4';
-    END IF;
+    PERFORM paimon.reject_name_collision(v_nsp, v_name);
 
     IF EXISTS (SELECT 1 FROM pg_constraint
                WHERE conrelid = v_relid AND contype = 'p' AND condeferrable) THEN
@@ -638,7 +674,7 @@ BEGIN
     END IF;
 
     v_cols := paimon.table_cols(v_relid);
-    PERFORM paimon.reject_reserved_name(c->>'name') FROM jsonb_array_elements(v_cols) c;
+    PERFORM paimon.reject_reserved_name(c->>'name', cardinality(v_pk) = 0) FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_unsafe_numeric(v_relid, (c->>'id')::int) FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_unsupported_column(v_relid, (c->>'id')::int) FROM jsonb_array_elements(v_cols) c;
     PERFORM paimon.reject_inheritance(v_relid);
@@ -673,16 +709,20 @@ BEGIN
 
     INSERT INTO paimon.table_registry
         (relid, schema_name, table_name, pk_cols, cols,
-         backfill_due, replica_identity, changelog_producer, buckets)
+         backfill_due, replica_identity, changelog_producer, buckets, hist_table)
     VALUES (v_relid, v_nsp, v_name, v_pk, v_cols,
-            v_has_rows, replica_identity, changelog_producer, v_buckets);
+            v_has_rows, replica_identity, changelog_producer, v_buckets,
+            paimon.hist_name(v_name))
+    RETURNING registration INTO v_registration;
 
     PERFORM paimon.emit(jsonb_build_object(
         'v', 1, 'op', 'create', 'relid', v_relid,
         'schema', v_nsp, 'table', v_name,
         'pk', to_jsonb(v_pk), 'cols', paimon.wire_cols(v_cols),
         'options', jsonb_build_object('changelog-producer', changelog_producer,
-                                      'bucket', v_buckets)));
+                                      'bucket', v_buckets,
+                                      'hist-table', paimon.hist_name(v_name),
+                                      'registration', v_registration)));
 END $$;
 
 CREATE FUNCTION paimon.remove_table(rel regclass) RETURNS void
@@ -693,6 +733,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM paimon.table_registry WHERE relid = rel::oid) THEN
         RAISE EXCEPTION 'paimon_slot: % is not tracked', rel;
     END IF;
+    -- The history table stays in Paimon as the retained audit trail; remember it, so that a
+    -- later add_table() cannot append a different registration's changes to it.
+    PERFORM paimon.retain_history(rel::oid, 'remove_table');
     -- ORDER IS LOAD-BEARING: the registry row goes FIRST. The event triggers guard every
     -- replicated table, i.e. every registry row: with the row still present, leaving the
     -- publication is refused by check_publication() and dropping a value guard by
@@ -725,7 +768,10 @@ BEGIN
     LOOP
         IF r.data LIKE 'message: transactional:%prefix: paimon, sz:%' THEN
             -- The credential is random per installation, so it is not part of what tests see.
-            RETURN NEXT substring(r.data from position('content:' in r.data) + 8)::jsonb - 'auth';
+            -- The credential and the registration id are random per installation, so neither
+            -- is part of what tests see.
+            RETURN NEXT substring(r.data from position('content:' in r.data) + 8)::jsonb - 'auth'
+                        #- '{options,registration}';
         END IF;
     END LOOP;
 END $$;
@@ -738,8 +784,8 @@ REVOKE ALL ON FUNCTION paimon.peek_messages() FROM PUBLIC;
  * one (ruling R4).  Compared case-insensitively.  The single definition of the
  * rule: add_table() and the ddl_command_end trigger both call it.
  */
-CREATE FUNCTION paimon.reject_reserved_name(col_name text) RETURNS void
-LANGUAGE plpgsql IMMUTABLE AS $$
+CREATE FUNCTION paimon.reject_reserved_name(col_name text, keyless boolean DEFAULT false)
+RETURNS void LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
     IF lower(col_name) = ANY (ARRAY['_value_kind', '_row_id', 'rowkind',
                                     '_level', '_sequence_number']) THEN
@@ -766,6 +812,91 @@ BEGIN
     IF col_name IN ('_seq', '_op_seq', '_xid') THEN
         RAISE EXCEPTION 'paimon_slot: column name "%" is a metadata field the writer adds to every Paimon table', col_name
               USING HINT = 'choose a different column name (the writer''s fields are set by PGPAIMON_SEQ_FIELD, PGPAIMON_OP_SEQ_FIELD and PGPAIMON_XID_FIELD; these are their defaults)';
+    END IF;
+    /*
+     * A table with no primary key is replicated as an operation log whose Paimon table carries
+     * the user's columns unprefixed beside _op, _commit_lsn, _lsn, _op_seq, _xid and _ts; a
+     * user column with one of those names would duplicate a field. (History tables prefix
+     * every user column with before_/after_, so they cannot collide.)
+     */
+    IF keyless AND col_name IN ('_op', '_commit_lsn', '_lsn', '_ts') THEN
+        RAISE EXCEPTION 'paimon_slot: column name "%" is a field of the operation log a table without a primary key is replicated as', col_name
+              USING HINT = 'choose a different column name; _op, _commit_lsn, _lsn, _op_seq, _xid and _ts are the log''s own fields';
+    END IF;
+END $$;
+
+/* The history table of a table registered as `name`. One place, so every check agrees. */
+CREATE FUNCTION paimon.hist_name(name text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$ SELECT name || '_hist' $$;
+
+/*
+ * add_table() writes two Paimon tables, <schema>.T and <schema>.T_hist, and neither may be
+ * one that already belongs to something else. Refused (same schema = same Paimon database):
+ *   - T_hist is a replicated table's own name: its main table and T's history would be one;
+ *   - T is a replicated table's history (T = X_hist with X replicated);
+ *   - T or T_hist is a history table retained from a table no longer replicated
+ *     (paimon.retained_history): appending a new registration's changes to that audit trail,
+ *     or turning it into a main table, corrupts it silently.
+ * Whether a same-named Paimon table exists that this extension never made is invisible from
+ * here; the writer refuses to adopt a history table carrying another registration (or none).
+ */
+CREATE FUNCTION paimon.reject_name_collision(v_schema text, v_table text) RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    other text;
+    kept  paimon.retained_history;
+BEGIN
+    SELECT table_name INTO other FROM paimon.table_registry
+     WHERE schema_name = v_schema AND table_name = paimon.hist_name(v_table);
+    IF FOUND THEN
+        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: its history table %.% would be the replicated table %.%',
+                        v_schema, v_table, v_schema, paimon.hist_name(v_table), v_schema, other
+              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema; rename one of the two tables before paimon.add_table()';
+    END IF;
+    SELECT table_name INTO other FROM paimon.table_registry
+     WHERE schema_name = v_schema AND hist_table = v_table;
+    IF FOUND THEN
+        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: that name is the history table of replicated table %.%',
+                        v_schema, v_table, v_schema, other
+              USING HINT = 'every replicated table T gets a Paimon history table T_hist in the same schema; rename the table before paimon.add_table()';
+    END IF;
+    SELECT * INTO kept FROM paimon.retained_history
+     WHERE schema_name = v_schema AND hist_table IN (v_table, paimon.hist_name(v_table))
+     ORDER BY retained_at LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'paimon_slot: cannot replicate %.%: Paimon table %.% is the retained history of %.%, which stopped being replicated by %',
+                        v_schema, v_table, kept.schema_name, kept.hist_table, kept.schema_name,
+                        kept.table_name, kept.reason
+              USING HINT = format('a history table is kept as the audit trail when its table is dropped or removed, and a new registration must not append to it. Rename or drop the Paimon table %s.%s by hand (from Spark or Flink, or move its directory), then run SELECT paimon.forget_history(%L, %L); and add the table again',
+                                  kept.schema_name, kept.hist_table, kept.schema_name, kept.hist_table);
+    END IF;
+END $$;
+
+/* Records that a table's history table stays behind (remove_table, DROP TABLE). */
+CREATE FUNCTION paimon.retain_history(v_relid oid, why text) RETURNS void
+LANGUAGE sql AS $$
+    INSERT INTO paimon.retained_history (schema_name, hist_table, relid, table_name, registration, reason)
+    SELECT schema_name, hist_table, relid, table_name, registration, why
+      FROM paimon.table_registry WHERE relid = v_relid
+    ON CONFLICT (schema_name, hist_table) DO UPDATE
+       SET relid = EXCLUDED.relid, table_name = EXCLUDED.table_name,
+           registration = EXCLUDED.registration, reason = EXCLUDED.reason,
+           retained_at = now();
+$$;
+
+/*
+ * The operator's statement that a retained history table has been renamed or dropped in
+ * Paimon by hand, so the name is free again. Nothing here can check that; the writer still
+ * refuses to adopt a history table carrying another registration.
+ */
+CREATE FUNCTION paimon.forget_history(schema_name text, hist_table text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM paimon.retained_history h
+     WHERE h.schema_name = forget_history.schema_name AND h.hist_table = forget_history.hist_table;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'paimon_slot: %.% is not a retained history table', schema_name, hist_table
+              USING HINT = 'SELECT * FROM paimon.retained_history lists them';
     END IF;
 END $$;
 
@@ -893,7 +1024,7 @@ BEGIN
                       USING HINT = 'add the column without a default, then UPDATE it';
             END IF;
 
-            PERFORM paimon.reject_reserved_name(c->>'name');
+            PERFORM paimon.reject_reserved_name(c->>'name', cardinality(reg.pk_cols) = 0);
 
             IF (c->>'type') LIKE '% NOT NULL' THEN
                 RAISE EXCEPTION
@@ -902,7 +1033,7 @@ BEGIN
             END IF;
         ELSE
             IF (o->>'name') <> (c->>'name') THEN
-                PERFORM paimon.reject_reserved_name(c->>'name');
+                PERFORM paimon.reject_reserved_name(c->>'name', cardinality(reg.pk_cols) = 0);
             END IF;
 
             /*
@@ -1168,6 +1299,8 @@ BEGIN
         PERFORM paimon.emit(jsonb_build_object(
             'v', 1, 'op', 'drop_table', 'relid', obj.objid,
             'schema', reg.schema_name, 'table', reg.table_name));
+        -- drop_table purges the main Paimon table and LEAVES the history table.
+        PERFORM paimon.retain_history(obj.objid, 'DROP TABLE');
         DELETE FROM paimon.table_registry WHERE relid = obj.objid;
     END LOOP;
 
@@ -1250,6 +1383,18 @@ BEGIN
         END LOOP;
         IF EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent = r.relid) THEN
             RETURN NEXT format('replicated table %s has inheritance children, whose rows are not replicated', r.relid::regclass);
+        END IF;
+        IF r.hist_table IS DISTINCT FROM paimon.hist_name(r.table_name) THEN
+            RETURN NEXT format('registry row for %I.%I names history table %L, not %L', r.schema_name, r.table_name, r.hist_table, paimon.hist_name(r.table_name));
+        END IF;
+        IF EXISTS (SELECT 1 FROM paimon.table_registry o
+                    WHERE o.schema_name = r.schema_name AND o.hist_table = r.table_name) THEN
+            RETURN NEXT format('replicated table %I.%I has the name of another replicated table''s history table: both would write one Paimon table', r.schema_name, r.table_name);
+        END IF;
+        IF EXISTS (SELECT 1 FROM paimon.retained_history h
+                    WHERE h.schema_name = r.schema_name
+                      AND h.hist_table IN (r.table_name, r.hist_table)) THEN
+            RETURN NEXT format('replicated table %I.%I writes a Paimon table that paimon.retained_history records as the retained history of a table no longer replicated', r.schema_name, r.table_name);
         END IF;
     END LOOP;
 END $$;

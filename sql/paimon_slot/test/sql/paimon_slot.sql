@@ -51,9 +51,12 @@ CREATE TABLE no_cols_t ();
 SELECT paimon.table_cols('no_cols_t'::regclass) AS cols,
        paimon.table_cols('no_cols_t'::regclass) IS NULL AS is_null;
 
--- add_table requires a primary key
+-- a table without a primary key is accepted (replicated as an operation log); see section (12)
 CREATE TABLE nopk (a int);
-SELECT paimon.add_table('nopk'::regclass);        -- expect ERROR
+SELECT paimon.add_table('nopk'::regclass);
+SELECT pk_cols, hist_table FROM paimon.table_registry WHERE relid = 'nopk'::regclass;
+SELECT paimon.remove_table('nopk'::regclass);
+SELECT paimon.forget_history('public', 'nopk_hist');
 
 -- the v1 escapes are accepted but not implemented
 SELECT paimon.add_table('reg_t'::regclass, 'default');          -- expect ERROR
@@ -686,6 +689,9 @@ SELECT * FROM paimon.publication_problems();
 -- remove_table and DROP TABLE still leave the publication, legitimately
 SELECT paimon.remove_table('pub_t'::regclass);
 SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub' AND tablename = 'pub_t';
+-- its history table stays behind, so the same name cannot simply be registered again
+SELECT paimon.add_table('pub_t'::regclass);                                    -- expect ERROR
+SELECT paimon.forget_history('public', 'pub_t_hist');
 SELECT paimon.add_table('pub_t'::regclass);
 DROP TABLE pub_t, pub_plain;
 SELECT count(*) FROM pg_publication_tables WHERE pubname = 'paimon_pub';
@@ -732,4 +738,64 @@ SELECT has_table_privilege('paimon_nobody', 'paimon.secret', 'SELECT') AS can_re
 DROP ROLE paimon_nobody;
 DROP TABLE au_t;
 SELECT count(*) FROM paimon.peek_messages();
+SELECT pg_drop_replication_slot('paimon_test');
+
+-- (12) operation history tables and key-less operation logs
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_test', 'test_decoding');
+-- key-less: accepted, REPLICA IDENTITY FULL set, the create message carries an empty key
+CREATE TABLE kl_t (a int, b text NOT NULL);
+SELECT paimon.add_table('kl_t'::regclass);
+SELECT pk_cols, hist_table, backfill_due FROM paimon.table_registry WHERE relid = 'kl_t'::regclass;
+SELECT relreplident FROM pg_class WHERE oid = 'kl_t'::regclass;
+SELECT paimon.peek_messages() - 'relid';
+-- the guardrails apply to it as to any table
+ALTER TABLE kl_t REPLICA IDENTITY DEFAULT;                                      -- expect ERROR
+ALTER TABLE kl_t ADD COLUMN d int DEFAULT 1;                                    -- expect ERROR
+ALTER TABLE kl_t ADD PRIMARY KEY (b);                                           -- expect ERROR
+-- the log's own field names are reserved on a key-less table, and only there
+ALTER TABLE kl_t ADD COLUMN _lsn int;                                           -- expect ERROR
+ALTER TABLE kl_t RENAME COLUMN a TO _op;                                        -- expect ERROR
+ALTER TABLE kl_t ADD COLUMN _ts timestamptz;                                    -- expect ERROR
+ALTER TABLE kl_t ADD COLUMN _commit_lsn bigint;                                 -- expect ERROR
+CREATE TABLE kl_bad (x int, _ts timestamptz);
+SELECT paimon.add_table('kl_bad'::regclass);                                    -- expect ERROR
+CREATE TABLE pk_ts (id int PRIMARY KEY, _ts timestamptz, _lsn bigint);
+SELECT paimon.add_table('pk_ts'::regclass);
+ALTER TABLE kl_t ADD COLUMN c int;
+SELECT paimon.peek_messages() - 'relid';
+-- name collisions: T_hist is a replicated table, or T is a replicated table's history
+CREATE TABLE col_a (id int PRIMARY KEY);
+CREATE TABLE col_a_hist (id int PRIMARY KEY);
+SELECT paimon.add_table('col_a'::regclass);
+SELECT paimon.add_table('col_a_hist'::regclass);                                -- expect ERROR
+CREATE TABLE col_b_hist (id int PRIMARY KEY);
+CREATE TABLE col_b (id int PRIMARY KEY);
+SELECT paimon.add_table('col_b_hist'::regclass);
+SELECT paimon.add_table('col_b'::regclass);                                     -- expect ERROR
+-- other schemas are other Paimon databases: no collision
+CREATE SCHEMA s12;
+CREATE TABLE s12.col_a_hist (id int PRIMARY KEY);
+SELECT paimon.add_table('s12.col_a_hist'::regclass);
+-- DROP TABLE leaves the history table: re-creating the name is refused, with the remedy
+DROP TABLE col_a;
+SELECT schema_name, hist_table, table_name, reason FROM paimon.retained_history
+ WHERE hist_table LIKE 'col\_%' ORDER BY 1, 2;
+SELECT count(*) FROM paimon.retained_history WHERE hist_table = 'reg_t_hist' AND reason = 'remove_table';
+CREATE TABLE col_a (id int PRIMARY KEY, v text);
+SELECT paimon.add_table('col_a'::regclass);                                     -- expect ERROR
+-- and a table named like a retained history table would turn it into a main table
+SELECT paimon.add_table('col_a_hist'::regclass);                                -- expect ERROR
+SELECT paimon.forget_history('public', 'col_a_hist');
+SELECT paimon.forget_history('public', 'col_a_hist');                           -- expect ERROR
+SELECT paimon.add_table('col_a'::regclass);
+SELECT table_name, hist_table FROM paimon.table_registry WHERE table_name LIKE 'col_%' ORDER BY 1;
+-- health() reports a collision made behind the guardrails' back
+SELECT * FROM paimon.health();
+UPDATE paimon.table_registry SET table_name = 'col_b_hist_hist' WHERE table_name = 'col_a';
+SELECT * FROM paimon.health();
+UPDATE paimon.table_registry SET table_name = 'col_a' WHERE table_name = 'col_b_hist_hist';
+SELECT * FROM paimon.health();
+DROP TABLE kl_t, kl_bad, pk_ts, col_a, col_a_hist, col_b, col_b_hist, s12.col_a_hist;
+DROP SCHEMA s12;
+SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');
