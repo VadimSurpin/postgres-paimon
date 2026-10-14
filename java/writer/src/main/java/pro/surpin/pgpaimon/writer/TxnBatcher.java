@@ -243,8 +243,8 @@ public final class TxnBatcher {
             if (event instanceof PgEvent.Insert) {
                 addHistory(relid, "+I", parts.get(0).values(), changeLsn, changeOpSeq, meta);
             } else if (event instanceof PgEvent.Update) {
-                addHistory(relid, "-U", parts.get(0).values(), changeLsn, changeOpSeq, meta);
-                addHistory(relid, "+U", parts.get(1).values(), changeLsn, changeOpSeq + 1, meta);
+                addHistoryPair(relid, parts.get(0).values(), parts.get(1).values(), changeLsn,
+                               changeOpSeq, meta);
             } else if (event instanceof PgEvent.Delete) {
                 addHistory(relid, "-D", parts.get(0).values(), changeLsn, changeOpSeq, meta);
             }
@@ -304,6 +304,41 @@ public final class TxnBatcher {
         }
         addOp(SinkRecord.op(key, code, image, changeLsn, seq, xid, commitMicros, meta), meta);
         return true;
+    }
+
+    /**
+     * An UPDATE's two history images, -U then +U, which go together or not at all: the
+     * poison-record escape used to apply per image, so with only the new image unrepresentable
+     * the history kept a -U with no +U (review of the history tables, m8), which no reader can
+     * interpret. With {@code PGPAIMON_SKIP_LSN} at this change, both images are checked and, if
+     * either is dropped, the other is dropped with it and says so.
+     */
+    private void addHistoryPair(long relid, List<String> before, List<String> after, long changeLsn,
+                                int seq, RelationMeta meta) {
+        if (registry == null) {
+            return;
+        }
+        long key = registry.historyKey(relid, changeLsn);
+        if (key == 0) {
+            return;
+        }
+        SinkRecord mu = SinkRecord.op(key, "-U", before, changeLsn, seq, xid, commitMicros, meta);
+        SinkRecord pu = SinkRecord.op(key, "+U", after, changeLsn, seq + 1, xid, commitMicros, meta);
+        if (skipLsn != 0 && changeLsn == skipLsn) {
+            boolean a = skip(mu.withCommitLsn(Long.MAX_VALUE), meta);
+            boolean b = skip(pu.withCommitLsn(Long.MAX_VALUE), meta);
+            if (a || b) {
+                if (a != b) {
+                    skipped.add("history key " + key + " " + (a ? "+U" : "-U") + " at _seq "
+                        + SlotConsumer.formatLsn(changeLsn) + ": representable, but dropped with"
+                        + " its " + (a ? "-U" : "+U") + " so that the history keeps no half of an"
+                        + " UPDATE; its raw values were " + raw((a ? pu : mu).values()));
+                }
+                return;
+            }
+        }
+        open.add(mu);
+        open.add(pu);
     }
 
     private void addOp(SinkRecord record, RelationMeta meta) {

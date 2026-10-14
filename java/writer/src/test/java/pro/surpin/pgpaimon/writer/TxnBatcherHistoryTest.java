@@ -230,4 +230,28 @@ class TxnBatcherHistoryTest {
         b.onEvent(new PgEvent.Commit(900L, 910L, PG_TS), 900L, null);
         assertTrue(rec.batches.get(0).isEmpty());
     }
+
+    /**
+     * Review of the history tables, m8: PGPAIMON_SKIP_LSN at an UPDATE whose NEW image is
+     * unrepresentable used to drop only the +U, leaving the history a -U with no +U. Both go.
+     */
+    @Test
+    void theSkipDropsBothImagesOfAnUpdateOrNeither() throws Exception {
+        Recorder rec = new Recorder();
+        TxnBatcher.RowCheck refusesNaN = (record, meta) -> {
+            if (record.values().contains("NaN")) {
+                throw new TextDecoder.UnrepresentableValueException("column 'v': NaN");
+            }
+        };
+        TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec, 120L, refusesNaN);
+        b.onEvent(new PgEvent.Begin(900L, PG_TS, 77L), 100L, null);
+        b.onEvent(new PgEvent.Insert(PK, row("1", "a")), 110L, PK_META);
+        b.onEvent(new PgEvent.Update(PK, row("1", "a"), false, row("1", "NaN")), 120L, PK_META);
+        b.onEvent(new PgEvent.Update(PK, row("1", "NaN"), false, row("1", "c")), 130L, PK_META);
+        b.onEvent(new PgEvent.Commit(900L, 910L, PG_TS), 900L, null);
+        List<SinkRecord> hist = ops(rec.batches.get(0), HistoryKeys.histKey(PK));
+        // the change at 120 is gone whole; the one at 130 is not at the skip LSN and stays whole
+        assertEquals(List.of("+I", "-U", "+U"), codes(hist));
+        assertEquals(List.of(110L, 130L, 130L), hist.stream().map(SinkRecord::seq).toList());
+    }
 }
