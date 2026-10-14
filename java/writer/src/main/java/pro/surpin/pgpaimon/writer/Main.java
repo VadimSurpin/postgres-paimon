@@ -111,11 +111,7 @@ public final class Main {
         // 4. where to resume; 0 means "the slot's own position", an ordinary value. The MIN is
         //    over every Paimon table the writer commits to: each main table AND each history
         //    table, since the two are committed separately and a crash can leave either behind.
-        List<Long> relids = new ArrayList<>();
-        for (RegistryRow r : rows) {
-            relids.add(r.relid());
-            relids.add(HistoryKeys.histKey(r.relid()));
-        }
+        List<Long> relids = resumeKeys(rows);
         long resume = new OffsetStore(registry, config).highestCommittedLsn(relids);
 
         PaimonSink sink = new PaimonSink(registry, config);
@@ -195,6 +191,24 @@ public final class Main {
             exiting = true;
             System.exit(1);
         }
+    }
+
+    /**
+     * The tables whose committed identifiers decide where the stream resumes (the MIN over them):
+     * each tracked relation's main table AND its current history table. The two are committed
+     * separately, so a crash can leave either behind, and leaving the history out lost changes
+     * for good: measured (review of the history tables, I2), five one-row transactions committed
+     * in one batch, a halt right after the main table's commit, and after the restart the history
+     * held only the last of them. Archives are not included: nothing is written to an archive
+     * after its rotation, and the writer commits a flush's archives first (PaimonSink).
+     */
+    static List<Long> resumeKeys(List<RegistryRow> rows) {
+        List<Long> keys = new ArrayList<>();
+        for (RegistryRow r : rows) {
+            keys.add(r.relid());
+            keys.add(HistoryKeys.histKey(r.relid()));
+        }
+        return keys;
     }
 
     /**

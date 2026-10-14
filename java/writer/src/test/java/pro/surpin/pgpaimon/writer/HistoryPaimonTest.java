@@ -411,7 +411,11 @@ class HistoryPaimonTest {
             OffsetStore offsets = new OffsetStore(reg, cfg);
             assertEquals(mainFirst ? BASE + 4000L : 0L, offsets.highestCommitted(rel));
             assertEquals(mainFirst ? 0L : BASE + 4000L, offsets.highestCommitted(hk));
-            assertEquals(0L, offsets.highestCommittedLsn(List.of(rel, hk)),
+            // The list Main itself resumes from (review of the history tables, I2: with the
+            // history left out of it, every unit test passed while changes were lost).
+            List<Long> resumeKeys = Main.resumeKeys(List.of(new Main.RegistryRow(rel, "public",
+                name, List.of("id"), List.of(), false, "input", 1)));
+            assertEquals(0L, offsets.highestCommittedLsn(resumeKeys),
                          "the resume position is the MIN over both tables");
             try (Process p = new Process(BIG)) {
                 p.ev(new PgEvent.Relation(meta(rel, name)), 0);
@@ -430,7 +434,7 @@ class HistoryPaimonTest {
                 kinds.merge(r.rowKind(), 1L, Long::sum);
             }
             assertEquals(Map.of("+I", 6L, "-U", 12L, "+U", 12L, "-D", 6L), kinds, name);
-            assertEquals(BASE + 6000L, offsets.highestCommittedLsn(List.of(rel, hk)));
+            assertEquals(BASE + 6000L, offsets.highestCommittedLsn(resumeKeys));
         }
     }
 

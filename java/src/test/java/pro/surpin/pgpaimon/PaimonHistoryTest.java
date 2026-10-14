@@ -272,7 +272,14 @@ public class PaimonHistoryTest {
             exec(c, "SELECT paimon.add_table('" + table + "'::regclass)");
         }
         writerKeepsUp(test + " registered");
-        restartWriter(test, Map.of("PGPAIMON_TEST_HALT_AFTER_COMMIT", haltAfter));
+        // A batch interval long enough that all ten transactions below are committed together:
+        // the halted commit must hold SEVERAL transactions. With one, resuming at the table that
+        // is ahead still re-decodes that transaction (its commit record is the resume point), so
+        // a writer that left the history out of the resume position passed (review of the history
+        // tables, I2, mutation M9: 275/275); with several, the earlier ones are lost under it.
+        restartWriter(test, Map.of("PGPAIMON_TEST_HALT_AFTER_COMMIT", haltAfter,
+                                   "PGPAIMON_BATCH_MAX_INTERVAL_MS", "8000",
+                                   "PGPAIMON_BATCH_MAX_ROWS", "1000000"));
         String pid = writerPid();
         try (Connection c = connect()) {
             for (int k = 1; k <= 10; k++) txnH2(c, table, k);
@@ -285,6 +292,10 @@ public class PaimonHistoryTest {
         check(test + " the window was real: " + (mainFirst ? "main" : "history")
               + " is ahead (main " + mainId + ", history " + histId + ")",
               mainFirst ? mainId > histId : histId > mainId);
+        int committed = mainFirst ? rowsNow(PG_SCHEMA, table).size()
+                                  : rowsNow(PG_SCHEMA, table + "_hist").size() / 4;
+        int txns = mainFirst ? committed / 2 : committed;
+        check(test + " the halted commit held several transactions (" + txns + ")", txns >= 2);
         try (Connection c = connect()) {
             for (int k = 11; k <= 15; k++) txnH2(c, table, k);    // while the writer is down
         }
