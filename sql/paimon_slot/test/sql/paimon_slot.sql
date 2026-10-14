@@ -124,7 +124,7 @@ SELECT (j->>'relid')::oid = 'ddl_t'::regclass AS relid_ok, j - 'relid' AS msg
 FROM (SELECT paimon.peek_messages() AS j) s;
 ALTER TABLE ddl_t RENAME COLUMN extra TO renamed;
 SELECT paimon.peek_messages() - 'relid';
-ALTER TABLE ddl_t ALTER COLUMN a TYPE varchar(64);   -- STRING -> STRING: no message
+ALTER TABLE ddl_t ALTER COLUMN a TYPE varchar;       -- STRING -> STRING: no message
 SELECT paimon.peek_messages() - 'relid';
 ALTER TABLE ddl_t ADD COLUMN n int;
 ALTER TABLE ddl_t ALTER COLUMN n TYPE bigint;
@@ -315,7 +315,7 @@ WHERE attrelid = 'key_t'::regclass AND attname = 'n';
 SELECT paimon.peek_messages() - 'relid';                          -- nothing emitted
 
 -- what stays allowed: a non-key type change, and NOT NULL -> nullable
-ALTER TABLE key_t ALTER COLUMN v TYPE varchar(32);   -- STRING -> STRING: no message
+ALTER TABLE key_t ALTER COLUMN v TYPE varchar;       -- STRING -> STRING: no message
 SELECT paimon.peek_messages() - 'relid';
 ALTER TABLE key_t ALTER COLUMN n TYPE bigint;        -- non-key: allowed
 SELECT paimon.peek_messages() - 'relid';
@@ -501,7 +501,7 @@ ALTER TABLE vg_t ADD CONSTRAINT users_own CHECK (id > 0);
 ALTER TABLE vg_t ADD CONSTRAINT paimon_guard_6 CHECK (t <> 'forbidden');
 SELECT paimon.peek_messages() - 'relid';
 SELECT paimon.remove_table('vg_t'::regclass);
-SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c';
+SELECT conname FROM pg_constraint WHERE conrelid = 'vg_t'::regclass AND contype = 'c' ORDER BY 1;
 INSERT INTO vg_t (id, n) VALUES (11, 'NaN');                         -- allowed: not replicated
 DROP TABLE vg_t, vg_bad, vg_named;
 SELECT count(*) FROM paimon.peek_messages();
@@ -619,6 +619,22 @@ ALTER TABLE tc_t ALTER COLUMN t TYPE int USING t::int;                          
 ALTER TABLE tc_t ALTER COLUMN k TYPE int USING k + 1;                           -- expect ERROR
 ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k;                            -- expect ERROR
 DO $$ BEGIN EXECUTE 'ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k * 2'; END $$; -- expect ERROR
+-- a column rewrite inside a function or procedure: its USING is invisible to current_query(), so
+-- any column rewrite there is refused, even an allowed widening without USING (fails closed)
+CREATE PROCEDURE tc_migrate() LANGUAGE plpgsql AS $$
+BEGIN ALTER TABLE tc_t ALTER COLUMN k TYPE bigint USING k * 1000; END $$;
+CALL tc_migrate();                                                              -- expect ERROR
+CREATE PROCEDURE tc_widen() LANGUAGE plpgsql AS $$
+BEGIN ALTER TABLE tc_t ALTER COLUMN i2 TYPE int; END $$;
+CALL tc_widen();                                                                -- expect ERROR
+CREATE FUNCTION tc_fn() RETURNS void LANGUAGE sql AS $$
+ALTER TABLE tc_t ALTER COLUMN i2 TYPE int $$;
+SELECT tc_fn();                                                                 -- expect ERROR
+DROP PROCEDURE tc_migrate(), tc_widen();
+DROP FUNCTION tc_fn();
+-- a length limit on text trims trailing spaces in PostgreSQL alone
+ALTER TABLE tc_t ALTER COLUMN t TYPE varchar(20);                               -- expect ERROR
+ALTER TABLE tc_t ALTER COLUMN v TYPE varchar(2);                                -- expect ERROR
 SELECT count(*) FROM paimon.peek_messages();                         -- nothing was emitted
 -- the widenings
 ALTER TABLE tc_t ALTER COLUMN i2 TYPE int;
@@ -628,9 +644,11 @@ ALTER TABLE tc_t ALTER COLUMN k TYPE text;
 ALTER TABLE tc_t ALTER COLUMN f4 TYPE float8;
 ALTER TABLE tc_t ALTER COLUMN n TYPE numeric(14,4);
 ALTER TABLE tc_t ALTER COLUMN v TYPE varchar(10);
+ALTER TABLE tc_t ALTER COLUMN v TYPE varchar;
 ALTER TABLE tc_t ALTER COLUMN v TYPE text;
-ALTER TABLE tc_t ALTER COLUMN t TYPE varchar(20);
-ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(6);
+ALTER TABLE tc_t ALTER COLUMN t TYPE varchar;
+-- a widening in a top-level DO block is still a top-level ALTER TABLE in the statement text
+DO $$ BEGIN ALTER TABLE tc_t ALTER COLUMN ts TYPE timestamp(6); END $$;
 SELECT paimon.peek_messages() - 'relid';
 -- the retyped numeric kept its guard; i8, now numeric, gained one
 SELECT conname, pg_get_expr(conbin, conrelid) FROM pg_constraint
@@ -679,6 +697,14 @@ SELECT paimon.add_table('ty_t'::regclass);
 RESET client_min_messages;
 ALTER TYPE ty_comp ADD ATTRIBUTE b int;                                         -- expect ERROR
 ALTER TYPE ty_mood RENAME VALUE 'a' TO 'A';              -- expect ERROR (used inside an array)
+-- in a procedure the statement text is only the CALL: any ALTER TYPE of a used enum is refused
+CREATE PROCEDURE ty_ren() LANGUAGE plpgsql AS $$
+BEGIN ALTER TYPE ty_mood RENAME VALUE 'a' TO 'A'; END $$;
+CALL ty_ren();                                                                  -- expect ERROR
+CREATE PROCEDURE ty_add() LANGUAGE plpgsql AS $$
+BEGIN ALTER TYPE ty_mood ADD VALUE 'z'; END $$;
+CALL ty_add();                                                                  -- expect ERROR
+DROP PROCEDURE ty_ren(), ty_add();
 ALTER TYPE ty_mood ADD VALUE 'c';
 ALTER TYPE ty_mood RENAME TO ty_mood_renamed;           -- a type rename changes no value text
 ALTER TYPE ty_free ADD ATTRIBUTE b int;

@@ -938,8 +938,11 @@ read back as `SMALLINT -1`; integers reinterpreted as timestamps). And a change 
 Paimon type can still change values in PostgreSQL alone (`char(n)` pads, `timestamp(p)` rounds,
 `json` to `jsonb` normalises). Allowed: `smallint`→`int`→`bigint`; an integer to a `numeric` with room
 for all its digits, or to `text`/`varchar`; `real`→`double precision`; `numeric(p,s)` to one with no
-fewer integer digits or decimal places; `text`↔`varchar(n)`; `timestamp(p)`/`timestamptz(p)` to a
-higher precision. Everything else:
+fewer integer digits or decimal places; `text` or `varchar(n)` to `text` or unbounded `varchar`, and
+`varchar(n)` to `varchar(m)` with `m >= n`; `timestamp(p)`/`timestamptz(p)` to a higher precision. Not
+`text` to `varchar(n)`, nor a shorter `varchar`: PostgreSQL's length coercion silently trims trailing
+*spaces* beyond the new length (any other excess character is an error), so `'ab        '` became
+`'ab'` in PostgreSQL and stayed `'ab        '` in Paimon (measured). Everything else:
 
 ```
 ERROR:  paimon_slot: cannot change the type of replicated column public.t.n from numeric(10,2) to numeric(10,1): it removes integer digits or decimal places
@@ -949,8 +952,16 @@ HINT:  PostgreSQL rewrites the table without sending the rewritten rows, ... Oth
 `USING` is refused even for an allowed or unchanged type (`ALTER COLUMN a TYPE int USING a + 1`),
 because the expression can change every value. The rewrite event cannot tell whether `USING` was
 given, so the `table_rewrite` trigger reads the statement text; a false positive (the word elsewhere
-in the same query string) refuses, never loses. **Residual risk:** a statement built in `EXECUTE`
-from fragments that hide the word is not caught.
+in the same query string) refuses, never loses. That text is `current_query()`, the **top-level**
+statement: inside a function or procedure it is only the `CALL` or `SELECT`, and an ordinary
+procedure doing `ALTER COLUMN a TYPE bigint USING a * 1000` left PostgreSQL at 10000 and Paimon at 10
+(measured). So the check fails closed: on a replicated table, a column rewrite whose `ALTER TABLE` is
+not in the top-level statement text is refused, even an allowed widening without `USING` (`ALTER
+COLUMN ... TYPE on replicated table public.t must be run as a top-level statement`). Run such
+migrations as plain statements; a `DO` block that spells the `ALTER TABLE` out is fine. **Residual
+risk:** a top-level `DO` block that builds the statement in `EXECUTE` from fragments hiding the word
+`USING`, or a single query string that both calls such a routine and contains an unrelated `ALTER
+TABLE`, is not caught.
 
 **Inheritance.** A replicated table may not have inheritance children (`CREATE TABLE ... INHERITS`,
 `ALTER TABLE ... INHERIT`, or registering a parent that has them): a child's rows are returned by
@@ -964,7 +975,9 @@ composite type, and `ALTER TYPE ... RENAME VALUE` on an enum, are refused while 
 uses the type (directly, in an array, a domain, a range or another composite): every value's text
 changes and no row change reaches Paimon (measured: `(1,x)` became `(1,x,)` in PostgreSQL, enum `a`
 became `A`, Paimon kept the old text). `ADD VALUE` and type renames stay allowed. `RENAME VALUE` is
-recognised from the statement text, as `USING` is.
+recognised from the statement text, as `USING` is, and for the same reason any `ALTER TYPE` of such
+an enum run inside a function or procedure is refused (there the text is only the `CALL`; measured,
+`CALL ren()` renamed a used value unrefused).
 
 **The publication.** `paimon_pub` must publish insert, update, delete and truncate of every replicated
 table, with no row filter, no column list and `publish_via_partition_root = false`, and cannot be

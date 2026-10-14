@@ -513,7 +513,10 @@ END $$;
  *   - an integer -> numeric(p,s) with room for all its digits, or -> text/varchar;
  *   - real -> double precision;
  *   - numeric(p,s) -> numeric(p',s') with s' >= s and p'-s' >= p-s;
- *   - text <-> varchar(n), and varchar(n) -> varchar(m);
+ *   - text or varchar(n) -> text or unbounded varchar, and varchar(n) -> varchar(m) for m >= n.
+ *     NOT a shrink, and not text -> varchar(n): PostgreSQL's length coercion silently trims
+ *     trailing SPACES beyond the new length (measured: 'ab        ' became 'ab' in PostgreSQL and
+ *     stayed 'ab        ' in Paimon), where any other excess character is an error;
  *   - timestamp(p) -> timestamp(q) for q >= p, and the same for timestamptz.
  * ALTER COLUMN ... TYPE ... USING is refused separately (on_table_rewrite), because USING can
  * change the values of any of these.
@@ -564,7 +567,11 @@ BEGIN
         RETURN 'it removes integer digits or decimal places';
     END IF;
     IF old_typid = ANY (strs) AND new_typid = ANY (strs) THEN
-        RETURN NULL;
+        IF new_typid = 'text'::regtype OR new_typmod = -1
+           OR (old_typid = 'varchar'::regtype AND old_typmod <> -1 AND new_typmod >= old_typmod) THEN
+            RETURN NULL;
+        END IF;
+        RETURN 'a length limit trims the trailing spaces of longer values, without the change reaching Paimon';
     END IF;
     IF old_typid = new_typid AND old_typid IN ('timestamp'::regtype, 'timestamptz'::regtype) THEN
         IF new_typmod = -1 OR (old_typmod <> -1 AND new_typmod >= old_typmod) THEN
@@ -1244,7 +1251,7 @@ BEGIN
                     format_type((c->>'typid')::oid, (c->>'typmod')::int),
                     paimon.type_change_problem((o->>'typid')::oid, (o->>'typmod')::int,
                                                (c->>'typid')::oid, (c->>'typmod')::int)
-                      USING HINT = 'PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, text<->varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.';
+                      USING HINT = 'PostgreSQL rewrites the table without sending the rewritten rows, so Paimon keeps the old values and reads them through its own cast. Only exact widenings are allowed (smallint->int->bigint, integer->wide-enough numeric or text, real->double precision, numeric(p,s)->numeric with no fewer integer digits or decimal places, varchar->text or a longer varchar, timestamp precision up). Otherwise: ADD COLUMN the new type, UPDATE it from the old one, DROP the old column, RENAME the new one -- each step replicates.';
             END IF;
         END IF;
     END LOOP;
@@ -1365,9 +1372,18 @@ BEGIN
     FOR obj IN SELECT DISTINCT objid FROM pg_event_trigger_ddl_commands()
                 WHERE classid = 'pg_type'::regclass AND command_tag = 'ALTER TYPE'
     LOOP
+        /* current_query() is the top-level statement: inside a function or procedure it shows
+         * only the CALL (measured: CALL ren() renamed 'a' to 'A' unrefused). Fail closed: an
+         * ALTER TYPE of such an enum whose own text is not the top-level statement is refused. */
         IF (SELECT typtype FROM pg_type WHERE oid = obj.objid) = 'e'
-           AND current_query() ~* 'rename[[:space:]]+value' THEN
+           AND (current_query() ~* 'rename[[:space:]]+value'
+                OR current_query() !~* '(^|[^[:alnum:]_])alter[[:space:]]+type([^[:alnum:]_]|$)') THEN
             used := paimon.type_used_by_replicated(obj.objid);
+            IF used IS NOT NULL
+               AND current_query() !~* '(^|[^[:alnum:]_])alter[[:space:]]+type([^[:alnum:]_]|$)' THEN
+                RAISE EXCEPTION 'paimon_slot: ALTER TYPE of enum type % must be run as a top-level statement while replicated column % uses it', obj.objid::regtype, used
+                      USING HINT = 'it ran inside a function, procedure or DO block, where paimon_slot cannot see whether it renames a value (a rename changes the text of every row holding it without any row change reaching Paimon). Run ALTER TYPE ... ADD VALUE as a statement of its own.';
+            END IF;
             IF used IS NOT NULL THEN
                 RAISE EXCEPTION 'paimon_slot: cannot rename a value of enum type % while replicated column % uses it', obj.objid::regtype, used
                       USING HINT = 'rows already replicated keep the old label in Paimon, because a rename changes no row; add the new value (ALTER TYPE ... ADD VALUE), UPDATE the rows to it, then stop using the old one';
@@ -1400,8 +1416,9 @@ CREATE EVENT TRIGGER paimon_ddl_end ON ddl_command_end
  * rewritten rows never reach the stream, so Paimon would keep every old value. The rewrite
  * event is the only place this is visible at all, and it does not say whether USING was
  * given, so the statement text is consulted. A false positive (USING elsewhere in the same
- * statement string) refuses, never loses; deliberately hiding the word, e.g. by building the
- * statement in EXECUTE from fragments, is not caught (documented residual risk).
+ * statement string) refuses, never loses. A rewrite nested in a function or procedure is refused
+ * outright (below). Deliberately hiding the word in a top-level DO block that builds the
+ * statement in EXECUTE from fragments is not caught (documented residual risk).
  */
 CREATE FUNCTION paimon.on_table_rewrite() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -1415,8 +1432,23 @@ BEGIN
         RETURN;
     END IF;
     -- AT_REWRITE_COLUMN_REWRITE (src/include/nodes/parsenodes.h)
-    IF (pg_event_trigger_table_rewrite_reason() & 4) <> 0
-       AND current_query() ~* '(^|[^[:alnum:]_])using([^[:alnum:]_]|$)' THEN
+    IF (pg_event_trigger_table_rewrite_reason() & 4) = 0 THEN
+        RETURN;
+    END IF;
+    /*
+     * current_query() is the TOP-LEVEL statement. A column rewrite run inside a function, a
+     * procedure or a migration tool's stored routine shows only the CALL or SELECT that invoked
+     * it, so the USING test below cannot see it: measured, CALL migrate() with ALTER COLUMN a TYPE
+     * bigint USING a * 1000 inside left PostgreSQL at 10000 and Paimon at 10, with no error. So the
+     * check fails closed: on a replicated table, a column rewrite whose ALTER TABLE is not itself
+     * in the top-level statement text is refused. A false positive only refuses.
+     */
+    IF current_query() !~* '(^|[^[:alnum:]_])alter[[:space:]]+table([^[:alnum:]_]|$)' THEN
+        RAISE EXCEPTION 'paimon_slot: ALTER COLUMN ... TYPE on replicated table %.% must be run as a top-level statement',
+                        reg.schema_name, reg.table_name
+              USING HINT = 'it ran inside a function, procedure or DO block, where paimon_slot cannot see whether USING changes the values (PostgreSQL rewrites the rows without sending them, so Paimon would keep the old ones). Run the ALTER TABLE itself as a statement, not through CALL/SELECT/EXECUTE.';
+    END IF;
+    IF current_query() ~* '(^|[^[:alnum:]_])using([^[:alnum:]_]|$)' THEN
         RAISE EXCEPTION 'paimon_slot: ALTER COLUMN ... TYPE ... USING is not supported on replicated table %.%',
                         reg.schema_name, reg.table_name
               USING HINT = 'PostgreSQL rewrites the rows without sending them, so values a USING expression changes would never reach Paimon. Change the type without USING (only exact widenings are allowed), or ADD COLUMN, UPDATE it with the expression, DROP the old column and RENAME the new one -- each step replicates.';
