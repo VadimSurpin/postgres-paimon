@@ -28,9 +28,11 @@ restarted independently of the database.
   `changelog-producer = input`, so every `UPDATE` produces a real `-U` / `+U` pair, including for
   rows whose large (TOASTed) columns were not touched.
 * **An operation history of every table.** Beside each replicated table `T` the writer keeps
-  `T_hist`, an append-only Paimon table with one row per row-level change -- operation, commit and
-  change LSN, transaction id, commit time, and the row before and after -- in commit order and never
-  collapsed, even inside one transaction or one commit batch. It survives `DROP TABLE`.
+  `T_hist`, an append-only Paimon table partitioned by day, with one row per row image -- `+I`, an
+  update's `-U` and `+U`, `-D` -- carrying the table's columns plus operation, commit and change LSN,
+  transaction id and commit time, in commit order and never collapsed, even inside one transaction
+  or one commit batch. Every DDL archives it as `T_hist_<lsn>` and starts a new one with the new
+  schema. It survives `DROP TABLE`.
 * **Tables without a primary key** are replicated as append-only operation logs: one row per
   insert, update, delete or truncate, with the same metadata.
 * **DDL follows the data:** `ADD`/`DROP`/`RENAME COLUMN`, `ALTER COLUMN TYPE`, `DROP TABLE` and
@@ -80,9 +82,11 @@ Each is deliberate and explained, with its reason, in section 5 of the guide:
 
 * a table **without a primary key** is replicated as an operation log, not as a merged table, and a
   key cannot be added to a replicated table later; a primary key must not be `DEFERRABLE`;
-* the history tables (`<table>_hist`) roughly **double write volume** and **grow without bound**:
-  retention is yours to run; a dropped table's history is kept and its name stays taken until you
-  move it aside and call `paimon.forget_history()`;
+* the history tables (`<table>_hist`) roughly **double write volume** and **grow without bound**,
+  in rows and in archived tables (one per DDL): retention is yours to run (drop old `_dt`
+  partitions); a dropped table's history is kept and its names stay taken until you move them aside
+  and call `paimon.forget_history()`; the seven history field names (`_op`, `_commit_lsn`, `_lsn`,
+  `_op_seq`, `_xid`, `_ts`, `_dt`) are reserved column names;
 * `numeric` columns need an explicit precision of at most 38;
 * `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET NOT NULL` are refused;
 * a **non-empty** table cannot be added once the writer's slot exists;

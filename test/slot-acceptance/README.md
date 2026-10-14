@@ -18,7 +18,7 @@ script — and runs all ten:
     PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
     PaimonAdversarialTest PaimonHistoryTest
 
-That is **551 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
+That is **635 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
 the writer on purpose in its last case (A15, `paimon.health()`); `PaimonHistoryTest` restarts it
 several times, with batch limits that hold a batch open and with the test-only crash hook
 `PGPAIMON_TEST_HALT_AFTER_COMMIT`. It prints the list it is about to run.

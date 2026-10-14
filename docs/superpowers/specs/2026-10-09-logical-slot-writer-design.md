@@ -129,7 +129,9 @@ CREATE TABLE paimon.table_registry (
     changelog_producer text NOT NULL DEFAULT 'input',-- 'input' | 'lookup',  §5 escape
     registered_at timestamptz NOT NULL DEFAULT now(),
     hist_table   text    NOT NULL,   -- table_name || '_hist'   (amended 2026-10-14)
-    registration uuid    NOT NULL DEFAULT gen_random_uuid()  -- stamped on the history table
+    registration uuid    NOT NULL DEFAULT gen_random_uuid(), -- stamped on the history table
+    hist_buckets int     NOT NULL DEFAULT 1, -- the history's buckets per daily partition
+    hist_buckets_user int                    -- add_table(hist_buckets => N), which always wins
 );
 ```
 
@@ -617,10 +619,12 @@ transaction.
    that table's highest committed identifier** (per table; read from Paimon once and kept current
    in memory, re-read after any DDL). See "Why a timeout needs rule 4" below. *Amended
    2026-10-14:* "table" means each Paimon table the writer commits to: a relation's history table
-   `T_hist` (and a key-less relation's log `T`) is a separate table with its own identifier
-   stream, filtered on its own, and the resume position is the MIN over all of them. The main and
-   history commits of a batch are not atomic with each other; a crash between them is repaired by
-   replay, each table filtering independently.
+   `T_hist`, each archived `T_hist_<lsn>` (and a key-less relation's log `T`) is a separate table
+   with its own identifier stream, filtered on its own; one commit per table even when it spans
+   several daily partitions. The resume position is the MIN over the current tables; archives,
+   committed first in a flush, never constrain it. The main and history commits of a batch are not
+   atomic with each other; a crash between them is repaired by replay, each table filtering
+   independently.
 5. `PaimonSink` commits the batch with `commitIdentifier` = the commit LSN of the **last**
    transaction in it, under a fixed `commitUser`, through
    `TableCommitImpl.filterAndCommit(Map<Long, List<CommitMessage>>)`.
@@ -900,8 +904,9 @@ startup cost is one query, independent of how much WAL the slot is holding.
 - `wal_level = logical` is mandatory.
 - `merge-engine` is fixed at `deduplicate` for tracked tables with a primary key. *Amended
   2026-10-14:* a table without one is an append-only operation log, and every tracked table has an
-  append-only history table `T_hist` beside it, which roughly doubles the writer's Paimon writes
-  and grows without bound (retention is the operator's job).
+  append-only history table `T_hist` beside it (one row per row image, partitioned by day, archived
+  as `T_hist_<lsn>` at every DDL), which roughly doubles the writer's Paimon writes and grows without
+  bound (retention is the operator's job).
 - Tracked tables are switched to `REPLICA IDENTITY FULL`, which adds the old row to the
   WAL written by every UPDATE and DELETE and is visible to any other logical consumer of
   the same table. The §5 escape exists for tables that cannot afford it.
