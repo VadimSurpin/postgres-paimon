@@ -239,6 +239,123 @@ class BackfillerTest {
         }
     }
 
+    /**
+     * The initial load of a table with no primary key, and of the history tables: R rows. The
+     * load runs twice, as an interrupted first load is retried; the second must replace the
+     * first's R rows (they are all the history holds), not add to them. Then a streamed change
+     * lands in the history and the load runs a third time, as a re-bootstrap does: that history
+     * is kept, and the R rows are appended after it.
+     */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "PGPAIMON_IT_JDBC_URL", matches = ".+")
+    void backfillWritesRRowsAndKeepsStreamedHistory() throws Exception {
+        String jdbc = System.getenv("PGPAIMON_IT_JDBC_URL");
+        String wh   = System.getenv("PGPAIMON_IT_WAREHOUSE");
+        try (Connection c = DriverManager.getConnection(jdbc);
+             Statement st = c.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS bf_log");
+            st.execute("DELETE FROM paimon.retained_history WHERE hist_table = 'bf_log_hist'");
+            st.execute("CREATE TABLE bf_log (id int, v text)");
+            st.execute("INSERT INTO bf_log SELECT g % 3, 'v' || g FROM generate_series(1, 7) g");
+            st.execute("SELECT paimon.add_table('bf_log'::regclass)");
+        }
+        long relid = relidOf(jdbc, "bf_log");
+        Map<String, String> env = new HashMap<>();
+        env.put("PGPAIMON_JDBC_URL", jdbc);
+        env.put("PGPAIMON_WAREHOUSE", wh);
+        env.put("PGPAIMON_FLUSH_MAX_RECORDS", "3");     // 3 chunks
+        WriterConfig cfg = WriterConfig.fromEnv(env);
+        Options o = new Options();
+        o.set("warehouse", wh);
+        Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o));
+        SchemaRegistry reg = new SchemaRegistry(catalog, cfg);
+        List<DdlMessage.Col> cols = List.of(new DdlMessage.Col(1, "id", "INT"),
+                                            new DdlMessage.Col(2, "v", "STRING"));
+        reg.createTable(relid, "public", "bf_log", List.of(), cols, "input", 2, 0L,
+                        "bf_log_hist", "it-registration");
+        PaimonSink sink = new PaimonSink(reg, cfg);
+        try {
+            sink.setRelation(relid, new RelationMeta(relid, "public", "bf_log",
+                List.of("id", "v"), List.of(false, false)));
+            long cp1 = load(cfg, reg, sink, relid);
+            assertEquals(7, ops(wh, "bf_log", "R"), "the log: one R row per loaded row");
+            assertEquals(7, ops(wh, "bf_log_hist", "R"));
+            long cp2 = load(cfg, reg, sink, relid);       // a retried first load
+            assertTrue(cp2 > cp1);
+            assertEquals(7, ops(wh, "bf_log", "R"), "the retry replaced the first attempt");
+            assertEquals(7, ops(wh, "bf_log_hist", "R"));
+
+            // a streamed change, then a re-bootstrap: the history is kept, R rows appended
+            // A streamed transaction commits between the two slots: just after the last load.
+            long lsn = cp2 + 1;
+            try (Connection c = DriverManager.getConnection(jdbc);
+                 Statement st = c.createStatement()) {
+                st.execute("SELECT pg_logical_emit_message(false, 'it', repeat('x', 4096))");
+            }
+            SinkRecord change = SinkRecord.op(HistoryKeys.histKey(relid), 'I', null,
+                java.util.Arrays.asList("9", "streamed"), lsn - 10, 0, 42L, 0L, null)
+                .withCommitLsn(lsn);
+            sink.flush(List.of(change, new SinkRecord(relid, change.kind(), change.values(),
+                change.seq(), 0, 42L, null, new SinkRecord.Op('I', null, change.op().after(),
+                lsn, 0L))), lsn, lsn + 8);
+            long cp3 = load(cfg, reg, sink, relid);
+            assertTrue(cp3 > lsn, "a new slot starts after the streamed change");
+            assertEquals(1, ops(wh, "bf_log_hist", "I"), "streamed history kept");
+            assertEquals(14, ops(wh, "bf_log_hist", "R"), "the reload appended its R rows");
+            assertEquals(1, ops(wh, "bf_log", "I"));
+            assertEquals(14, ops(wh, "bf_log", "R"));
+        } finally {
+            sink.close();
+            catalog.close();
+            try (Connection c = DriverManager.getConnection(jdbc);
+                 Statement st = c.createStatement()) {
+                st.execute("SELECT pg_drop_replication_slot(slot_name)"
+                    + " FROM pg_replication_slots WHERE slot_name = '" + cfg.slotName() + "'");
+            }
+        }
+    }
+
+    /** One load from a fresh slot (dropped again afterwards); returns its consistent point. */
+    private static long load(WriterConfig cfg, SchemaRegistry reg, PaimonSink sink, long relid)
+            throws Exception {
+        long cp;
+        try (Backfiller bf = new Backfiller(cfg, reg, sink)) {
+            Backfiller.BackfillPlan plan = bf.createSlotAndExportSnapshot();
+            cp = plan.consistentPoint();
+            bf.backfill(plan, relid, "public", "bf_log", List.of("id", "v"));
+        }
+        try (Connection c = DriverManager.getConnection(cfg.jdbcUrl());
+             Statement st = c.createStatement()) {
+            st.execute("SELECT pg_drop_replication_slot('" + cfg.slotName() + "')");
+        }
+        return cp;
+    }
+
+    /** How many rows of an append-only table carry operation {@code op}. */
+    private static long ops(String wh, String db, String table, String op) throws Exception {
+        Options o = new Options();
+        o.set("warehouse", wh);
+        try (Catalog c = CatalogFactory.createCatalog(CatalogContext.create(o))) {
+            var t = c.getTable(org.apache.paimon.catalog.Identifier.create(db, table));
+            int i = t.rowType().getFieldNames().indexOf("_op");
+            var rb = t.newReadBuilder();
+            long n = 0;
+            try (var r = rb.newRead().createReader(rb.newScan().plan());
+                 var it = r.toCloseableIterator()) {
+                while (it.hasNext()) {
+                    if (it.next().getString(i).toString().equals(op)) {
+                        n++;
+                    }
+                }
+            }
+            return n;
+        }
+    }
+
+    private static long ops(String wh, String table, String op) throws Exception {
+        return ops(wh, "public", table, op);
+    }
+
     private static long relidOf(String jdbc, String table) throws Exception {
         try (Connection c = DriverManager.getConnection(jdbc);
              Statement st = c.createStatement();

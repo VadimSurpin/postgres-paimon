@@ -339,6 +339,10 @@ public final class SchemaRegistry implements TableTracker {
         Identifier hid = identifierOf(schema, histTable);
         Table existing = null;
         try {
+            // Paimon's catalog caches tables (cache-enabled is its default). The remedy for a
+            // refusal below is to rename or drop this table by hand, out of band: without
+            // dropping the cached entry the writer would keep seeing the table that is gone.
+            catalog.invalidateTable(hid);
             try {
                 existing = catalog.getTable(hid);
             } catch (Catalog.TableNotExistException e) {
