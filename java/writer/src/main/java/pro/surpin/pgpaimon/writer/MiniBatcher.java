@@ -276,7 +276,7 @@ public final class MiniBatcher implements TxnBatcher.Flusher {
         return n;
     }
 
-    private static long chars(List<String> values) {
+    static long chars(List<String> values) {
         long n = 0;
         for (String v : values) {
             if (v != null) {

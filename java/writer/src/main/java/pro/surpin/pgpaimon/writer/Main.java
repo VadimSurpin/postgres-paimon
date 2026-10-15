@@ -141,7 +141,11 @@ public final class Main {
             + " ms since the batch's first transaction, whichever comes first (PGPAIMON_BATCH_*)");
         TxnBatcher batcher = new TxnBatcher(new ToastResolver(), registry, mini,
             config.skipLsn(),
-            (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record));
+            (record, meta) -> registry.rowBuilder(record.relid(), meta).build(record))
+            .withMaxBytes(config.txnMaxBytes());
+        LOG.info("largest transaction the writer will hold: an estimated " + config.txnMaxBytes()
+            + " bytes (PGPAIMON_TXN_MAX_BYTES; the default is a quarter of the maximum heap, "
+            + Runtime.getRuntime().maxMemory() + " bytes)");
         DdlMessageHandler ddl = new DdlMessageHandler(registry, config.messagePrefix(), token,
             config.skipLsn(), () -> {
                 try (Connection conn = plainConnection(config)) {

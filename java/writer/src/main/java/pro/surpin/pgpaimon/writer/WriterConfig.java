@@ -27,7 +27,8 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            int flushMaxRecords, long skipLsn,
                            long batchMaxRows, long batchMaxBytes, long batchMaxIntervalMs,
                            long healthIntervalMs,
-                           Map<String, String> catalogOptions) {
+                           Map<String, String> catalogOptions,
+                           long txnMaxBytes) {
 
     /** Defaults for the streaming commit batch; see {@link MiniBatcher}. */
     public static final String DEFAULT_BATCH_MAX_ROWS = "10000";
@@ -35,6 +36,17 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
     public static final String DEFAULT_BATCH_MAX_INTERVAL_MS = "2000";
     /** How often the running writer re-runs paimon.health(); see {@link HealthCheck}. */
     public static final String DEFAULT_HEALTH_INTERVAL_MS = "60000";
+
+    /**
+     * The default {@code PGPAIMON_TXN_MAX_BYTES}: a quarter of the JVM's maximum heap. The
+     * estimate (see {@link MiniBatcher#estimate}) undercounts what a buffered transaction really
+     * holds: measured, a 500,000-row INSERT (1,000,000 records with its history, an estimated
+     * 153 MB) held about 340 MB live, and the flush that followed peaked at 1 GB of heap with
+     * Paimon's write buffers. A quarter leaves room for both; see {@link TxnBatcher}.
+     */
+    static long defaultTxnMaxBytes() {
+        return Math.max(1, Runtime.getRuntime().maxMemory() / 4);
+    }
 
     /**
      * The publication and message prefix the extension uses. Both are fixed in
@@ -79,7 +91,8 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             parseMin(env, "PGPAIMON_BATCH_MAX_BYTES", DEFAULT_BATCH_MAX_BYTES, 1),
             parseMin(env, "PGPAIMON_BATCH_MAX_INTERVAL_MS", DEFAULT_BATCH_MAX_INTERVAL_MS, 0),
             parseMin(env, "PGPAIMON_HEALTH_INTERVAL_MS", DEFAULT_HEALTH_INTERVAL_MS, 0),
-            Map.copyOf(cat));
+            Map.copyOf(cat),
+            parseMin(env, "PGPAIMON_TXN_MAX_BYTES", String.valueOf(defaultTxnMaxBytes()), 1));
     }
 
     /** A setting that may only take the one value the extension uses; see {@link #PUBLICATION}. */

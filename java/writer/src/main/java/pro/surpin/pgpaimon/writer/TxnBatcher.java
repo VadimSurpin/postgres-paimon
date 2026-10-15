@@ -88,6 +88,8 @@ public final class TxnBatcher {
     private long xid;
     private long commitMicros;               // the open transaction's commit time, Unix epoch
     private int opSeq;
+    private long maxBytes = Long.MAX_VALUE;  // PGPAIMON_TXN_MAX_BYTES
+    private long openBytes;                  // the open transaction's estimate
     private final Set<Long> buffered = new HashSet<>();    // relids with records this txn
     private final List<String> skipped = new ArrayList<>();  // audit lines for this txn
 
@@ -109,6 +111,36 @@ public final class TxnBatcher {
         this.rowCheck = rowCheck;
     }
 
+    /**
+     * Bounds the memory one open transaction may take (estimated as {@link MiniBatcher#estimate}
+     * does). A transaction is held whole until its Commit, because it is never written in part
+     * (pgoutput streaming is off on purpose: a transaction's records are built and committed
+     * together, after every DDL inside it is known). Without a bound, a large enough transaction
+     * -- a bulk load, an UPDATE of a whole table -- ended in an OutOfMemoryError deep inside the
+     * decoder or the JVM, on every replay, with no word about why. With it, the writer stops with
+     * {@link TransactionTooLargeException}, which names the transaction and the remedy.
+     *
+     * <p>Why not spill it to disk: every later step (the truncate rule above, the history
+     * rerouting at the Commit, the per-table filter in {@link MiniBatcher}, the sink grouping a
+     * flush by table) takes the transaction as one list in memory, and rewriting each to stream
+     * from disk is a redesign with every invariant of this pipeline at stake. Nothing is lost by
+     * stopping instead: the transaction stays in the slot until the writer can hold it.
+     */
+    public TxnBatcher withMaxBytes(long maxBytes) {
+        if (maxBytes < 1) {
+            throw new IllegalArgumentException("maxBytes must be at least 1: " + maxBytes);
+        }
+        this.maxBytes = maxBytes;
+        return this;
+    }
+
+    /** Thrown when one transaction outgrows {@code PGPAIMON_TXN_MAX_BYTES}. Fatal. */
+    public static final class TransactionTooLargeException extends IllegalStateException {
+        TransactionTooLargeException(String msg) {
+            super(msg);
+        }
+    }
+
     public boolean hasOpenTransaction() {
         return open != null;
     }
@@ -116,6 +148,7 @@ public final class TxnBatcher {
     public void discardOpenTransaction() {
         open = null;
         opSeq = 0;
+        openBytes = 0;
         buffered.clear();
         skipped.clear();   // a transaction that never committed skipped nothing: it replays
     }
@@ -136,6 +169,7 @@ public final class TxnBatcher {
                 throw new IllegalStateException(msg);
             }
             open = new ArrayList<>();
+            openBytes = 0;
             xid = b.xid();
             commitMicros = LogRowBuilder.pgToUnixMicros(b.commitTimestamp());
             opSeq = 0;
@@ -222,7 +256,7 @@ public final class TxnBatcher {
                     if (skipLsn != 0 && changeLsn == skipLsn && skip(record, meta)) {
                         continue;   // see skip(): the transaction stays open, deliberately
                     }
-                    open.add(record);
+                    buffer(record);
                     buffered.add(p.relid());
                 }
             } else {
@@ -337,8 +371,8 @@ public final class TxnBatcher {
                 return;
             }
         }
-        open.add(mu);
-        open.add(pu);
+        buffer(mu);
+        buffer(pu);
     }
 
     private void addOp(SinkRecord record, RelationMeta meta) {
@@ -346,7 +380,30 @@ public final class TxnBatcher {
             && skip(record.withCommitLsn(Long.MAX_VALUE), meta)) {
             return;
         }
+        buffer(record);
+    }
+
+    /**
+     * Every record of the open transaction is added here, and the transaction's size is checked
+     * as it grows (the records a TRUNCATE later removes stay counted: a bound, not an exact sum).
+     * The throw happens inside onEvent's try, so the transaction is discarded and nothing of it
+     * was flushed or confirmed: it replays, whole, on the next start.
+     */
+    private void buffer(SinkRecord record) {
         open.add(record);
+        openBytes += MiniBatcher.RECORD_OVERHEAD_BYTES + MiniBatcher.chars(record.values());
+        if (openBytes > maxBytes) {
+            throw new TransactionTooLargeException("TRANSACTION TOO LARGE: transaction " + xid
+                + " has reached " + open.size() + " change record(s) and an estimated "
+                + openBytes + " bytes (at _seq " + SlotConsumer.formatLsn(record.seq())
+                + "), over PGPAIMON_TXN_MAX_BYTES=" + maxBytes + ". The writer holds a whole"
+                + " transaction in memory until its commit and never writes part of one, so it"
+                + " stops here rather than run out of memory. Nothing is lost: the transaction"
+                + " stays in the slot and replays, whole, on the next start. Give the writer more"
+                + " heap (java -Xmx...; the default limit is a quarter of the maximum heap) or"
+                + " raise PGPAIMON_TXN_MAX_BYTES, then restart. Avoid such transactions where you"
+                + " can: load and update in batches of bounded size (docs, section 3).");
+        }
     }
 
     /**
