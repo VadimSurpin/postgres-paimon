@@ -12,11 +12,18 @@ is active does it run `mvn test` in `java/pom.xml`, always with an explicit `-Dt
 The script's exit status is Maven's. Teardown runs on any exit.
 
 **What a bare run covers.** With no argument it names every suite — the `ALL_SUITES` list in the
-script — and runs all ten:
+script — and runs all twelve:
 
     SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
     PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
-    PaimonAdversarialTest PaimonHistoryTest
+    PaimonAdversarialTest PaimonHistoryTest TpccCompareSelfTest PaimonRobustTest
+
+`PaimonRobustTest` (`LAST_SUITES`) runs after the others, in a Maven invocation of its own: it sets
+hostile `ALTER DATABASE`/`ALTER ROLE` settings, tampers with the warehouse's cluster identity,
+advances the slot behind a stopped writer, invalidates the slot with a 1 MB
+`max_slot_wal_keep_size` and re-bootstraps with `scripts/rebootstrap.sh`, which reloads every
+table of the database; it restores the settings at the end. The cluster gets
+`max_prepared_transactions = 8` (added to a reused `pgdata` too) for its prepared transactions.
 
 That is **635 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
 the writer on purpose in its last case (A15, `paimon.health()`); `PaimonHistoryTest` restarts it

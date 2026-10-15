@@ -33,7 +33,11 @@ NOT_RUN=""                          # checks a suite will skip: reported next to
 # C++ implementation it exercised; naming a suite that does not exist fails the run, by design.)
 ALL_SUITES=(SlotHarnessSmokeIT PaimonSchemaIT PaimonFeatureTest PaimonDdlTest
             PaimonAdvancedTest PaimonTypeTest PaimonSlotKeyMoveTest PaimonOffloadTest
-            PaimonAdversarialTest PaimonHistoryTest TpccCompareSelfTest)
+            PaimonAdversarialTest PaimonHistoryTest TpccCompareSelfTest PaimonRobustTest)
+# Suites that must run after every other one, each in a Maven invocation of its own (Surefire's
+# order within one invocation is the filesystem's): PaimonRobustTest invalidates the slot and
+# re-bootstraps, which reloads every table of the database under the other suites' feet.
+LAST_SUITES=(PaimonRobustTest)
 LAUNCHER="$RUN/start_writer.sh"
 PIDFILE="$RUN/writer.pid"
 export PATH="$PGBIN:$PATH" PGHOST PGPORT PGUSER
@@ -164,12 +168,13 @@ run_suites() {
     NOT_RUN="T18 (S3) NOT RUN: no executable MinIO at '$minio'; enable with E2E_MINIO_BIN=/path/to/minio"
     echo ">> NOTE: $NOT_RUN" >&2
   fi
-  # Built with printf, not by setting IFS: `local IFS=,` lasts to the end of the function and
-  # would also mangle "${args[*]}" in the echo below.
-  local dtest
-  dtest="$(printf '%s,' "$@")"
-  args+=("-Dtest=${dtest%,}")
-  echo ">> mvn ${args[*]}"
+  # Split off the suites that must run last (LAST_SUITES): one more invocation each, in order.
+  local first=() last=() name l is_last
+  for name in "$@"; do
+    is_last=0
+    for l in "${LAST_SUITES[@]}"; do [ "$name" = "$l" ] && is_last=1; done
+    if [ "$is_last" = 1 ]; then last+=("$name"); else first+=("$name"); fi
+  done
   # Surefire exits 0 when a -Dtest name matches nothing as long as another name matches (the smoke
   # test always does), and -DfailIfNoSpecifiedTests does not change that. So a mistyped suite, or a
   # class with no @Test, would print "ALL SUITES PASSED" having run nothing. Prove each named suite
@@ -179,15 +184,22 @@ run_suites() {
   # The writer module's live IT (BackfillerTest) creates and then DROPS the slot named by
   # PGPAIMON_SLOT, default "paimon" - the live writer's slot. Give suites a different name so
   # it can never kill the running writer. Do not "simplify" this back to one name.
-  local rc=0
-  E2E_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
-  PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
-  PGPAIMON_IT_WAREHOUSE="$WAREHOUSE" \
-  PGPAIMON_HARNESS=1 \
-  PGPAIMON_WRITER_LAUNCHER="$LAUNCHER" \
-  PGPAIMON_WRITER_PID_FILE="$PIDFILE" \
-  PGPAIMON_SLOT="${SLOT}_it" \
-    mvn -B -ntp "${args[@]}" || rc=$?
+  # Group lists are built with printf, not by setting IFS: `local IFS=,` lasts to the end of the
+  # function and would also mangle "${args[*]}" in the echo below.
+  local rc=0 group
+  for group in "$(printf '%s,' "${first[@]}")" $(printf '%s ' "${last[@]}"); do
+    group="${group%,}"
+    [ -n "$group" ] || continue
+    echo ">> mvn ${args[*]} -Dtest=$group"
+    E2E_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
+    PGPAIMON_IT_JDBC_URL="jdbc:postgresql://$PGHOST:$PGPORT/$DB?user=$PGUSER" \
+    PGPAIMON_IT_WAREHOUSE="$WAREHOUSE" \
+    PGPAIMON_HARNESS=1 \
+    PGPAIMON_WRITER_LAUNCHER="$LAUNCHER" \
+    PGPAIMON_WRITER_PID_FILE="$PIDFILE" \
+    PGPAIMON_SLOT="${SLOT}_it" \
+      mvn -B -ntp "${args[@]}" -Dtest="$group" || rc=$?
+  done
   local name rpt n
   for name in "$@"; do
     rpt="$(ls "$reports"/TEST-*."$name".xml 2>/dev/null | head -n1 || true)"
