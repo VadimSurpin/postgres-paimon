@@ -323,6 +323,15 @@ public class PaimonOffloadTest {
         }
         deadline = System.currentTimeMillis() + 30_000;
         while (slotActive() && System.currentTimeMillis() < deadline) Thread.sleep(200);
+        if (env.isEmpty()) {
+            // Back to the default warehouse after the slot was handed to a writer on another one.
+            // What that writer consumed is meant never to reach the default warehouse: exactly the
+            // loss the clean-stop mark exists to catch (SLOT MOVED WHILE THE WRITER WAS STOPPED,
+            // guide section 8). Accepted here as the guide says: delete the mark.
+            File mark = new File(System.getenv("PGPAIMON_IT_WAREHOUSE"), "_pgpaimon_stopped_paimon");
+            check("the default warehouse's stop mark is there to accept", mark.isFile());
+            mark.delete();
+        }
 
         ProcessBuilder pb = new ProcessBuilder("bash", launcher());
         pb.environment().putAll(env);
