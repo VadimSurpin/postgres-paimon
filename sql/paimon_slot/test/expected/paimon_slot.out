@@ -2796,3 +2796,92 @@ SELECT pg_drop_replication_slot('paimon_test');
  
 (1 row)
 
+-- (16) paimon.slot_health(): the replication slot, and what holds it back
+SELECT * FROM paimon.slot_health('pg_no_such_slot');                -- fatal: missing
+ level |                                                                         problem                                                                         
+-------+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ fatal | replication slot pg_no_such_slot does not exist: the writer creates it only on a first start or a re-bootstrap; if it was dropped by hand, re-bootstrap
+(1 row)
+
+SELECT * FROM paimon.slot_health('pg_no_such_slot', for_writer => true);   -- the writer: nothing
+ level | problem 
+-------+---------
+(0 rows)
+
+-- a slot of the writer's name made by hand with another plugin
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_sh', 'test_decoding');
+ slot_name 
+-----------
+ paimon_sh
+(1 row)
+
+SELECT level, problem FROM paimon.slot_health('paimon_sh') WHERE level <> 'down';
+ level |                                                                     problem                                                                      
+-------+--------------------------------------------------------------------------------------------------------------------------------------------------
+ fatal | replication slot paimon_sh is a logical slot with plugin test_decoding, not the writer's pgoutput slot: it was dropped and created again by hand
+(1 row)
+
+SELECT level FROM paimon.slot_health('paimon_sh');
+ level 
+-------
+ fatal
+ down
+(2 rows)
+
+SELECT pg_drop_replication_slot('paimon_sh');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+-- a pgoutput slot of this database: nothing but "no writer attached", which the writer omits
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_sh', 'pgoutput');
+ slot_name 
+-----------
+ paimon_sh
+(1 row)
+
+SELECT level FROM paimon.slot_health('paimon_sh');
+ level 
+-------
+ down
+(1 row)
+
+SELECT count(*) FROM paimon.slot_health('paimon_sh', for_writer => true);
+ count 
+-------
+     0
+(1 row)
+
+-- a prepared transaction holds the slot back until it is committed or rolled back
+CREATE TABLE sh_t (id int PRIMARY KEY);
+BEGIN;
+INSERT INTO sh_t VALUES (1);
+PREPARE TRANSACTION 'sh_gid';
+SELECT level, problem LIKE 'prepared transaction ''sh_gid'' (owner %) has been open since % holds back the replication slot%' AS reported
+  FROM paimon.slot_health('paimon_sh', prepared_older_than => '0 seconds', for_writer => true);
+  level  | reported 
+---------+----------
+ warning | t
+(1 row)
+
+SELECT count(*) FROM paimon.slot_health('paimon_sh', for_writer => true);   -- younger than 5 minutes
+ count 
+-------
+     0
+(1 row)
+
+COMMIT PREPARED 'sh_gid';
+SELECT count(*) FROM paimon.slot_health('paimon_sh', prepared_older_than => '0 seconds', for_writer => true);
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE sh_t;
+SELECT pg_drop_replication_slot('paimon_sh');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+

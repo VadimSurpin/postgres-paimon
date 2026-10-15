@@ -68,6 +68,10 @@ public final class Main {
             // 2. CHECK that the slot exists. Main never creates it: the initial backfill must
             //    read the snapshot exported by the slot's own creation (Backfiller, Task 13).
             slotExists = slotExists(conn, config.slotName());
+            // 2a. a slot that exists must be usable: not invalidated, and the writer's own.
+            if (slotExists) {
+                checkSlot(conn, config.slotName());
+            }
             // 3. rebuild the registry from paimon.table_registry BEFORE the stream opens. A
             //    'create' message is emitted once and consumed once; without this a restarted
             //    writer knows no tables and silently discards every replicated row.
@@ -154,7 +158,8 @@ public final class Main {
                     throw new IllegalStateException(e);
                 }
             });
-        HealthCheck health = new HealthCheck(() -> plainConnection(config), config.healthIntervalMs());
+        HealthCheck health = new HealthCheck(() -> plainConnection(config), config.healthIntervalMs(),
+                                             config.slotName());
         SlotConsumer.Handler handler = new PipelineHandler(registry::tracked, registry::primaryKey, ddl::handle, ddl::isDdl,
             new PipelineHandler.Target() {
                 @Override public void setRelation(long relid, RelationMeta meta) {
@@ -191,6 +196,7 @@ public final class Main {
         } catch (Throwable t) {
             // Fatal by design: resume from the last confirmed LSN on restart.
             LOG.severe("fatal: " + t);
+            explainSlotFailure(config, t);
             t.printStackTrace();
             exiting = true;
             System.exit(1);
@@ -465,6 +471,66 @@ public final class Main {
             }
             throw e;
         }
+    }
+
+    /**
+     * START_REPLICATION refused the slot (55000: invalidated, while the writer ran -- the
+     * checkpointer kills the walsender and the reconnect meets this; 42704: dropped). The raw
+     * error says neither why nor what to do, so the slot is looked up and that is logged.
+     */
+    static void explainSlotFailure(WriterConfig config, Throwable t) {
+        if (!(t instanceof java.sql.SQLException e)
+            || !("55000".equals(e.getSQLState()) || "42704".equals(e.getSQLState()))) {
+            return;
+        }
+        try (Connection conn = plainConnection(config)) {
+            if (!slotExists(conn, config.slotName())) {
+                LOG.severe("replication slot '" + config.slotName() + "' was dropped while the"
+                    + " writer ran (DROP of the slot by hand?). Re-bootstrap"
+                    + " (docs/logical-slot-architecture.md, section 3, 'Re-bootstrapping').");
+                return;
+            }
+            checkSlot(conn, config.slotName(), "while running (the stream was refused)");
+        } catch (IllegalStateException diagnosis) {
+            LOG.severe(diagnosis.getMessage());
+        } catch (Exception other) {
+            LOG.warning("could not look up why the slot was refused: " + other);
+        }
+    }
+
+    /**
+     * Step 2a: the slot is not invalidated and is a pgoutput slot of this database
+     * ({@code paimon.slot_health}); its warnings are logged. A lock timeout is retried, as for
+     * the health check.
+     */
+    static void checkSlot(Connection conn, String slotName) throws java.sql.SQLException {
+        checkSlot(conn, slotName, "at startup");
+    }
+
+    static void checkSlot(Connection conn, String slotName, String when)
+            throws java.sql.SQLException {
+        List<String> found;
+        while (true) {
+            try {
+                found = HealthCheck.slotProblems(conn, slotName);
+                break;
+            } catch (java.sql.SQLException e) {
+                if (!"55P03".equals(e.getSQLState()) && !"57014".equals(e.getSQLState())) {
+                    if (HealthCheck.transientFailure(e) || "42501".equals(e.getSQLState())) {
+                        throw e;
+                    }
+                    throw HealthCheck.checkFailed(e, "at startup (paimon.slot_health)");
+                }
+                LOG.warning("paimon.slot_health() timed out at startup; retrying in 2 s");
+                try {
+                    Thread.sleep(2_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        HealthCheck.requireUsableSlot(found, slotName, when);
     }
 
     static boolean slotExists(Connection conn, String slotName) throws java.sql.SQLException {

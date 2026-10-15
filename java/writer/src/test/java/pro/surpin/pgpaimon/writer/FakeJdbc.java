@@ -59,6 +59,7 @@ final class FakeJdbc {
             new Class<?>[] {PreparedStatement.class}, (p, m, a) -> switch (m.getName()) {
                 case "executeQuery" -> run(sql);
                 case "execute" -> { run(sql); yield false; }
+                case "setString", "setLong", "setInt" -> null;
                 case "close" -> null;
                 default -> throw new UnsupportedOperationException(m.getName());
             });

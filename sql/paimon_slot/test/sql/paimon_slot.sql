@@ -1007,3 +1007,28 @@ DROP TABLE kt_t;
 SELECT forget_history FROM paimon.forget_history('public', 'kt_t_hist');
 SELECT count(*) > 0 AS drained FROM paimon.peek_messages();
 SELECT pg_drop_replication_slot('paimon_test');
+
+-- (16) paimon.slot_health(): the replication slot, and what holds it back
+SELECT * FROM paimon.slot_health('pg_no_such_slot');                -- fatal: missing
+SELECT * FROM paimon.slot_health('pg_no_such_slot', for_writer => true);   -- the writer: nothing
+-- a slot of the writer's name made by hand with another plugin
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_sh', 'test_decoding');
+SELECT level, problem FROM paimon.slot_health('paimon_sh') WHERE level <> 'down';
+SELECT level FROM paimon.slot_health('paimon_sh');
+SELECT pg_drop_replication_slot('paimon_sh');
+-- a pgoutput slot of this database: nothing but "no writer attached", which the writer omits
+SELECT slot_name FROM pg_create_logical_replication_slot('paimon_sh', 'pgoutput');
+SELECT level FROM paimon.slot_health('paimon_sh');
+SELECT count(*) FROM paimon.slot_health('paimon_sh', for_writer => true);
+-- a prepared transaction holds the slot back until it is committed or rolled back
+CREATE TABLE sh_t (id int PRIMARY KEY);
+BEGIN;
+INSERT INTO sh_t VALUES (1);
+PREPARE TRANSACTION 'sh_gid';
+SELECT level, problem LIKE 'prepared transaction ''sh_gid'' (owner %) has been open since % holds back the replication slot%' AS reported
+  FROM paimon.slot_health('paimon_sh', prepared_older_than => '0 seconds', for_writer => true);
+SELECT count(*) FROM paimon.slot_health('paimon_sh', for_writer => true);   -- younger than 5 minutes
+COMMIT PREPARED 'sh_gid';
+SELECT count(*) FROM paimon.slot_health('paimon_sh', prepared_older_than => '0 seconds', for_writer => true);
+DROP TABLE sh_t;
+SELECT pg_drop_replication_slot('paimon_sh');

@@ -87,6 +87,10 @@ unix_socket_directories = ''
 extension_control_path = '$REPO/sql/paimon_slot/_install:\$system'
 CONF
   fi
+  # Settings added after the first initdb: a reused pgdata gets them too. PaimonRobustTest
+  # prepares transactions (PREPARE TRANSACTION needs max_prepared_transactions > 0).
+  grep -q '^max_prepared_transactions' "$RUN/pgdata/postgresql.conf" \
+    || echo "max_prepared_transactions = 8" >>"$RUN/pgdata/postgresql.conf"
   if ! pg_ctl -D "$RUN/pgdata" status >/dev/null 2>&1; then
     echo ">> starting PostgreSQL on $PGHOST:$PGPORT"
     pg_ctl -D "$RUN/pgdata" -l "$RUN/pg.log" -w -t "$READY_TIMEOUT" start >"$RUN/pg_ctl.out" 2>&1 \

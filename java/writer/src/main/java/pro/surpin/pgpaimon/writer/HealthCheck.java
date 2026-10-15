@@ -50,6 +50,7 @@ public final class HealthCheck {
     }
 
     private final ConnectionSource connections;
+    private final String slotName;           // null: the slot is not checked
     private final long intervalNanos;
     private final LongSupplier nanoClock;
     private long lastCheck;
@@ -59,8 +60,19 @@ public final class HealthCheck {
         this(connections, intervalMs, System::nanoTime);
     }
 
+    /** As above, also checking the replication slot {@code slotName} ({@link #slotProblems}). */
+    public HealthCheck(ConnectionSource connections, long intervalMs, String slotName) {
+        this(connections, intervalMs, System::nanoTime, slotName);
+    }
+
     HealthCheck(ConnectionSource connections, long intervalMs, LongSupplier nanoClock) {
+        this(connections, intervalMs, nanoClock, null);
+    }
+
+    HealthCheck(ConnectionSource connections, long intervalMs, LongSupplier nanoClock,
+                String slotName) {
         this.connections = connections;
+        this.slotName = slotName;
         this.intervalNanos = intervalMs * 1_000_000L;
         this.nanoClock = nanoClock;
         this.lastCheck = nanoClock.getAsLong();
@@ -171,6 +183,65 @@ public final class HealthCheck {
         }
     }
 
+    /**
+     * What {@code paimon.slot_health(slot, for_writer => true)} reports about the writer's
+     * replication slot, as {@code level|problem}. Runs under the same timeouts as
+     * {@link #problems}, which must have set them on this connection, or sets them itself.
+     */
+    static List<String> slotProblems(Connection conn, String slotName) throws SQLException {
+        try (java.sql.Statement st = conn.createStatement()) {
+            st.execute("SET lock_timeout = '" + LOCK_TIMEOUT + "'");
+            st.execute("SET statement_timeout = '" + STATEMENT_TIMEOUT + "'");
+        }
+        List<String> out = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                 "SELECT level || '|' || problem FROM paimon.slot_health(?, for_writer => true)")) {
+            ps.setString(1, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getString(1));
+                }
+            }
+        }
+        try (java.sql.Statement st = conn.createStatement()) {
+            st.execute("RESET lock_timeout");
+            st.execute("RESET statement_timeout");
+        }
+        return out;
+    }
+
+    /**
+     * Throws on any {@code fatal} finding about the slot (invalidated, or not the writer's slot);
+     * logs every {@code warning} (unreserved WAL, an old prepared transaction holding it back).
+     * An invalidated slot is otherwise met only as START_REPLICATION's bare "can no longer access
+     * replication slot", or, while streaming, as the walsender being killed and that same error
+     * on the reconnect; this says why and what to do.
+     */
+    static void requireUsableSlot(List<String> findings, String slotName, String when) {
+        List<String> fatal = new ArrayList<>();
+        for (String f : findings) {
+            int bar = f.indexOf('|');
+            String level = bar < 0 ? "fatal" : f.substring(0, bar);
+            String problem = bar < 0 ? f : f.substring(bar + 1);
+            if (level.equals("fatal")) {
+                fatal.add(problem);
+            } else {
+                LOG.warning("paimon.slot_health() " + when + ": " + problem);
+            }
+        }
+        if (!fatal.isEmpty()) {
+            throw new IllegalStateException("REPLICATION SLOT UNUSABLE " + when + ": "
+                + String.join("; ", fatal) + ". The writer stops: nothing it could stream from"
+                + " this slot would be complete. Nothing already in Paimon is lost or changed."
+                + " Re-bootstrap (docs/logical-slot-architecture.md, section 3,"
+                + " 'Re-bootstrapping'; scripts/rebootstrap.sh does it): stop the"
+                + " writer, SELECT pg_drop_replication_slot('" + slotName + "'); UPDATE"
+                + " paimon.table_registry SET backfill_due = true; and start the writer again."
+                + " Changes made while the slot was unusable are not in the history tables or"
+                + " the changelog: the reload copies each table's state at the new snapshot.");
+        }
+    }
+
     /** Called from the consumer loop; checks at most once per interval. */
     public void maybeCheck() {
         if (intervalNanos <= 0) {
@@ -182,8 +253,12 @@ public final class HealthCheck {
         }
         lastCheck = now;
         List<String> found;
+        List<String> slot = List.of();
         try (Connection conn = connections.open()) {
             found = problems(conn);
+            if (slotName != null) {
+                slot = slotProblems(conn, slotName);
+            }
         } catch (SQLException e) {
             if (!transientFailure(e)) {
                 throw checkFailed(e, "while running");
@@ -193,5 +268,6 @@ public final class HealthCheck {
             return;
         }
         requireHealthy(found, "while running");
+        requireUsableSlot(slot, slotName, "while running");
     }
 }

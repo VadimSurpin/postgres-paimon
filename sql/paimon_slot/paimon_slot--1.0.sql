@@ -1703,3 +1703,75 @@ BEGIN
         END IF;
     END LOOP;
 END $$;
+
+/*
+ * The replication slot, checked from pg_replication_slots: what paimon.health() cannot see
+ * because it is about the slot, not the guardrails. One row per finding, with a level:
+ *   'fatal'   -- the writer cannot (or must not) stream from this slot. It stops on these, at
+ *                startup and while running (they all mean a re-bootstrap; docs, section 3).
+ *   'warning' -- the slot is at risk or held back; the writer logs these and carries on.
+ *   'down'    -- no writer is attached. Omitted when the writer itself asks (for_writer).
+ * Nothing at all means healthy. For monitoring:
+ *   SELECT * FROM paimon.slot_health();
+ *
+ * Why each row exists:
+ *  - invalidated (invalidation_reason, or wal_status 'lost'): PostgreSQL removed WAL or rows the
+ *    slot needed (max_slot_wal_keep_size, idle_replication_slot_timeout, a recovery conflict on
+ *    a standby, wal_level lowered). An invalidated slot can never stream again; before this,
+ *    the writer stopped on START_REPLICATION's bare "can no longer access replication slot".
+ *  - not a pgoutput logical slot of this database: someone created a slot of that name by hand
+ *    (DROP and CREATE of the slot), which the writer would read from or fail on.
+ *  - wal_status 'unreserved': the next checkpoint may invalidate it; 'extended': it holds more
+ *    WAL than max_wal_size.
+ *  - a prepared transaction (PREPARE TRANSACTION) older than prepared_older_than: until it is
+ *    committed or rolled back the slot's restart_lsn and catalog_xmin cannot pass it, so WAL
+ *    accumulates and catalog vacuum is held back, with the slot looking perfectly healthy. Its
+ *    rows reach Paimon only at COMMIT PREPARED.
+ */
+CREATE FUNCTION paimon.slot_health(slot_name name DEFAULT 'paimon',
+                                   prepared_older_than interval DEFAULT '5 minutes',
+                                   for_writer boolean DEFAULT false)
+RETURNS TABLE (level text, problem text)
+LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    s  record;
+    p  record;
+    re constant text := 'it cannot be repaired: re-bootstrap (docs/logical-slot-architecture.md, section 3, "Re-bootstrapping"; scripts/rebootstrap.sh)';
+BEGIN
+    SELECT * INTO s FROM pg_replication_slots r WHERE r.slot_name = slot_health.slot_name;
+    IF NOT FOUND THEN
+        IF NOT for_writer THEN
+            RETURN QUERY SELECT 'fatal', format('replication slot %I does not exist: the writer creates it only on a first start or a re-bootstrap; if it was dropped by hand, re-bootstrap', slot_health.slot_name);
+        END IF;
+    ELSE
+        IF s.slot_type <> 'logical' OR s.plugin IS DISTINCT FROM 'pgoutput' THEN
+            RETURN QUERY SELECT 'fatal', format('replication slot %I is a %s slot with plugin %s, not the writer''s pgoutput slot: it was dropped and created again by hand', s.slot_name, s.slot_type, coalesce(s.plugin, 'none'));
+        ELSIF s.database IS DISTINCT FROM current_database() THEN
+            RETURN QUERY SELECT 'fatal', format('replication slot %I belongs to database %s, not %s', s.slot_name, s.database, current_database());
+        END IF;
+        IF s.invalidation_reason IS NOT NULL OR s.wal_status = 'lost' THEN
+            RETURN QUERY SELECT 'fatal', format('replication slot %I is invalidated (%s): %s; %s', s.slot_name,
+                coalesce(s.invalidation_reason, 'wal_status lost'),
+                CASE s.invalidation_reason
+                    WHEN 'wal_removed' THEN 'WAL it still needed was removed because it held more than max_slot_wal_keep_size, while the writer was stopped or behind'
+                    WHEN 'idle_timeout' THEN 'it was inactive for longer than idle_replication_slot_timeout'
+                    WHEN 'rows_removed' THEN 'a recovery conflict: rows its catalog_xmin needed were removed on the primary'
+                    WHEN 'wal_level_insufficient' THEN 'wal_level was lowered below logical'
+                    ELSE 'PostgreSQL can no longer decode from it' END, re);
+        ELSIF s.wal_status = 'unreserved' THEN
+            RETURN QUERY SELECT 'warning', format('replication slot %I is unreserved: it holds more WAL than max_slot_wal_keep_size allows and the next checkpoint may invalidate it, which forces a re-bootstrap; the writer is stopped or too far behind', s.slot_name);
+        ELSIF s.wal_status = 'extended' THEN
+            RETURN QUERY SELECT 'warning', format('replication slot %I holds more WAL than max_wal_size (wal_status extended)', s.slot_name);
+        END IF;
+        IF NOT s.active AND NOT for_writer THEN
+            RETURN QUERY SELECT 'down', format('no writer is attached to replication slot %I (inactive since %s); PostgreSQL keeps all WAL from %s for it', s.slot_name, coalesce(s.inactive_since::text, 'unknown'), s.restart_lsn);
+        END IF;
+    END IF;
+    FOR p IN SELECT x.gid, x.prepared, x.owner FROM pg_prepared_xacts x
+              WHERE x.database = current_database() AND x.prepared < now() - prepared_older_than
+              ORDER BY x.prepared
+    LOOP
+        RETURN QUERY SELECT 'warning', format('prepared transaction %L (owner %s) has been open since %s: until COMMIT PREPARED or ROLLBACK PREPARED it holds back the replication slot (WAL is retained and catalog vacuum is blocked), and its changes reach Paimon only at the commit', p.gid, p.owner, p.prepared);
+    END LOOP;
+END $$;
