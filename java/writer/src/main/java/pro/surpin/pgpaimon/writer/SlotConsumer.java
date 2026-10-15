@@ -66,11 +66,20 @@ public final class SlotConsumer {
     private final Handler handler;
     private volatile PGReplicationStream stream;
     private volatile boolean running = true;
+    private volatile long flushedAtCleanStop;
 
     public SlotConsumer(WriterConfig config, PgOutputDecoder decoder, Handler handler) {
         this.config = config;
         this.decoder = decoder;
         this.handler = handler;
+    }
+
+    /**
+     * The flushed position last sent to the server by a clean stop; 0 when the stream did not end
+     * with one (see {@link StopMark}).
+     */
+    public long flushedAtCleanStop() {
+        return flushedAtCleanStop;
     }
 
     public void stop() {
@@ -244,6 +253,7 @@ public final class SlotConsumer {
         call(handler::onShutdown);
         try {
             s.forceUpdateStatus();
+            flushedAtCleanStop = s.getLastFlushedLSN().asLong();
         } catch (SQLException e) {
             LOG.warning("final status update failed: " + e);
         }

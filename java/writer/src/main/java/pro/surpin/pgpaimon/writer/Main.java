@@ -72,6 +72,10 @@ public final class Main {
             if (slotExists) {
                 checkSlot(conn, config.slotName());
             }
+            // 2b. ... and where a clean stop left it, unless someone moved it since (StopMark).
+            StopMark.check(StopMark.inWarehouse(config),
+                           slotExists ? confirmedFlush(conn, config.slotName()) : 0,
+                           config.slotName());
             // 3. rebuild the registry from paimon.table_registry BEFORE the stream opens. A
             //    'create' message is emitted once and consumed once; without this a restarted
             //    writer knows no tables and silently discards every replicated row.
@@ -228,8 +232,12 @@ public final class Main {
             }
         }, "shutdown"));
 
+        // The clean-stop mark was checked at step 2b; from here on it would only be stale.
+        StopMark.clear(StopMark.inWarehouse(config));
         try {
             consumer.run(resume);
+            // A clean stop (SIGTERM): where the slot was left, for the next start's check.
+            StopMark.record(StopMark.inWarehouse(config), consumer.flushedAtCleanStop());
         } catch (Throwable t) {
             // Fatal by design: resume from the last confirmed LSN on restart.
             LOG.severe("fatal: " + t);
@@ -568,6 +576,18 @@ public final class Main {
             }
         }
         HealthCheck.requireUsableSlot(found, slotName, when);
+    }
+
+    /** The slot's {@code confirmed_flush_lsn}; 0 when it has none. */
+    static long confirmedFlush(Connection conn, String slotName) throws java.sql.SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = ?")) {
+            ps.setString(1, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                String v = rs.next() ? rs.getString(1) : null;
+                return v == null ? 0 : SlotConsumer.parseLsn(v);
+            }
+        }
     }
 
     static boolean slotExists(Connection conn, String slotName) throws java.sql.SQLException {
