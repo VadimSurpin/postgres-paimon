@@ -136,12 +136,10 @@ public final class Backfiller implements AutoCloseable {
         try (Connection conn = Main.plainConnection(config)) {
             conn.setAutoCommit(true);
             qualified = currentName(conn, relid);
+            // Text output that depends on session settings is pinned, as on the stream: COPY
+            // prints every value with the same output functions pgoutput uses.
+            SessionSettings.pin(conn);
             try (Statement st = conn.createStatement()) {
-                // Text output that depends on session settings is pinned, as on the stream.
-                st.execute("SET TimeZone = 'UTC'");
-                st.execute("SET client_encoding = 'UTF8'");
-                st.execute("SET bytea_output = 'hex'");
-                st.execute("SET extra_float_digits = 1");
                 st.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
                 // must be the first statement of the transaction
                 st.execute("SET TRANSACTION SNAPSHOT " + quoteLiteral(plan.snapshotName()));

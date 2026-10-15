@@ -4,9 +4,7 @@ package pro.surpin.pgpaimon.writer;
 import java.nio.ByteBuffer;
 import java.sql.Connection;
 import java.sql.DriverManager;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -297,22 +295,9 @@ public final class SlotConsumer {
         p.setProperty("assumeMinServerVersion", "18");
         Connection conn = DriverManager.getConnection(config.jdbcUrl(), p);
         try {
-            // Pinned, not defaulted. pgjdbc announces the JVM's default zone as TimeZone in the
-            // startup packet and the "options" property does not override it (verified against
-            // PostgreSQL 18), so the zone is set with SQL, which a replication=database session
-            // accepts. client_encoding must be UTF8 because PgOutputDecoder decodes strictly.
-            // bytea_output must be hex because TextDecoder accepts only the \x form, and a
-            // server (or role, or database) set to 'escape' would otherwise feed it octal
-            // escapes; Backfiller pins it on its own connection for the same reason.
-            // Each setting is read back: a mismatch is a misconfiguration, not connection loss.
-            try (Statement st = conn.createStatement()) {
-                st.execute("SET TimeZone = 'UTC'");
-                st.execute("SET client_encoding = 'UTF8'");
-                st.execute("SET bytea_output = 'hex'");
-            }
-            requireSetting(conn, "TimeZone", "UTC");
-            requireSetting(conn, "client_encoding", "UTF8");
-            requireSetting(conn, "bytea_output", "hex");
+            // Pinned, not defaulted, and read back: see SessionSettings for each setting and
+            // why. A mismatch is a misconfiguration, not connection loss.
+            SessionSettings.pin(conn);
         } catch (SQLException | RuntimeException e) {
             try {
                 conn.close();
@@ -322,20 +307,6 @@ public final class SlotConsumer {
             throw e;
         }
         return conn;
-    }
-
-    /** A setting that is not what we pinned is a misconfiguration, never connection loss. */
-    private static void requireSetting(Connection conn, String name, String want)
-            throws SQLException {
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SHOW " + name)) {
-            rs.next();
-            String got = rs.getString(1);
-            if (!want.equalsIgnoreCase(got)) {
-                throw new IllegalStateException("replication session has " + name + "=" + got
-                    + " but the writer requires " + want);
-            }
-        }
     }
 
     private PGReplicationStream open(Connection conn, long startLsn) throws SQLException {
