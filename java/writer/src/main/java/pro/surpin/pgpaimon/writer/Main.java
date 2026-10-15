@@ -102,7 +102,44 @@ public final class Main {
         BackfillAction action = decideBackfill(slotExists, due.size(), rows.size(), stranded,
                                                config.slotName());
 
-        // 3c. only now does anything in the warehouse change.
+        // 3b'. the warehouse belongs to this cluster (ClusterIdentity says why it matters):
+        //      refused here, still before anything is written.
+        ClusterIdentity.Identity cluster;
+        try (Connection conn = plainConnection(config)) {
+            cluster = ClusterIdentity.read(conn);
+        }
+        List<ClusterIdentity.Stamp> stamps = new ArrayList<>();
+        long highest = 0;
+        for (RegistryRow r : rows) {
+            for (String t : new String[] {r.table(), r.histTable()}) {
+                if (t == null) {
+                    continue;
+                }
+                Map<String, String> o = registry.optionsOf(r.schema(), t);
+                if (o != null) {
+                    stamps.add(new ClusterIdentity.Stamp(r.schema() + "." + t,
+                        o.get(ClusterIdentity.SYSID_OPTION), o.get(ClusterIdentity.TIMELINE_OPTION)));
+                }
+            }
+            if (offsets.hasCommitted(r.relid())) {
+                long h = offsets.highestCommitted(r.relid());
+                if (Long.compareUnsigned(h, highest) > 0) {
+                    highest = h;
+                }
+            }
+        }
+        ClusterIdentity.decide(stamps, cluster, highest, slotExists,
+            action != BackfillAction.NONE, config.acceptSystemIdentifier());
+        registry.identityOptions(cluster.options());
+
+        // 3c. only now does anything in the warehouse change. Existing tables first take the
+        //     cluster's stamp (adopted when they carry none); new ones are created with it.
+        for (RegistryRow r : rows) {
+            registry.stampExisting(r.schema(), r.table(), cluster.options());
+            if (r.histTable() != null) {
+                registry.stampExisting(r.schema(), r.histTable(), cluster.options());
+            }
+        }
         for (RegistryRow r : rows) {
             // reconcileLostDdl only when the slot is absent: see SchemaRegistry.bootstrapTable.
             registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),

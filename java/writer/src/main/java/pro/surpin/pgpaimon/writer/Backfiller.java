@@ -89,9 +89,15 @@ public final class Backfiller implements AutoCloseable {
         p.setProperty("preferQueryMode", "simple");
         p.setProperty("assumeMinServerVersion", "18");
         Connection conn = DriverManager.getConnection(config.jdbcUrl(), p);
+        int major;
+        try {
+            major = conn.getMetaData().getDatabaseMajorVersion();
+        } catch (SQLException | RuntimeException e) {
+            closeQuietly(conn);
+            throw e;
+        }
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery(
-                 "CREATE_REPLICATION_SLOT " + slot + " LOGICAL pgoutput (SNAPSHOT 'export')")) {
+             ResultSet rs = st.executeQuery(createSlotCommand(slot, major))) {
             if (!rs.next()) {
                 throw new SQLException("CREATE_REPLICATION_SLOT returned no row");
             }
@@ -102,13 +108,27 @@ public final class Backfiller implements AutoCloseable {
                     + lsn + " snapshot_name=" + snapshot);
             }
             long cp = LogSequenceNumber.valueOf(lsn).asLong();
-            LOG.info("created slot " + slot + " at " + lsn + ", snapshot " + snapshot);
+            LOG.info("created slot " + slot + " at " + lsn + ", snapshot " + snapshot
+                + (major >= 17 ? ", failover enabled" : ", without failover (PostgreSQL "
+                    + major + " has none; a promoted standby will not have this slot)"));
             replicationConnection = conn;
             return new BackfillPlan(snapshot, cp);
         } catch (SQLException | RuntimeException e) {
             closeQuietly(conn);
             throw e;
         }
+    }
+
+    /**
+     * The command that creates the slot. With {@code FAILOVER} (PostgreSQL 17 and later) the slot
+     * can be synchronized to physical standbys ({@code sync_replication_slots = on} there, the
+     * standby listed in {@code synchronized_standby_slots} here), so a promoted standby has it and
+     * the writer continues there instead of needing a re-bootstrap. Without it, any failover
+     * loses the slot. Older servers do not know the option and get the command without it.
+     */
+    static String createSlotCommand(String slot, int serverMajor) {
+        return "CREATE_REPLICATION_SLOT " + slot + " LOGICAL pgoutput (SNAPSHOT 'export'"
+            + (serverMajor >= 17 ? ", FAILOVER" : "") + ")";
     }
 
     /**

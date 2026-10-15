@@ -28,7 +28,7 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                            long batchMaxRows, long batchMaxBytes, long batchMaxIntervalMs,
                            long healthIntervalMs,
                            Map<String, String> catalogOptions,
-                           long txnMaxBytes) {
+                           long txnMaxBytes, String acceptSystemIdentifier) {
 
     /** Defaults for the streaming commit batch; see {@link MiniBatcher}. */
     public static final String DEFAULT_BATCH_MAX_ROWS = "10000";
@@ -92,7 +92,8 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
             parseMin(env, "PGPAIMON_BATCH_MAX_INTERVAL_MS", DEFAULT_BATCH_MAX_INTERVAL_MS, 0),
             parseMin(env, "PGPAIMON_HEALTH_INTERVAL_MS", DEFAULT_HEALTH_INTERVAL_MS, 0),
             Map.copyOf(cat),
-            parseMin(env, "PGPAIMON_TXN_MAX_BYTES", String.valueOf(defaultTxnMaxBytes()), 1));
+            parseMin(env, "PGPAIMON_TXN_MAX_BYTES", String.valueOf(defaultTxnMaxBytes()), 1),
+            systemIdentifier(env, "PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER"));
     }
 
     /** A setting that may only take the one value the extension uses; see {@link #PUBLICATION}. */
@@ -141,6 +142,23 @@ public record WriterConfig(String jdbcUrl, String replicationUrl, String user,
                 + " X/XXXXXXXX form the POISON RECORD error prints or as a decimal, got '"
                 + v + "'", e);
         }
+    }
+
+    /** A PostgreSQL system identifier (a decimal 64-bit number), or null for unset. */
+    private static String systemIdentifier(Map<String, String> env, String key) {
+        String v = get(env, key);
+        if (v == null) {
+            return null;
+        }
+        v = v.trim();
+        try {
+            Long.parseUnsignedLong(v);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(key + " must be the decimal system identifier the"
+                + " writer's refusal printed (SELECT system_identifier FROM pg_control_system()),"
+                + " got '" + v + "'", e);
+        }
+        return v;
     }
 
     private static long parseNumber(Map<String, String> env, String key, String dflt, long max) {

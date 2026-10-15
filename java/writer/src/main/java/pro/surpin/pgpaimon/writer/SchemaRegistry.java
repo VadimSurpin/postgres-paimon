@@ -96,6 +96,63 @@ public final class SchemaRegistry implements TableTracker {
      */
     static final String BASELINE_OPTION = "pgpaimon.history-baseline-lsn";
 
+    /** Options every table this writer creates carries: the cluster identity, see ClusterIdentity. */
+    private Map<String, String> identityOptions = Map.of();
+
+    /** Sets what {@link #identityOptions} every table created from now on carries. */
+    public void identityOptions(Map<String, String> options) {
+        identityOptions = Map.copyOf(options);
+    }
+
+    /** {@code s} with {@link #identityOptions} added. */
+    private Schema stamped(Schema s) {
+        if (identityOptions.isEmpty()) {
+            return s;
+        }
+        Map<String, String> o = new java.util.HashMap<>(s.options());
+        o.putAll(identityOptions);
+        return new Schema(s.fields(), s.partitionKeys(), s.primaryKeys(), o, s.comment());
+    }
+
+    /** The options of an existing Paimon table, or null when there is no such table. */
+    public Map<String, String> optionsOf(String schema, String table) {
+        try {
+            return catalog.getTable(identifierOf(schema, table)).options();
+        } catch (Catalog.TableNotExistException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Sets {@code options} on an existing Paimon table where they differ (one schema change), and
+     * drops every cached table and row builder, which may now be stale. Returns whether anything
+     * changed; a missing table is not an error.
+     */
+    public boolean stampExisting(String schema, String table, Map<String, String> options) {
+        Map<String, String> have = optionsOf(schema, table);
+        if (have == null) {
+            return false;
+        }
+        List<SchemaChange> changes = new ArrayList<>();
+        options.forEach((k, v) -> {
+            if (!v.equals(have.get(k))) {
+                changes.add(SchemaChange.setOption(k, v));
+            }
+        });
+        if (changes.isEmpty()) {
+            return false;
+        }
+        try {
+            catalog.alterTable(identifierOf(schema, table), changes, false);
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot set " + options.keySet() + " on "
+                + identifierOf(schema, table) + ": " + e, e);
+        }
+        tables.clear();
+        builders.clear();
+        return true;
+    }
+
     public SchemaRegistry(Catalog catalog, WriterConfig config) {
         this(catalog, config, CrashHook.fromEnv(System.getenv()));
     }
@@ -393,7 +450,7 @@ public final class SchemaRegistry implements TableTracker {
         try {
             // One Paimon database per PostgreSQL schema, created on demand. Idempotent.
             catalog.createDatabase(schema, true);
-            catalog.createTable(id, wanted, true);
+            catalog.createTable(id, stamped(wanted), true);
         } catch (Exception e) {
             throw new IllegalStateException("cannot create Paimon table " + id, e);
         }
@@ -462,8 +519,8 @@ public final class SchemaRegistry implements TableTracker {
                     user.add(new DataField(user.size(), c.name(), parseType(c.type())));
                 }
                 // No baseline: a table's first history holds everything from its creation on.
-                catalog.createTable(hid, histSchema(user, histBuckets, ddlLsn, 0,
-                                                    schema + "." + table, registration), true);
+                catalog.createTable(hid, stamped(histSchema(user, histBuckets, ddlLsn, 0,
+                                                    schema + "." + table, registration)), true);
             }
         } catch (Exception e) {
             throw new IllegalStateException("cannot create Paimon history table " + hid, e);
@@ -1089,9 +1146,9 @@ public final class SchemaRegistry implements TableTracker {
                 LOG.info(what + ": the new " + cur + " keeps the options set on the archived one: "
                     + carried);
             }
-            catalog.createTable(cur, histSchema(user, buckets, ddlLsn, ddlLsn,
+            catalog.createTable(cur, stamped(histSchema(user, buckets, ddlLsn, ddlLsn,
                 archived.options().getOrDefault(HISTORY_OF_OPTION, ""),
-                archived.options().get(REGISTRATION_OPTION), carried), false);
+                archived.options().get(REGISTRATION_OPTION), carried)), false);
             hook.step("rotate-created");
         } catch (RuntimeException e) {
             throw e;
