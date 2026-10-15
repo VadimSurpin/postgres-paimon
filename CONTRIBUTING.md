@@ -28,7 +28,9 @@ Run all three layers before sending a change; they cover different failures.
 cd java/writer && mvn test
 
 # 2. The SQL extension. install-local stages it under sql/paimon_slot/_install so that no
-#    system directory is written; the test cluster must set extension_control_path to it.
+#    system directory is written; the test cluster must set extension_control_path to it, and
+#    the settings in sql/paimon_slot/test/logical.conf (wal_level = logical,
+#    max_prepared_transactions > 0: section (16) prepares a transaction).
 make -C sql/paimon_slot install-local
 make -C sql/paimon_slot installcheck
 
@@ -36,6 +38,11 @@ make -C sql/paimon_slot installcheck
 #    every acceptance suite. Needs the writer jar from step 1.
 ./test/slot-acceptance/run_acceptance.sh
 ```
+
+`PaimonRobustTest` (what an administrator or developer can do to the database: section 8 of the
+guide) runs last, in a Maven invocation of its own (`LAST_SUITES` in the script): it invalidates the
+slot and re-bootstraps, which reloads every table of the database. A new suite that changes state
+for everything after it belongs there too.
 
 `run_acceptance.sh` with no argument also runs the writer module's live ITs (`BackfillerTest`'s
 initial-load tests, skipped by plain `mvn test`) against a database of its own, and fails if any is
@@ -76,6 +83,7 @@ section 7, for what each layer proves.
 1. Open an issue describing the change before starting significant work.
 2. Keep commits focused; one logical change per commit.
 3. Update the guide in `docs/` if you add or change a setting, a guardrail, a limitation or a
-   build step. State the reason for a limitation, not only the rule: a rule without its reason gets
+   build step; a new way for a database user to break replication (or a new refusal of one) is a
+   row in section 8, "Rules for developers and administrators", with its marker and its test. State the reason for a limitation, not only the rule: a rule without its reason gets
    "fixed" later.
 4. All source files must carry the `SPDX-License-Identifier: Apache-2.0` header.

@@ -74,7 +74,10 @@ java -jar java/writer/target/paimon-writer.jar
 The full setup, every setting, the operational hazards (an abandoned slot retains WAL and fills the
 disk), the limitations and why each exists, troubleshooting and the test procedure are in
 **[docs/logical-slot-architecture.md](docs/logical-slot-architecture.md)**. Read its section 3 before
-running this anywhere that matters.
+running this anywhere that matters, and give its section 8, **"Rules for developers and
+administrators"**, to everyone who changes the database: one table of everything not to do, each
+marked REJECTED, STOPS WRITER, REINIT / HISTORY LOSS or SILENT, with the recovery and the test that
+proves it.
 
 ## Limitations worth knowing up front
 
@@ -99,6 +102,12 @@ Each is deliberate and explained, with its reason, in section 5 of the guide:
 * a **non-empty** table cannot be added once the writer's slot exists;
 * PostgreSQL `infinity` / `-infinity` are stored as the finite extremes of the Paimon type, which is
   order-preserving but lossy at the very end of the range;
+* a few things are **not detected** at all (guide, section 8): consuming or advancing the writer's
+  slot with another client after a crash of the writer (after a clean stop it is refused), a
+  changed `PGPAIMON_COMMIT_USER`, a new partition nobody registered, a file-level snapshot restore
+  started once the WAL has passed the warehouse; sequences and large objects are not replicated;
+* one transaction is bounded by `PGPAIMON_TXN_MAX_BYTES` (a quarter of the heap by default): a
+  larger one stops the writer, losing nothing, until it is given more memory;
 * S3 support is wired in but **has not been exercised** in this repository's own environment: the
   test is skipped unless `E2E_MINIO_BIN` points at a MinIO binary.
 

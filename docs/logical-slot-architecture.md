@@ -53,7 +53,7 @@ a JDK and Maven to build the writer.
 wal_level = logical
 max_slot_wal_keep_size = 20GB        # read section 3 before choosing a value
 
-# 2. Build the writer (shaded jar, about 199 MB; runs its 371 unit tests).
+# 2. Build the writer (shaded jar, about 199 MB; runs its 394 unit tests).
 cd java/writer && mvn -q package     # -> java/writer/target/paimon-writer.jar
 ```
 
@@ -109,6 +109,8 @@ java -jar java/writer/target/paimon-writer.jar
 | `PGPAIMON_BATCH_MAX_INTERVAL_MS` | `2000` | streaming commit batch: longest a transaction waits for its commit, counted from the batch's **first** transaction. Bounds replication latency |
 | `PGPAIMON_FLUSH_MAX_RECORDS` | `10000` | rows per COPY chunk during the **initial load** only (each chunk is a commit of its own). **Not** the streaming batch size: that is `PGPAIMON_BATCH_MAX_ROWS`. The two do not interact |
 | `PGPAIMON_SKIP_LSN` | unset | break-glass for a single poison record: the change LSN of the ONE record to drop. Every known way to create one is now refused before commit; read section 3, "A record the writer can never apply", before setting it. Also skips the ONE DDL message at that LSN if it is rejected for its credential (section 5, "DDL messages carry a credential") |
+| `PGPAIMON_TXN_MAX_BYTES` | a quarter of the JVM's maximum heap | the largest single transaction the writer will hold, as an estimate of its text payload (an UPDATE is two records, and every change also has a history record). Over it the writer stops with `TRANSACTION TOO LARGE` and loses nothing; give it more heap or raise this (section 3, "Other operational notes") |
+| `PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER` | unset | break-glass for a `CLUSTER MISMATCH` refusal, **only** after a `pg_upgrade` from PostgreSQL 17 or later that carried the writer's slot over: the new cluster's system identifier, which the refusal prints. Unset it once the writer has started (section 8, "The cluster a warehouse belongs to") |
 | `PGPAIMON_S3_ENDPOINT`, `PGPAIMON_S3_ACCESS_KEY`, `PGPAIMON_S3_SECRET_KEY` | unset | S3 (path-style access is switched on when an endpoint is given) |
 | `PGPAIMON_TEST_HALT_AFTER_COMMIT` | unset | **test only, never in production**: `<schema>.<table>`; the writer halts (as `kill -9` would) right after its first commit to that Paimon table. Used by the crash tests of history tables (section 2, "History tables") |
 | `PGPAIMON_TEST_HALT_AT_STEP` | unset | **test only, never in production**: `rotate-renamed`, `rotate-created` or `rotate-altered`; the writer halts right after that step of its first history rotation |
@@ -634,15 +636,39 @@ willing to ride out, and less than the free space on the WAL volume. The price: 
 hit PostgreSQL invalidates the slot, and **an invalidated slot cannot be repaired, only
 re-bootstrapped**.
 
-**A missing or invalidated slot is fatal to the writer, by design.** On start it exits with, for example:
+**A missing or invalidated slot is fatal to the writer, by design.** It checks the slot at startup
+and with every periodic health check (`paimon.slot_health()`, below), and a stream refused while it
+runs (the checkpointer kills the walsender of a slot it invalidates; the reconnect is refused) is
+diagnosed the same way. It names the cause and the procedure:
 
 ```
-SEVERE: fatal: org.postgresql.util.PSQLException: ERROR: can no longer access replication slot "paimon"
-  Detail: This replication slot has been invalidated due to "wal_removed".
+SEVERE: REPLICATION SLOT UNUSABLE while running (the stream was refused): replication slot paimon is invalidated (wal_removed): WAL it still needed was removed because it held more than max_slot_wal_keep_size, while the writer was stopped or behind; it cannot be repaired: re-bootstrap (...; scripts/rebootstrap.sh). The writer stops: ...
 ```
 
 It does not retry. Nothing but the backfill path ever creates a slot, so retrying could never
 resolve the condition; a retry loop would only hide it from whoever is watching the process.
+(Verified end to end: `PaimonRobustTest` R11 freezes the writer, churns WAL past a 1 MB
+`max_slot_wal_keep_size`, and checks both messages and the recovery.)
+
+**`paimon.slot_health()`** is the slot's counterpart of `paimon.health()`, for monitoring:
+
+```sql
+SELECT * FROM paimon.slot_health();     -- (slot_name DEFAULT 'paimon', prepared_older_than DEFAULT '5 minutes')
+```
+
+One row per finding, with a level. `fatal`: the slot is invalidated (`wal_removed` from
+`max_slot_wal_keep_size`, `idle_timeout` from `idle_replication_slot_timeout`, `rows_removed` or
+`wal_level_insufficient` from a recovery conflict), or a slot of that name is not a `pgoutput` slot
+of this database (dropped and created again by hand); the writer stops on these. `warning`:
+`wal_status` is `unreserved` (the next checkpoint may invalidate it) or `extended`, or a **prepared
+transaction** (`PREPARE TRANSACTION`) has been open longer than `prepared_older_than`; the writer logs
+these and carries on. `down`: no writer is attached. Alert on any row.
+
+**Prepared transactions hold the slot back.** Until `COMMIT PREPARED` or `ROLLBACK PREPARED`, the
+slot's `restart_lsn` and `catalog_xmin` cannot pass a prepared transaction: WAL accumulates and
+catalog vacuum is held back while the slot looks perfectly healthy, and with
+`max_slot_wal_keep_size` set the slot is eventually invalidated. Its changes reach Paimon only at
+`COMMIT PREPARED`, exactly once; after `ROLLBACK PREPARED`, never (`PaimonRobustTest` R5).
 
 ### Re-bootstrapping
 
@@ -650,7 +676,8 @@ This is the single recovery procedure for an invalidated slot, for a replication
 accident (section 6), and for adding a non-empty table. It reloads every tracked table from scratch.
 
 1. Stop the writer.
-2. In the replicated database:
+2. In the replicated database, run `scripts/rebootstrap.sh` (it refuses while a writer is attached),
+   for example `PGPAIMON_SLOT=paimon scripts/rebootstrap.sh -h dbhost -U postgres -d mydb`, or by hand:
 
    ```sql
    SELECT pg_drop_replication_slot('paimon');
@@ -873,18 +900,29 @@ the rows streamed meanwhile were built against the old schema.
   identified by name, so a PostgreSQL table dropped and recreated under the same name resolves to
   the same Paimon table, and a `drop_table` whose LSN is at or below what the table records is
   refused as stale rather than purging a table it was never about.
-  **It carries no cluster or timeline identity**, which matters in exactly one situation: point a
-  warehouse at a *different* PostgreSQL server, or at one restored by PITR or re-`initdb`'d, and
-  its LSNs start again from a lower point, so DDL below the recorded value is skipped as a replay
-  it is not. Nothing detects this. A warehouse belongs to one cluster's timeline; re-bootstrap into
-  a fresh warehouse rather than reusing one across a restore.
+  It is an LSN, meaningful only on the timeline of the cluster that produced it; every table
+  therefore also carries `pgpaimon.pg-system-identifier` and `pgpaimon.pg-timeline`, and the writer
+  refuses to stream into a warehouse of another cluster, or from a server whose WAL is behind it
+  (section 8, "The cluster a warehouse belongs to").
 * The writer is one process per slot. Multi-writer and HA are non-goals.
 * The shaded jar is about 199 MB (Paimon, Hadoop client, `paimon-s3`).
 * The writer accumulates a whole transaction before flushing it and never writes a partial one
-  (pgoutput `streaming` is off on purpose), so very large transactions need heap. **A transaction
-  larger than the writer can hold is a poison record of its own kind** (residual risk): it fails
-  with `OutOfMemoryError` on every replay. The recourse is more heap (`java -Xmx...`), not a skip;
-  size the heap for the largest transaction you run (bulk loads, `UPDATE` of a whole table). Completed
+  (pgoutput `streaming` is off on purpose), so very large transactions need heap. **One transaction
+  is bounded by `PGPAIMON_TXN_MAX_BYTES`** (default a quarter of the maximum heap): over it the writer
+  stops with
+
+  ```
+  SEVERE: fatal: ...TransactionTooLargeException: TRANSACTION TOO LARGE: transaction 19179 has reached 1326 change record(s) and an estimated 200010 bytes (at _seq 0/8F233A90), over PGPAIMON_TXN_MAX_BYTES=200000. ... Nothing is lost: the transaction stays in the slot and replays, whole, on the next start. Give the writer more heap (java -Xmx...) ...
+  ```
+
+  rather than run out of memory on every replay (as it used to). Give it more heap, or raise the
+  limit, and restart. Measured (default 3 GB heap): a 500,000-row `INSERT` of about 100 bytes a row
+  (1,000,000 records with its history, estimated at 153 MB) held about 340 MB live while it was
+  buffered and peaked at 1 GB of heap during the flush; it replicated in about 20 s. The estimate
+  undercounts by a factor of about two, which the default's quarter allows for. The transaction is
+  not spilled to disk: every later stage takes it as one list in memory, and a redesign to stream it
+  from disk would put every invariant of the pipeline at stake. Size the heap for the largest
+  transaction you run (bulk loads, `UPDATE` of a whole table), or load in batches. Completed
   transactions then wait in the commit batch (see "Commit batching") up to its row, byte and
   interval limits.
 * Stopping the writer with SIGTERM is safe at any time, and commits and confirms whatever is
@@ -1404,7 +1442,7 @@ and 5, with their exact text.
 ## 7. Testing and verification
 
 ```bash
-cd java/writer && mvn -q package                 # 371 unit tests (2 live ITs skipped), builds the shaded jar
+cd java/writer && mvn -q package                 # 394 unit tests (2 live ITs skipped), builds the shaded jar
 ( cd sql/paimon_slot && make install-local && make installcheck )   # pg_regress against a running cluster on 5441
 ./test/slot-acceptance/run_acceptance.sh [Suite ...]
 ```
@@ -1414,9 +1452,12 @@ port 5442 (leaving a cluster on 5441 alone), installs the extension from the wor
 jar locally, runs the JDBC suites and exits with their status. With no arguments it runs **every**
 suite — `SlotHarnessSmokeIT`, `PaimonSchemaIT`, `PaimonFeatureTest`, `PaimonDdlTest`,
 `PaimonAdvancedTest`, `PaimonTypeTest`, `PaimonSlotKeyMoveTest`, `PaimonOffloadTest`,
-`PaimonAdversarialTest`, `PaimonHistoryTest` and `TpccCompareSelfTest` (the TPC-C comparator
-against tampered histories, no live stack needed), named explicitly in the script's `ALL_SUITES` and
-printed at the start of the run — which is **688 checks** — and then the writer module's live ITs
+`PaimonAdversarialTest`, `PaimonHistoryTest`, `TpccCompareSelfTest` (the TPC-C comparator
+against tampered histories, no live stack needed) and, last and in a Maven invocation of its own,
+`PaimonRobustTest` (section 8: hostile settings, the cluster identity, a transaction too large, prepared
+transactions, TRUNCATE and partitions, VACUUM FULL, renames, types, a slot advanced behind a stopped
+writer, an invalidated slot and the re-bootstrap), named explicitly in the script's `ALL_SUITES` and
+printed at the start of the run — which is **813 checks** — and then the writer module's live ITs
 (`BackfillerTest`, 16 tests, none may be skipped) in a database of their own. `PaimonHistoryTest` is the history-table
 and key-less-log suite: a row per image, uncollapsed, inside one proven commit batch, a writer halted
 between the main and history commits in both orders, one archive per DDL and a straddling
@@ -1564,3 +1605,167 @@ Two consequences for an operator:
 * **Read planning scales with the snapshot count, not the data.** A streaming changelog scan must
   `plan()` once per snapshot, which is why the batch exists: before it, reading the changelogs of
   9,467 snapshots took 120 s.
+
+## 8. Rules for developers and administrators
+
+Everything a developer (who writes the schema and the application's SQL) or an administrator (who
+runs the cluster, its backups, upgrades and the writer) must **not** do to a database replicated by
+the writer, what happens if they do, and how to recover. Each row carries exactly one marker:
+
+* **REJECTED**: PostgreSQL or the extension's guardrail refuses it; nothing happens. The error is named.
+* **STOPS WRITER**: PostgreSQL accepts it; the writer stops with a diagnosis (it never continues
+  wrongly), nothing is lost, and the named procedure brings it back.
+* **REINIT / HISTORY LOSS**: the replica must be re-bootstrapped (section 3, "Re-bootstrapping";
+  `scripts/rebootstrap.sh`). What that costs is always the same, so it is stated once, below the table.
+* **SILENT / NOT DETECTED**: nothing refuses it and nothing reports it. Listed honestly, with the
+  mitigation.
+
+The **Test** column names what proves the row: an acceptance case (`A…` in `PaimonAdversarialTest`,
+`H…` in `PaimonHistoryTest`, `R…` in `PaimonRobustTest`), a pg_regress section (`regress (n)`), a
+writer unit test, or **untested** with the reason.
+
+### What a re-bootstrap costs, and how to keep the history
+
+A re-bootstrap drops the slot and reloads every registered table from a fresh snapshot.
+
+* **Rebuilt from PostgreSQL:** every main Paimon table (a primary-key table is emptied and reloaded;
+  a key-less table's operation log keeps its rows and gets one `R` row per current row).
+* **Kept:** every history table (`<table>_hist`), its archives (`<table>_hist_<lsn>`) and every row
+  they held; the reload appends one `R` row per row to each history. Retained histories of dropped
+  tables are untouched.
+* **Lost:** the changes made between the last change the writer applied and the new snapshot: they
+  are in no history table and in no changelog (the main table's state after the reload includes
+  their *effect*, not the changes). A changelog consumer sees the reload as fresh inserts.
+* **When the warehouse itself cannot be reused** (the server's WAL is behind it: a restore from a
+  backup or a point-in-time recovery; see "The cluster a warehouse belongs to"), the reload's
+  commits would be filtered below the warehouse's, so it needs a new warehouse. To keep the history,
+  move each `<table>_hist` and its archives into the new warehouse's database directory (or keep the
+  old warehouse readable beside it); they are ordinary Paimon tables. In the new warehouse a
+  `_hist` name already taken is refused by `add_table()` until `paimon.forget_history()` is called,
+  so move them aside under another name.
+
+### Administrators
+
+| Do not | Consequence | Marker | Recovery | Test |
+|---|---|---|---|---|
+| Disable or drop an event trigger (`ALTER EVENT TRIGGER paimon_ddl_end DISABLE`, `... ENABLE` without `ALWAYS`, `DROP EVENT TRIGGER`), or change a replicated table, the publication or a guard while one is off | `paimon.health()` reports it; the writer refuses to start and stops while running (`paimon.health() reports N problem(s)`) | **STOPS WRITER** | put the trigger back (`ALTER EVENT TRIGGER ... ENABLE ALWAYS`); a table changed while unguarded is re-registered (REINIT for that table) | A15, regress (10) |
+| Edit `paimon_pub` (`DROP TABLE`, `SET (publish = ...)`, `publish_via_partition_root`, `RENAME`, `DROP PUBLICATION`) | refused by the extension's trigger (`... is not in publication paimon_pub`, `does not publish every action`, ...) | **REJECTED** | - | A9, regress (10) |
+| Change `REPLICA IDENTITY` of a replicated table, also under `session_replication_role = replica` | refused (`... must stay FULL`) | **REJECTED** | - | A10, regress |
+| `ALTER TABLE ... SET UNLOGGED` on a replicated table | PostgreSQL refuses (`cannot change table ... to unlogged because it is part of a publication`) | **REJECTED** | - | R9 |
+| Register a table that already holds rows while the writer's slot exists | `add_table()` accepts it; the running writer replicates its new changes but not the rows it already had, and the next start refuses (`slot 'paimon' exists and 1 of 2 tracked table(s) are awaiting their initial backfill`) | **REINIT / HISTORY LOSS** | register tables while they are empty; otherwise re-bootstrap (section 5) | unit `BackfillerTest` (`decideBackfill`) |
+| `DROP EXTENSION paimon_slot` (or drop its schema, functions or tables) under a writer | the writer stops (`paimon.health() could not run ... the paimon_slot extension ... is missing`); the registry is gone with the extension | **REINIT / HISTORY LOSS** | `CREATE EXTENSION`, register every table again, re-bootstrap | unit `aMissingExtensionIsFatal` |
+| Revoke a grant the writer's role needs | the writer stops at startup naming every grant (42501), or while running (`... could not run`) | **STOPS WRITER** | grant it back (section 2) | unit `MainStartupTest` (`aPermissionErrorNamesEveryGrant`), `HealthCheckTest` (`whichFailuresAreTransient`) |
+| Leave the writer stopped, or let it fall behind, with `max_slot_wal_keep_size` set | the slot is invalidated (`wal_removed`); the writer stops with `REPLICATION SLOT UNUSABLE` and the cause; `paimon.slot_health()` says `fatal` | **REINIT / HISTORY LOSS** | `scripts/rebootstrap.sh`, start the writer | R11 |
+| ... with `max_slot_wal_keep_size = -1` (the default) | nothing invalidates the slot, and `pg_wal` grows until the disk is full and the server stops (section 3, "The abandoned slot") | **SILENT / NOT DETECTED** by the writer (it is the one stopped) | monitor `paimon.slot_health()` (`down`, `unreserved`) and the slot's lag; set `max_slot_wal_keep_size` | untested (would fill a disk) |
+| Set `idle_replication_slot_timeout` shorter than your longest writer outage | the slot is invalidated (`idle_timeout`); diagnosed as above | **REINIT / HISTORY LOSS** | as above | the diagnosis: unit `SlotHealthTest`; the invalidation itself untested (only `wal_removed` is induced, R11) |
+| Drop the writer's slot by hand (`pg_drop_replication_slot`), or drop and create one of that name | with the slot absent the writer refuses to start (`slot 'paimon' does not exist but N tracked table(s) already hold data ...`); a slot of that name made by hand with another plugin or in another database is `fatal` in `paimon.slot_health()` and stops the writer | **REINIT / HISTORY LOSS** | re-bootstrap | unit `BackfillerTest` (`decideBackfill`); regress (16) |
+| Consume or advance the writer's slot with another client while the writer is stopped (`pg_logical_slot_get_changes`, `pg_replication_slot_advance`, a second writer with the same slot) | the changes consumed are never applied | see the next row | | |
+| ... while the writer runs | PostgreSQL refuses (`replication slot "paimon" is active for PID ...`) | **REJECTED** | - | verified by hand, see below |
+| ... while the writer is stopped cleanly (SIGTERM) | the next start refuses: `SLOT MOVED WHILE THE WRITER WAS STOPPED` (see "Consumed by another client") | **REINIT / HISTORY LOSS** | re-bootstrap; or, to accept the loss, delete the mark file the message names | R13; `PaimonOffloadTest` (it hands the slot to a writer on another warehouse and back, and must accept the loss); unit `StopMarkTest` |
+| ... while the writer is down after a crash (`kill -9`, OOM, power loss) | the changes consumed are never applied | **SILENT / NOT DETECTED** | restrict the REPLICATION attribute and `pg_hba.conf` replication entries; never run a second writer on the same slot | untested: by construction nothing records it |
+| Change `PGPAIMON_COMMIT_USER` (or the slot name) between runs | a changed commit user re-commits replayed transactions (the replay filter is per commit user): duplicates in the changelog and the history; a changed slot name finds no slot and refuses (stranded tables) | **SILENT / NOT DETECTED** for the commit user | keep both stable; the default derives the user from the slot name | untested |
+| Lower `wal_level` below `logical` and restart | PostgreSQL refuses to start while a logical slot exists | **REJECTED** (by PostgreSQL) | set it back | verified by hand, see below |
+| Leave a prepared transaction (`PREPARE TRANSACTION`) open for long | the slot cannot advance past it: WAL accumulates, catalog vacuum is held back; with `max_slot_wal_keep_size` the slot is eventually invalidated. Reported as a `warning` by `paimon.slot_health()` and in the writer's log | **REINIT / HISTORY LOSS** (only once the slot is invalidated) | `COMMIT PREPARED` or `ROLLBACK PREPARED` it; it then replicates exactly once, or never | R5, regress (16) |
+| `pg_upgrade` | the new cluster has a new system identifier: the writer refuses (`CLUSTER MISMATCH`) | **STOPS WRITER** if the upgrade carried the slot over (PostgreSQL 17 or later as the source, the slot caught up); otherwise **REINIT / HISTORY LOSS** | carried over: start once with `PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER=<new id>` (printed in the refusal); otherwise re-bootstrap | R3 (a warehouse stamped with another identifier), unit `ClusterIdentityTest`; a real `pg_upgrade` untested |
+| Restore the database from a backup, or recover it to a point in time, under an existing warehouse | if the server's WAL ends below the warehouse's last commit the writer refuses (`... WAL is behind the warehouse`); if the slot was not in the backup (`pg_basebackup` omits slots) it refuses as for a dropped slot | **REINIT / HISTORY LOSS**, into a new warehouse (see the cost above) | re-bootstrap into a new warehouse; move histories aside | unit `ClusterIdentityTest`; a real restore untested. **Residual:** a file-level snapshot restore that keeps the slot, started after the WAL has grown past the warehouse's last commit, is **not detected** |
+| Point the writer at another cluster (a wrong `PGPAIMON_JDBC_URL`, a dump restored into a new cluster) with an existing warehouse | `CLUSTER MISMATCH` | **STOPS WRITER** | point it back, or re-bootstrap the warehouse from the new cluster | R3 |
+| `pg_dump` / `pg_restore --clean` of replicated tables into the same database | the tables are dropped (their Paimon main tables purged, histories retained) and recreated under new OIDs; the registry no longer matches | **REINIT / HISTORY LOSS** | register the restored tables again (empty first, or re-bootstrap) | untested |
+| Fail over to a physical standby | with the slot synchronized (it is created with `failover = true`; the standby needs `sync_replication_slots = on`, the primary `synchronized_standby_slots`), the writer continues on the promoted standby; the new timeline is logged and stamped. Without a synchronized slot it refuses as for a dropped slot | **REINIT / HISTORY LOSS** without a synchronized slot | configure slot synchronization before you need it | R2 (the slot is a failover slot); a real failover untested (no standby in the test environment) |
+| Change `paimon.table_registry`, `paimon.secret`, `pgpaimon.*` table options or Paimon snapshots by hand | a registry edit is caught by `health()` (cols mismatch); a secret changed with DDL in the slot stops the writer (`REJECTED DDL MESSAGE`); an edited `pgpaimon.applied-ddl-lsn` skips or replays DDL | **SILENT / NOT DETECTED** for `pgpaimon.applied-ddl-lsn`; **STOPS WRITER** for the rest | do not; for the secret, section 5 | A16 (the secret); regress (10) (the registry); untested (the options) |
+| Give the writer too little heap for your largest transaction | `TRANSACTION TOO LARGE` | **STOPS WRITER** | more heap or a higher `PGPAIMON_TXN_MAX_BYTES` | R4, unit `TxnSizeLimitTest` |
+
+### Developers
+
+| Do not | Consequence | Marker | Recovery | Test |
+|---|---|---|---|---|
+| `ADD COLUMN ... DEFAULT`, `ALTER COLUMN ... SET NOT NULL`, change or drop the primary key, a `DEFERRABLE` key | refused by the DDL guardrail | **REJECTED** | see section 5 for each | A10, regress |
+| Change a column's type to one Paimon cannot apply, a `USING` rewrite, shrink a `varchar`, or wrap such DDL in a function or procedure | refused | **REJECTED** | run allowed DDL at top level | A6, A18, regress (5), (7) |
+| Store `numeric 'NaN'` / `Infinity`, or a `timestamp` after 294247-01-10 | refused by the column's guard | **REJECTED** | - | A1, A2 |
+| `numeric` with a negative scale or a scale above the precision; a generated column; a `reg*` column; a schema or table name with `$ : /`, `.` or `..`, or the schema `sys`; Paimon's or the history's reserved column names | refused by `add_table()` or the DDL guardrail | **REJECTED** | - | A3, A4, A5, regress (12) |
+| Give a replicated table an inheritance child, or register a partitioned parent | refused (`has inheritance child`, `is not an ordinary table (relkind p)`) | **REJECTED** | register each partition (leaf) | A7, R7 |
+| `ALTER TYPE ... RENAME VALUE`, or a composite type's `ADD ATTRIBUTE`, on a type a replicated table uses | refused | **REJECTED** | - | A8 |
+| Create a new partition of a tree whose partitions are replicated, and forget to register it | its rows are not replicated: only registered tables are | **SILENT / NOT DETECTED** | `paimon.add_table()` on the partition right after `CREATE TABLE ... PARTITION OF`, while it is empty | R7 |
+| One transaction larger than `PGPAIMON_TXN_MAX_BYTES` (a bulk load, an `UPDATE` of a whole table) | the writer stops (`TRANSACTION TOO LARGE`) until given more memory | **STOPS WRITER** | more heap or a higher limit; in the application, batch bulk changes | R4 |
+| Keep a prepared transaction open | as in the administrators' table | **REINIT / HISTORY LOSS** (only once the slot is invalidated) | finish it | R5 |
+| Rely on sequences, large objects (`lo_*`) or `money`'s locale reaching Paimon | sequence state and large objects are not replicated (an `oid` column replicates the number only); `money` arrives as text in the `C` locale (`$1,234.50`) whatever the database's locale | **SILENT / NOT DETECTED** (by design: not replicated) | read sequences from PostgreSQL; store binary data in `bytea` | `money`: R1, R10; the others untested (not replicated by design) |
+
+### What is safe, and proven so
+
+These are ordinary and need no precaution; each was run against the real writer and Paimon read back
+equal to PostgreSQL:
+
+* `TRUNCATE` in every form: of a replicated table, inside a transaction with later inserts (A12),
+  `... CASCADE` reaching a replicated table from one that is not (R6), `RESTART IDENTITY` (R6), of
+  a partition or of the whole partitioned tree (R7).
+* Partitions: rows moving between partitions by `UPDATE` of the key (a `-D` in the old partition's
+  history, a `+I` in the new one's), `DETACH PARTITION` (the table keeps replicating),
+  `ATTACH PARTITION` (R7); `ALTER TABLE` of the parent reaching a replicated partition (A7).
+* `VACUUM FULL`, `CLUSTER`, `REINDEX` of a replicated table, also while queued behind a lock: other
+  tables keep replicating, the health check gives up after its lock timeout and is not a problem
+  (R8, A19).
+* `ALTER TABLE ... RENAME TO`, `... SET SCHEMA`, `ALTER SCHEMA ... RENAME`: the table keeps
+  replicating into the Paimon table it was registered as (section 5); `OWNER TO` (R9).
+* DML under `session_replication_role = replica` replicates; the DDL guardrails fire under it too
+  (R9, A10).
+* `ALTER DATABASE` / `ALTER ROLE ... SET` of `DateStyle`, `IntervalStyle`, `TimeZone`,
+  `extra_float_digits`, `lc_monetary`, `bytea_output`: the writer pins each on its own sessions
+  (the stream and the initial load) and reads it back, so values replicate identically (R1, and R12
+  for a reload under the same settings). Before, `IntervalStyle` changed the text of every interval
+  value replicated afterwards.
+* Column types the writer carries as text: domains (as their text, not their base type), arrays,
+  ranges, `json`, `jsonb`, `xml`, `interval`, `money`, `uuid`, `inet`, `bit`, `time`, `timetz`, an
+  enum (also after `ADD VALUE`), `bytea`, a 3 MB `text`, control characters, tabs, newlines and
+  backslashes (R10, A8).
+* `ALTER TYPE ... ADD VALUE` on an enum (A8, R10); other publications on a replicated table (A14).
+
+### Consumed by another client
+
+A logical slot remembers only how far it has been confirmed. Anything that confirms past changes the
+writer has not applied, while the writer is not attached, removes them for good: SQL functions
+(`pg_logical_slot_get_changes`, `pg_replication_slot_advance`), a second writer process with the same
+`PGPAIMON_SLOT`, `pg_recvlogical`. Comparing the slot with the warehouse cannot tell: the slot's
+position is legitimately far ahead of the last Paimon commit whenever transactions touched no
+replicated table (they are confirmed without one).
+
+So a **clean stop** (SIGTERM) records the position the writer last sent the server in a small file in
+the warehouse, `_pgpaimon_stopped_<slot>`, and the next start compares it with the slot's
+`confirmed_flush_lsn` before anything is read or written:
+
+```
+IllegalStateException: SLOT MOVED WHILE THE WRITER WAS STOPPED: the writer stopped cleanly with slot 'paimon' at 0/9A8B7C60, but it is now confirmed to 0/9A8C1D28. Something else consumed or advanced it (...), and the changes in between will never reach Paimon. Re-bootstrap (...). If the loss is known and accepted, delete <warehouse>/_pgpaimon_stopped_paimon and start again.
+```
+
+It refuses on every start until the mark is gone (a re-bootstrap, or deleting it to accept the
+loss). The mark is deleted once a start is about to stream, so **after a crash there is none and
+nothing is checked**: that case stays undetected. Only roles with the REPLICATION attribute (or
+superusers) can consume a slot; keep that set small, and never point a second writer at the same slot.
+
+### The cluster a warehouse belongs to
+
+Every Paimon table the writer creates carries `pgpaimon.pg-system-identifier` and
+`pgpaimon.pg-timeline`; tables from before this check are stamped at the next start. At startup,
+before anything is written, the writer compares them with the server
+(`pg_control_system()`, `pg_control_checkpoint()`, `pg_current_wal_lsn()`):
+
+* **another system identifier** (`pg_upgrade`, a restore into a new cluster, a re-`initdb`, a JDBC
+  URL naming another server): refused with `CLUSTER MISMATCH ... this warehouse was written from
+  PostgreSQL cluster [...]`, naming both remedies. It is accepted without asking only when every
+  table is being reloaded anyway (a re-bootstrap), or when `PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER` names
+  the new identifier: for a `pg_upgrade` from PostgreSQL 17 or later, which carries logical slots
+  over when they are caught up, so the new cluster's stream continues the old one exactly.
+* **the server's WAL ends below the warehouse's last commit**: a restore or point-in-time recovery
+  under the warehouse. Refused, always, even for a re-bootstrap, whose commits the warehouse would
+  filter as already applied: it needs a new warehouse (above).
+* **another timeline with the slot present**: a promoted standby with a synchronized failover slot.
+  Logged as a WARNING and re-stamped; streaming continues.
+
+Why it matters: commit identifiers and `pgpaimon.applied-ddl-lsn` are LSNs. On another cluster, or
+on this one rewound, new transactions arrive with LSNs the warehouse has already passed, and would be
+filtered as replays: silent loss with nothing in any log.
+
+### Verified by hand, not in a suite
+
+* `wal_level` lowered to `replica` with the writer's slot present: PostgreSQL 18.6 refuses to start,
+  `FATAL:  logical replication slot "paimon" exists, but "wal_level" < "logical"`.
+* A second consumer while the writer runs (`pg_logical_slot_peek_changes('paimon', ...)`): refused
+  by PostgreSQL, `ERROR:  replication slot "paimon" is active for PID 743526`.

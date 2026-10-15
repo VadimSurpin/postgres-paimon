@@ -25,7 +25,7 @@ advances the slot behind a stopped writer, invalidates the slot with a 1 MB
 table of the database; it restores the settings at the end. The cluster gets
 `max_prepared_transactions = 8` (added to a reused `pgdata` too) for its prepared transactions.
 
-That is **635 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
+That is **813 checks** (plus T18 not run without MinIO). `PaimonAdversarialTest` stops and restarts
 the writer on purpose in its last case (A15, `paimon.health()`); `PaimonHistoryTest` restarts it
 several times, with batch limits that hold a batch open and with the test-only crash hook
 `PGPAIMON_TEST_HALT_AFTER_COMMIT`. It prints the list it is about to run.
