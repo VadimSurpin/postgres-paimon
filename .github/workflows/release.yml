@@ -1,0 +1,71 @@
+name: Release
+
+# Builds the release assets from the commit it is dispatched on and publishes a GitHub release.
+# workflow_dispatch ONLY: a release is deliberate. The writer module's unit tests run as part of
+# `mvn package`, so a release cannot be cut from a red build.
+#
+# Assets:
+#   paimon-writer.jar            the shaded writer (java -jar)
+#   paimon_slot-<version>.tar.gz paimon_slot.control and paimon_slot--1.0.sql
+#   SHA256SUMS
+# Release notes come from docs/releases/v<version>.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "release version without the leading v (e.g. 2.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the version, the notes and that the tag is free
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version: $VERSION"; exit 1; }
+          test -f "docs/releases/v${VERSION}.md" || { echo "missing docs/releases/v${VERSION}.md"; exit 1; }
+          grep -q "<version>${VERSION}</version>" java/writer/pom.xml \
+            || { echo "java/writer/pom.xml is not at ${VERSION}"; exit 1; }
+          if gh release view "v${VERSION}" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "v${VERSION}" >/dev/null 2>&1; then
+            echo "v${VERSION} already exists"; exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build the writer (runs its unit tests)
+        working-directory: java/writer
+        run: mvn -B -ntp package
+
+      - name: Assemble the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp java/writer/target/paimon-writer.jar dist/
+          tar -czf "dist/paimon_slot-${VERSION}.tar.gz" -C sql/paimon_slot \
+            paimon_slot.control paimon_slot--1.0.sql
+          (cd dist && sha256sum paimon-writer.jar "paimon_slot-${VERSION}.tar.gz" > SHA256SUMS)
+          ls -la dist; cat dist/SHA256SUMS
+
+      - name: Publish the release
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "v${VERSION}" \
+            --notes-file "docs/releases/v${VERSION}.md" \
+            --latest

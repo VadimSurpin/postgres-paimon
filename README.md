@@ -5,6 +5,10 @@ replication**. A small SQL extension registers the tables you want replicated an
 an external Java process reads a replication slot and writes to a Paimon warehouse on a local path,
 HDFS or S3.
 
+> **Branches.** `main` is the logical-replication implementation described here (v2.x). The
+> earlier C++ table-access-method implementation (`paimon_heap`, v1.x) is kept on the
+> [`pg-extension`](https://github.com/VadimSurpin/postgres-paimon/tree/pg-extension) branch.
+
 ```
 PostgreSQL 18                                   paimon-writer (JVM)                 Paimon warehouse
 ┌──────────────────────────────┐   pgoutput    ┌───────────────────────────┐       ┌──────────────────┐

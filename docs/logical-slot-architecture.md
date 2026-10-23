@@ -1517,7 +1517,7 @@ the run. Do not give it a key to make it look like the others; the stock schema 
 Paimon tables.
 
 **What the comparison asserts** (`java/src/test/java/pro/surpin/pgpaimon/TpccCompare.java`, run as
-`java -cp java/target/paimon-reader-1.0.jar pro.surpin.pgpaimon.TpccCompare <warehouse> <jdbc-url>
+`java -cp java/target/paimon-reader-2.0.0.jar pro.surpin.pgpaimon.TpccCompare <warehouse> <jdbc-url>
 [schema]`):
 
 * the Paimon column list is exactly PostgreSQL's plus the writer's metadata columns, and the Paimon

@@ -107,7 +107,7 @@ import java.util.TreeMap;
  * <h2>Usage</h2>
  *
  * <pre>
- *   java -cp java/target/paimon-reader-1.0.jar pro.surpin.pgpaimon.TpccCompare \
+ *   java -cp java/target/paimon-reader-2.0.0.jar pro.surpin.pgpaimon.TpccCompare \
  *        [warehouse] [jdbc-url] [pg-schema]
  * </pre>
  *
