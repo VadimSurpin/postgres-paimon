@@ -18,7 +18,7 @@ class MainStartupTest {
     e.put("PGPAIMON_USER", "writer");
     e.put("PGPAIMON_PASSWORD", "pw");
     e.put("PGPAIMON_WAREHOUSE", "/tmp/wh");
-    return WriterConfig.fromEnv(e);
+    return WriterConfigUtils.fromEnv(e);
   }
 
   /**

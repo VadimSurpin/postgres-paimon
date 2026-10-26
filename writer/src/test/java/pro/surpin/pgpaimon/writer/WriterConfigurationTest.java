@@ -7,10 +7,17 @@ import static org.mockito.Mockito.*;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.paimon.catalog.Catalog;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
+import pro.surpin.pgpaimon.writer.decoder.PgOutputMessageDecoder;
 import pro.surpin.pgpaimon.writer.dto.*;
+
+
 
 class WriterConfigurationTest {
 
@@ -27,9 +34,9 @@ class WriterConfigurationTest {
         .run(context -> {
           assertNull(context.getStartupFailure());
           WriterConfig config = context.getBean(WriterConfig.class);
-          assertEquals("custom-slot", config.slotName());
-          assertEquals("paimon-writer-custom-slot", config.commitUser());
-          assertEquals("jdbc:postgresql://localhost/paimon", config.jdbcUrl());
+          assertEquals("custom-slot", config.getSlotName());
+          assertEquals("paimon-writer-custom-slot", config.getCommitUser());
+          assertEquals("jdbc:postgresql://localhost/paimon", config.getJdbcUrl());
           assertNotNull(context.getBean(SlotConsumer.class));
           assertNotNull(context.getBean(TxnBatcher.class));
           assertNotNull(context.getBean(WriterRunner.class));
@@ -44,12 +51,14 @@ class WriterConfigurationTest {
 
   @Test
   void acceptsExistingPgpaimonEnvironmentNames() {
-    contexts
-        .withPropertyValues("PGPAIMON_JDBC_URL=jdbc:postgresql://localhost/paimon",
-            "PGPAIMON_WAREHOUSE=/tmp/spring-writer-test", "PGPAIMON_SKIP_LSN=0/100")
-        .run(context -> {
+    contexts.withPropertyValues("PGPAIMON_JDBC_URL=jdbc:postgresql://localhost/paimon",
+        "PGPAIMON_WAREHOUSE=/tmp/spring-writer-test", "PGPAIMON_SKIP_LSN=0/100",
+        "PGPAIMON_S3_ACCESS_KEY=legacy-access", "PGPAIMON_BATCH_MAX_ROWS=25").run(context -> {
           assertNull(context.getStartupFailure());
-          assertEquals(256L, context.getBean(WriterConfig.class).skipLsn());
+          WriterConfig config = context.getBean(WriterConfig.class);
+          assertEquals(256L, config.getSkipLsnValue());
+          assertEquals("legacy-access", config.getCatalogOptions().get("s3.access-key"));
+          assertEquals(25L, config.getBatchMaxRows());
         });
   }
 
@@ -61,11 +70,15 @@ class WriterConfigurationTest {
       while (root.getCause() != null) {
         root = root.getCause();
       }
-      assertEquals("PGPAIMON_JDBC_URL is required", root.getMessage());
+      assertTrue(root.getMessage().contains("PGPAIMON_JDBC_URL is required"), root.getMessage());
     });
   }
 
   @Configuration(proxyBeanMethods = false)
+  @EnableConfigurationProperties(WriterConfig.class)
+  @ComponentScan(basePackageClasses = PgOutputMessageDecoder.class)
+  @Import({WriterBootstrap.class, SchemaRegistry.class, PaimonSink.class, OffsetStore.class,
+      DdlMessageHandler.class, SlotConsumer.class, ToastResolver.class, WriterRunner.class})
   static class TestConfiguration extends WriterConfiguration {
     @Bean(destroyMethod = "close")
     @Override
@@ -76,8 +89,8 @@ class WriterConfigurationTest {
     }
 
     @Bean(destroyMethod = "close")
-    @Override
-    PaimonSink paimonSink(
+    @Primary
+    PaimonSink testPaimonSink(
         SchemaRegistry registry,
         WriterConfig config
     ) {
@@ -85,8 +98,8 @@ class WriterConfigurationTest {
     }
 
     @Bean
-    @Override
-    WriterBootstrap writerBootstrap(
+    @Primary
+    WriterBootstrap testWriterBootstrap(
         WriterConfig config,
         SchemaRegistry registry,
         PaimonSink sink,

@@ -8,10 +8,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.logging.Handler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
@@ -38,7 +34,20 @@ class DdlMessageAuthTest {
   Catalog catalog;
   SchemaRegistry reg;
   DdlMessageHandler handler;
-  final List<LogRecord> logged = new ArrayList<>();
+  final List<ch.qos.logback.classic.spi.ILoggingEvent> logged = new ArrayList<>();
+  ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent> appender;
+  ch.qos.logback.classic.Logger logger;
+
+  @org.junit.jupiter.api.AfterEach
+  void close() throws Exception {
+    if (appender != null) {
+      logger.detachAppender(appender);
+      appender.stop();
+    }
+    if (catalog != null)
+      catalog.close();
+  }
+
   long lsn = 0x5000;
 
   static final long RELID = 17001L;
@@ -48,7 +57,7 @@ class DdlMessageAuthTest {
     Options o = new Options();
     o.set("warehouse", wh.toString());
     catalog = CatalogFactory.createCatalog(CatalogContext.create(o));
-    WriterConfig cfg = WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL",
+    WriterConfig cfg = WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL",
         "jdbc:postgresql://localhost/db", "PGPAIMON_WAREHOUSE", wh.toString()));
     reg = new SchemaRegistry(catalog, cfg);
     handler = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
@@ -57,17 +66,18 @@ class DdlMessageAuthTest {
          "pk":["id"],"cols":[{"id":1,"name":"id","type":"INT NOT NULL"}],
          "options":{"bucket":"1"}}""")));
     assertTrue(reg.tracked(RELID));
-    Logger.getLogger(DdlMessageHandler.class.getName()).addHandler(new Handler() {
-      public void publish(
-          LogRecord r
+    logger =
+        (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(DdlMessageHandler.class);
+    appender = new ch.qos.logback.core.AppenderBase<>() {
+      @Override
+      protected void append(
+          ch.qos.logback.classic.spi.ILoggingEvent event
       ) {
-        logged.add(r);
+        logged.add(event);
       }
-
-      public void flush() {}
-
-      public void close() {}
-    });
+    };
+    appender.start();
+    logger.addAppender(appender);
   }
 
   PgEvent.Message message(
@@ -87,11 +97,11 @@ class DdlMessageAuthTest {
       String why
   ) {
     assertEquals(1, logged.size(), "exactly one warning");
-    assertEquals(Level.WARNING, logged.get(0).getLevel());
-    assertTrue(
-        logged.get(0).getMessage().startsWith("IGNORED a logical message with prefix 'paimon'"),
-        logged.get(0).getMessage());
-    assertTrue(logged.get(0).getMessage().contains(why), logged.get(0).getMessage());
+    assertEquals(ch.qos.logback.classic.Level.WARN, logged.get(0).getLevel());
+    assertTrue(logged.get(0).getFormattedMessage().startsWith(
+        "IGNORED a logical message with prefix 'paimon'"), logged.get(0).getFormattedMessage());
+    assertTrue(logged.get(0).getFormattedMessage().contains(why),
+        logged.get(0).getFormattedMessage());
   }
 
   @Test
@@ -154,8 +164,9 @@ class DdlMessageAuthTest {
         {"v":1,"op":"drop_table","relid":"17001","schema":"public","table":"victim"}""";
     assertDoesNotThrow(() -> armed.handle(message(raw(forged))));
     assertEquals(1, logged.size());
-    assertTrue(logged.get(0).getMessage().startsWith("SKIPPED DDL MESSAGE (PGPAIMON_SKIP_LSN="),
-        logged.get(0).getMessage());
+    assertTrue(
+        logged.get(0).getFormattedMessage().startsWith("SKIPPED DDL MESSAGE (PGPAIMON_SKIP_LSN="),
+        logged.get(0).getFormattedMessage());
     assertTrue(reg.tracked(RELID), "still tracked");
     assertNotNull(catalog.getTable(Identifier.create("public", "victim")), "Paimon table kept");
     // any other LSN stays fatal

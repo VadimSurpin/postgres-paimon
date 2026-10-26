@@ -47,7 +47,7 @@ class TxnBatcherTest {
   @Test
   void assignsPerChangeLsnAndAMonotoneOpSeq() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
 
     b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
@@ -79,7 +79,7 @@ class TxnBatcherTest {
   @Test
   void opSeqRestartsEachTransaction() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     for (int i = 0; i < 2; i++) {
       b.onEvent(new PgEvent.Begin(100L * i, 0L, i), 100L * i, null);
       b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 100L * i + 1, META);
@@ -93,7 +93,7 @@ class TxnBatcherTest {
   @Test
   void aTransactionWithNoRecordsStillFlushes() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(600L, 0L, 1L), 600L, null);
     b.onEvent(new PgEvent.Message(true, 601L, "paimon", "{\"v\":1,\"op\":\"add_col\"}".getBytes()),
         601L, null);
@@ -108,7 +108,7 @@ class TxnBatcherTest {
   @Test
   void keyMovesInterleaveWithoutBeingReordered() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(700L, 0L, 1L), 700L, null);
     // UPDATE t SET id = id + 1 over keys 1 and 2, in server row order
     b.onEvent(new PgEvent.Update(16412, row("1", "a"), false, row("2", "a")), 710L, META);
@@ -125,7 +125,7 @@ class TxnBatcherTest {
   @Test
   void discardThrowsAwayAnOpenTransaction() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(800L, 0L, 1L), 800L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 810L, META);
     assertTrue(b.hasOpenTransaction());
@@ -136,7 +136,7 @@ class TxnBatcherTest {
 
   @Test
   void eventsOutsideATransactionAreRejected() {
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, new Recorder());
     assertThrows(IllegalStateException.class,
         () -> b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1L, META));
   }
@@ -144,7 +144,7 @@ class TxnBatcherTest {
   @Test
   void untrackedRelationIsSkippedButTransactionStillFlushes() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), new SchemaRegistry(null, null), rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), new SchemaRegistry(null, null), rec);
     b.onEvent(new PgEvent.Begin(900L, 0L, 1L), 900L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 910L, META);
     b.onEvent(new PgEvent.Commit(900L, 920L, 0L), 920L, null);
@@ -165,7 +165,7 @@ class TxnBatcherTest {
     SchemaRegistry reg = new SchemaRegistry(null, null);
     reg.register(16412, "public", "t");
     reg.register(16413, "public", "u");
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), reg, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), reg, rec);
     RelationMeta u =
         new RelationMeta(16413, "public", "u", List.of("id", "v"), List.of(true, false));
     b.onEvent(new PgEvent.Begin(900L, 0L, 1L), 900L, null);
@@ -183,7 +183,7 @@ class TxnBatcherTest {
   @Test
   void relationAndTruncateContributeNothingAndKeepOpSeq() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1000L, 0L, 1L), 1000L, null);
     b.onEvent(new PgEvent.Relation(META), 0L, null);
     b.onEvent(new PgEvent.Truncate(List.of(99999L), false, false), 1005L, null);
@@ -197,7 +197,7 @@ class TxnBatcherTest {
 
   @Test
   void commitWithoutBeginAndNestedBeginAreRejected() throws Exception {
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, new Recorder());
     assertThrows(IllegalStateException.class,
         () -> b.onEvent(new PgEvent.Commit(1L, 2L, 0L), 1L, null));
     b.onEvent(new PgEvent.Begin(1L, 0L, 1L), 1L, null);
@@ -217,7 +217,7 @@ class TxnBatcherTest {
   @Test
   void truncateAloneIsFineAndStillFlushes() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1100L, 0L, 1L), 1100L, null);
     b.onEvent(trunc(16412), 1105L, null);
     b.onEvent(new PgEvent.Commit(1100L, 1110L, 0L), 1110L, null);
@@ -234,7 +234,7 @@ class TxnBatcherTest {
   @Test
   void aRecordAfterTruncateOfTheSameTableIsKept() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1200L, 0L, 1L), 1200L, null);
     b.onEvent(trunc(16412), 1205L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1210L, META);
@@ -247,7 +247,7 @@ class TxnBatcherTest {
   @Test
   void aTruncateRemovesOnlyTheRecordsOfItsTableThatPrecedeIt() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     RelationMeta other =
         new RelationMeta(77777, "public", "u", List.of("id", "v"), List.of(true, false));
     b.onEvent(new PgEvent.Begin(1300L, 0L, 1L), 1300L, null);
@@ -268,7 +268,7 @@ class TxnBatcherTest {
   @Test
   void truncateOfOneTableWithRecordForAnotherIsFine() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1400L, 0L, 1L), 1400L, null);
     b.onEvent(trunc(77777), 1405L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1410L, META);
@@ -279,7 +279,7 @@ class TxnBatcherTest {
 
   @Test
   void discardClearsTruncateState() throws Exception {
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, new Recorder());
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, new Recorder());
     b.onEvent(new PgEvent.Begin(1500L, 0L, 1L), 1500L, null);
     b.onEvent(trunc(16412), 1505L, null);
     b.discardOpenTransaction();
@@ -290,7 +290,7 @@ class TxnBatcherTest {
   @Test
   void aThrowMidTransactionLeavesNothingOpenAndCommitFlushesNothing() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1700L, 0L, 1L), 1700L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 1710L, META);
     // key-only old tuple: ToastResolver.resolve throws
@@ -305,7 +305,7 @@ class TxnBatcherTest {
   @Test
   void twoUpdatesToTheSameKeySurviveInOrder() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(1900L, 0L, 1L), 1900L, null);
     b.onEvent(new PgEvent.Update(16412, row("1", "a"), false, row("1", "b")), 1910L, META);
     b.onEvent(new PgEvent.Update(16412, row("1", "b"), false, row("1", "c")), 1920L, META);
@@ -321,7 +321,7 @@ class TxnBatcherTest {
   @Test
   void typeMsgAndOriginContributeNothing() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(2000L, 0L, 1L), 2000L, null);
     b.onEvent(new PgEvent.TypeMsg(23L, "pg_catalog", "int4"), 0L, null);
     b.onEvent(new PgEvent.Origin(2000L, "o"), 0L, null);
@@ -335,7 +335,7 @@ class TxnBatcherTest {
   @Test
   void nestedBeginDiscardsTheOpenBatchAndCommitFlushesNothing() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec);
     b.onEvent(new PgEvent.Begin(2100L, 0L, 1L), 2100L, null);
     b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 2110L, META);
     assertThrows(IllegalStateException.class,
@@ -367,37 +367,18 @@ class TxnBatcherTest {
     };
   }
 
-  private static List<java.util.logging.LogRecord> warningsFrom(
+  private static List<ch.qos.logback.classic.spi.ILoggingEvent> warningsFrom(
       Runnable r
   ) {
-    List<java.util.logging.LogRecord> out = new ArrayList<>();
-    java.util.logging.Logger log = java.util.logging.Logger.getLogger(TxnBatcher.class.getName());
-    java.util.logging.Handler h = new java.util.logging.Handler() {
-      public void publish(
-          java.util.logging.LogRecord x
-      ) {
-        out.add(x);
-      }
-
-      public void flush() {}
-
-      public void close() {}
-    };
-    log.addHandler(h);
-    try {
-      r.run();
-    } finally {
-      log.removeHandler(h);
-    }
-    return out;
+    return Slf4jTestLogs.capture(TxnBatcherImpl.class, r);
   }
 
   @Test
   void aMatchingSkipLsnDropsOneRecordAndTheTransactionStillCommits() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 420L, refuses("NaN"));
 
-    List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+    List<ch.qos.logback.classic.spi.ILoggingEvent> logs = warningsFrom(() -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
         b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
@@ -420,8 +401,8 @@ class TxnBatcherTest {
 
     // the audit trail: table, column, both LSNs, and the complete raw values
     assertEquals(1, logs.size(), logs.toString());
-    String m = logs.get(0).getMessage();
-    assertEquals(java.util.logging.Level.WARNING, logs.get(0).getLevel());
+    String m = logs.get(0).getFormattedMessage();
+    assertEquals(ch.qos.logback.classic.Level.WARN, logs.get(0).getLevel());
     assertTrue(m.contains("SKIPPED POISON RECORD"), m);
     assertTrue(m.contains("public.t"), m); // the table
     assertTrue(m.contains("column 'v'"), m); // the column
@@ -445,7 +426,7 @@ class TxnBatcherTest {
         c,
         e) -> commits.add("commit@" + c), x -> 0L,
         new MiniBatcher.Limits(1_000_000, 1L << 40, 3_600_000));
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, mini, 420L, refuses("NaN"));
     Runnable poisonTxn = () -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
@@ -457,7 +438,7 @@ class TxnBatcherTest {
       }
     };
 
-    List<java.util.logging.LogRecord> buffered = warningsFrom(poisonTxn);
+    List<ch.qos.logback.classic.spi.ILoggingEvent> buffered = warningsFrom(poisonTxn);
     assertTrue(mini.hasBuffered());
     assertTrue(buffered.isEmpty(), "only buffered: nothing is committed, nothing skipped yet");
 
@@ -465,7 +446,7 @@ class TxnBatcherTest {
     mini.discard();
     assertTrue(commits.isEmpty());
 
-    List<java.util.logging.LogRecord> replayed = warningsFrom(() -> {
+    List<ch.qos.logback.classic.spi.ILoggingEvent> replayed = warningsFrom(() -> {
       poisonTxn.run();
       try {
         mini.flushBuffered();
@@ -475,8 +456,8 @@ class TxnBatcherTest {
     });
     assertEquals(List.of("commit@500"), commits);
     assertEquals(1, replayed.size(), replayed.toString());
-    assertTrue(replayed.get(0).getMessage().contains("WAS committed to Paimon"));
-    assertTrue(replayed.get(0).getMessage().contains("0/000001F4"), "the commit LSN, 500");
+    assertTrue(replayed.get(0).getFormattedMessage().contains("WAS committed to Paimon"));
+    assertTrue(replayed.get(0).getFormattedMessage().contains("0/000001F4"), "the commit LSN, 500");
   }
 
   @Test
@@ -487,8 +468,8 @@ class TxnBatcherTest {
         e) -> {
       throw new java.io.IOException("commit failed");
     }, x -> 0L, new MiniBatcher.Limits(1, 1L << 40, 0));
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
-    List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+    List<ch.qos.logback.classic.spi.ILoggingEvent> logs = warningsFrom(() -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
         b.onEvent(new PgEvent.Insert(16412, row("1", "a")), 410L, META);
@@ -511,8 +492,8 @@ class TxnBatcherTest {
         c,
         e) -> commits.add("commit@" + c), x -> 0L,
         new MiniBatcher.Limits(1_000_000, 1L << 40, 3_600_000));
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, mini, 420L, refuses("NaN"));
-    List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, mini, 420L, refuses("NaN"));
+    List<ch.qos.logback.classic.spi.ILoggingEvent> logs = warningsFrom(() -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
         b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
@@ -528,8 +509,8 @@ class TxnBatcherTest {
   @Test
   void theAuditLineIsOnlyLoggedIfTheTransactionActuallyCommits() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
-    List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+    List<ch.qos.logback.classic.spi.ILoggingEvent> logs = warningsFrom(() -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
         b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
@@ -545,7 +526,7 @@ class TxnBatcherTest {
   void aNonMatchingSkipLsnLeavesTheFailureToTheSink() throws Exception {
     Recorder rec = new Recorder();
     // armed at 999, the poison record is at 420
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 999L, refuses("NaN"));
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 999L, refuses("NaN"));
     b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
     b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
     b.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
@@ -568,9 +549,9 @@ class TxnBatcherTest {
         meta) -> {
       throw new IllegalStateException("record has 2 values but the relation has 3 columns");
     };
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, somethingElse);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 420L, somethingElse);
 
-    List<java.util.logging.LogRecord> logs = warningsFrom(() -> {
+    List<ch.qos.logback.classic.spi.ILoggingEvent> logs = warningsFrom(() -> {
       try {
         b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
         b.onEvent(new PgEvent.Insert(16412, row("2", "x")), 420L, META);
@@ -590,7 +571,7 @@ class TxnBatcherTest {
         meta) -> {
       throw new IllegalArgumentException("not hex-format bytea (expected \\x prefix)");
     };
-    TxnBatcher b2 = new TxnBatcher(new ToastResolver(), null, rec2, 420L, malformed);
+    TxnBatcher b2 = new TxnBatcherImpl(new ToastResolver(), null, rec2, 420L, malformed);
     b2.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
     b2.onEvent(new PgEvent.Insert(16412, row("2", "x")), 420L, META);
     b2.onEvent(new PgEvent.Commit(500L, 510L, 0L), 500L, null);
@@ -601,7 +582,7 @@ class TxnBatcherTest {
   @Test
   void theNoTransactionOpenInvariantSurvivesTheSkipPath() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 420L, refuses("NaN"));
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 420L, refuses("NaN"));
     b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);
     b.onEvent(new PgEvent.Insert(16412, row("2", "NaN")), 420L, META);
     assertTrue(b.hasOpenTransaction(), "the skip deliberately leaves the transaction open");
@@ -616,7 +597,7 @@ class TxnBatcherTest {
   void withNoSkipLsnConfiguredTheCheckIsNeverCalled() throws Exception {
     Recorder rec = new Recorder();
     boolean[] called = {false};
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec, 0L, (
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec, 0L, (
         record,
         meta) -> called[0] = true);
     b.onEvent(new PgEvent.Begin(500L, 0L, 4711L), 400L, null);

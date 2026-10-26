@@ -107,7 +107,7 @@ class TxnBatcherHistoryTest {
       RelationMeta meta
   ) throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 77L), 100L, null);
     b.onEvent(new PgEvent.Insert(relid, row("1", "a")), 110L, meta);
     b.onEvent(new PgEvent.Update(relid, row("1", "a"), false, row("1", "b")), 120L, meta);
@@ -173,7 +173,7 @@ class TxnBatcherHistoryTest {
   @Test
   void aKeyMoveIsAMinusUPlusUPairInTheHistory() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 1L), 100L, null);
     b.onEvent(new PgEvent.Update(PK, row("1", "a"), false, row("2", "a")), 110L, PK_META);
     b.onEvent(new PgEvent.Commit(900L, 910L, PG_TS), 900L, null);
@@ -189,7 +189,7 @@ class TxnBatcherHistoryTest {
   @Test
   void anUpdateThatChangesNothingStillHasItsPair() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 1L), 100L, null);
     b.onEvent(new PgEvent.Update(PK, row("1", "a"), false, row("1", "a")), 110L, PK_META);
     b.onEvent(new PgEvent.Commit(900L, 910L, PG_TS), 900L, null);
@@ -199,7 +199,7 @@ class TxnBatcherHistoryTest {
   @Test
   void aTruncateIsATRecordAndRemovesNothingFromTheHistoryOrTheLog() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 5L), 100L, null);
     b.onEvent(new PgEvent.Insert(PK, row("1", "a")), 110L, PK_META);
     b.onEvent(new PgEvent.Insert(LOG, row("1", "a")), 115L, LOG_META);
@@ -229,7 +229,7 @@ class TxnBatcherHistoryTest {
   @Test
   void aTransactionStraddlingADdlWritesToTheArchiveAndToTheNewHistory() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), tracker(115L), rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), tracker(115L), rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 5L), 100L, null);
     b.onEvent(new PgEvent.Insert(PK, row("1", "a")), 110L, PK_META);
     b.onEvent(new PgEvent.Insert(PK, row("2", "b")), 120L, PK_META);
@@ -246,7 +246,7 @@ class TxnBatcherHistoryTest {
   @Test
   void severalTransactionsKeepTheirOwnCommitLsnsAndOpSeqs() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     for (int t = 1; t <= 3; t++) {
       b.onEvent(new PgEvent.Begin(1000L * t, PG_TS + t, t), 1000L * t - 50, null);
       b.onEvent(new PgEvent.Insert(PK, row("" + t, "a")), 1000L * t - 40, PK_META);
@@ -265,7 +265,7 @@ class TxnBatcherHistoryTest {
   @Test
   void anUntrackedRelationYieldsNoOperationRecords() throws Exception {
     Recorder rec = new Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 5L), 100L, null);
     b.onEvent(new PgEvent.Insert(99999L, row("1", "a")), 110L,
         new RelationMeta(99999L, "public", "x", List.of("id", "v"), List.of(false, false)));
@@ -288,7 +288,7 @@ class TxnBatcherHistoryTest {
         throw new TextDecoder.UnrepresentableValueException("column 'v': NaN");
       }
     };
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), TRACKER, rec, 120L, refusesNaN);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), TRACKER, rec, 120L, refusesNaN);
     b.onEvent(new PgEvent.Begin(900L, PG_TS, 77L), 100L, null);
     b.onEvent(new PgEvent.Insert(PK, row("1", "a")), 110L, PK_META);
     b.onEvent(new PgEvent.Update(PK, row("1", "a"), false, row("1", "NaN")), 120L, PK_META);

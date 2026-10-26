@@ -41,7 +41,7 @@ class SchemaRegistryHistoryTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db");
     env.put("PGPAIMON_WAREHOUSE", wh.toString());
-    cfg = WriterConfig.fromEnv(env);
+    cfg = WriterConfigUtils.fromEnv(env);
     reg = new SchemaRegistry(catalog, cfg, CrashHook.OFF);
     ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
   }

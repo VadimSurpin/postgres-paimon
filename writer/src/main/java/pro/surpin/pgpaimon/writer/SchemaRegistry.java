@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.schema.Schema;
@@ -21,9 +21,12 @@ import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.TimestampType;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.DdlMessage;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
+
 
 
 /**
@@ -46,9 +49,10 @@ import pro.surpin.pgpaimon.writer.dto.RelationMeta;
  * append-only. Every lookup below takes either key. Spec:
  * docs/superpowers/specs/2026-10-14-operation-history-design.md.
  */
+@Slf4j
+@Service
 public final class SchemaRegistry implements TableTracker {
 
-  private static final @NotNull Logger LOG = Logger.getLogger(SchemaRegistry.class.getName());
 
   private final Catalog catalog;
   private final WriterConfig config;
@@ -189,6 +193,7 @@ public final class SchemaRegistry implements TableTracker {
     return true;
   }
 
+  @Autowired
   public SchemaRegistry(
       @NotNull Catalog catalog,
       @NotNull WriterConfig config
@@ -554,15 +559,15 @@ public final class SchemaRegistry implements TableTracker {
       for (DdlMessage.Col c : cols) {
         b.column(c.name(), parseType(c.type()));
       }
-      b.column(config.seqField(), DataTypes.BIGINT().notNull());
-      b.column(config.opSeqField(), DataTypes.INT().notNull());
-      if (config.xidField() != null) {
-        b.column(config.xidField(), DataTypes.BIGINT());
+      b.column(config.getSeqField(), DataTypes.BIGINT().notNull());
+      b.column(config.getOpSeqField(), DataTypes.INT().notNull());
+      if (config.getXidField() != null) {
+        b.column(config.getXidField(), DataTypes.BIGINT());
       }
       b.primaryKey(pk);
       b.option("merge-engine", "deduplicate");
       b.option("changelog-producer", changelogProducer == null ? "input" : changelogProducer);
-      b.option("sequence.field", config.seqField() + "," + config.opSeqField());
+      b.option("sequence.field", config.getSeqField() + "," + config.getOpSeqField());
       b.option("ignore-update-before", "false");
       // Fixed-bucket mode. Never left unset: dynamic mode would reject the sink's
       // write(row) and bring back the key index this exists to remove. A create message
@@ -667,7 +672,7 @@ public final class SchemaRegistry implements TableTracker {
         // the replayed DDL message would then take for a half-copied rename -- and drop
         // the real history. The replayed message creates it; until then every change
         // routes to the archive (see the baseline set below).
-        LOG.warning("history table " + hid + " is missing and an archive of it exists:"
+        log.warn("history table " + hid + " is missing and an archive of it exists:"
             + " a rotation was interrupted after its rename; the replayed DDL message"
             + " completes it");
       } else if (existing == null) {
@@ -860,7 +865,7 @@ public final class SchemaRegistry implements TableTracker {
       try {
         catalog.alterTable(hid, add, false);
         forget0(hk);
-        LOG.warning("history table " + hid + ": added " + add.size() + " column(s) the"
+        log.warn("history table " + hid + ": added " + add.size() + " column(s) the"
             + " registry declares and Paimon lacked (the slot is absent, so their DDL"
             + " messages are lost, not pending; earlier rows hold NULL there)");
       } catch (Exception e) {
@@ -868,8 +873,7 @@ public final class SchemaRegistry implements TableTracker {
       }
     }
     if (!diffs.isEmpty()) {
-      LOG.warning(
-          "history table " + hid + " differs from the registry: " + String.join("; ", diffs));
+      log.warn("history table " + hid + " differs from the registry: " + String.join("; ", diffs));
     }
   }
 
@@ -931,10 +935,10 @@ public final class SchemaRegistry implements TableTracker {
     if (keyless(relid)) {
       LogRowBuilder.META.forEach(have::remove);
     } else {
-      have.remove(config.seqField());
-      have.remove(config.opSeqField());
-      if (config.xidField() != null) {
-        have.remove(config.xidField());
+      have.remove(config.getSeqField());
+      have.remove(config.getOpSeqField());
+      if (config.getXidField() != null) {
+        have.remove(config.getXidField());
       }
     }
     for (String extra : have.keySet()) {
@@ -943,14 +947,15 @@ public final class SchemaRegistry implements TableTracker {
       // whose DDL message was lost, where the pre-rename column survives beside the
       // correctly reloaded new one. Nothing here can safely drop it -- the registry not
       // naming it is not proof that no reader wants it -- so say exactly what it is.
-      LOG.warning("table " + id + " has a column '" + extra + "' that"
-          + " paimon.table_registry does not: it is NOT maintained, reads NULL for every"
-          + " row, and any SELECT * will return it. The usual cause is a rename whose DDL"
-          + " message was lost, leaving the pre-rename column beside the new one. It is"
-          + " not dropped automatically, because the registry not naming it is not proof"
-          + " that no reader wants it. Check it holds nothing you need, then remove it"
-          + " from a compute engine: ALTER TABLE `" + id.getDatabaseName() + "`.`"
-          + id.getObjectName() + "` DROP COLUMN `" + extra + "`");
+      log.warn(
+          "table {} has a column '{}' that"
+              + " paimon.table_registry does not: it is NOT maintained, reads NULL for every"
+              + " row, and any SELECT * will return it. The usual cause is a rename whose DDL"
+              + " message was lost, leaving the pre-rename column beside the new one. It is"
+              + " not dropped automatically, because the registry not naming it is not proof"
+              + " that no reader wants it. Check it holds nothing you need, then remove it"
+              + " from a compute engine: ALTER TABLE `{}`.`{}` DROP COLUMN `{}`",
+          id, extra, id.getDatabaseName(), id.getObjectName(), extra);
     }
     for (DdlMessage.Col c : missing) {
       if (!reconcileLostDdl) {
@@ -967,18 +972,18 @@ public final class SchemaRegistry implements TableTracker {
       try {
         catalog.alterTable(id, List.of(addUserColumn(keyless(relid), c.name(), t)), false);
         forget0(relid);
-        LOG.warning("create for existing table " + id + ": column '" + c.name() + "' "
-            + t.asSQLString() + " was missing from its Paimon schema and has been added"
+        log.warn("create for existing table {}: column '{}' {} was missing from its Paimon schema"
+            + " and has been added"
             + " (the slot is absent, so its DDL message is lost, not pending; rows"
-            + " written before now hold NULL there)");
+            + " written before now hold NULL there)", id, c.name(), t.asSQLString());
       } catch (Exception e) {
         diffs.add(
             "column '" + c.name() + "' is missing from Paimon and could not be" + " added: " + e);
       }
     }
     if (!diffs.isEmpty()) {
-      LOG.warning("create for existing table " + id + " differs from its Paimon schema: "
-          + String.join("; ", diffs));
+      log.warn("create for existing table {} differs from its Paimon schema: {}", id,
+          String.join("; ", diffs));
     }
   }
 
@@ -1071,8 +1076,8 @@ public final class SchemaRegistry implements TableTracker {
     DataField existing = field(relid, col.name());
     if (existing != null) {
       if (existing.type().equals(wanted)) {
-        LOG.info("add_col '" + col.name() + "' on " + identifiers.get(relid)
-            + " is already applied as " + wanted.asSQLString() + ": no-op");
+        log.info("add_col '{}' on {} is already applied as {}: no-op", col.name(),
+            identifiers.get(relid), wanted.asSQLString());
         return;
       }
       // Not a throw when there is no recorded LSN: a replayed add superseded by a replayed
@@ -1083,8 +1088,8 @@ public final class SchemaRegistry implements TableTracker {
           + ": the column already exists as " + existing.type().asSQLString()
           + " but the message declares " + wanted.asSQLString();
       requireNoRecordedLsn(relid, what);
-      LOG.warning(what + "; this table has no recorded DDL LSN, so a superseded replay"
-          + " cannot be ruled out: leaving the stored type alone");
+      log.warn("{}; this table has no recorded DDL LSN, so a superseded replay"
+          + " cannot be ruled out: leaving the stored type alone", what);
       return;
     }
     alter(relid, List.of(addUserColumn(keyless(relid), col.name(), wanted)), ddlLsn);
@@ -1110,8 +1115,8 @@ public final class SchemaRegistry implements TableTracker {
       return;
     }
     if (field(relid, name) == null) {
-      LOG.info("drop_col '" + name + "' on " + identifiers.get(relid)
-          + " is already applied (no such column): no-op");
+      log.info("drop_col '{}' on {} is already applied (no such column): no-op", name,
+          identifiers.get(relid));
       return;
     }
     alter(relid, List.of(SchemaChange.dropColumn(name)), ddlLsn);
@@ -1143,8 +1148,8 @@ public final class SchemaRegistry implements TableTracker {
       return;
     }
     if (field(relid, from) == null && field(relid, to) != null) {
-      LOG.info("rename_col '" + from + "' -> '" + to + "' on " + identifiers.get(relid)
-          + " is already applied: no-op");
+      log.info("rename_col '{}' -> '{}' on {} is already applied: no-op", from, to,
+          identifiers.get(relid));
       return;
     }
     alter(relid, List.of(SchemaChange.renameColumn(from, to)), ddlLsn);
@@ -1341,7 +1346,7 @@ public final class SchemaRegistry implements TableTracker {
     Table current = lookup(cur);
     Table archived = lookup(arch);
     if (current != null && Long.compareUnsigned(appliedDdlLsn(current), ddlLsn) >= 0) {
-      LOG.info(what + ": history table " + cur + " already rotated at "
+      log.info(what + ": history table " + cur + " already rotated at "
           + SlotConsumer.formatLsn(ddlLsn) + ": replay, no-op");
       if (archived != null) {
         registerArchive(relid, st, ddlLsn, arch);
@@ -1351,13 +1356,13 @@ public final class SchemaRegistry implements TableTracker {
     try {
       if (current != null && archived != null) {
         if (readable(current)) {
-          LOG.warning(what + ": both " + cur + " and " + arch + " exist: a rename was"
+          log.warn(what + ": both " + cur + " and " + arch + " exist: a rename was"
               + " interrupted half-way. " + cur + " is intact, so the partial " + arch
               + " is dropped and the rename repeated");
           catalog.dropTable(arch, false);
           archived = null;
         } else {
-          LOG.warning(what + ": both " + cur + " and " + arch + " exist and " + cur
+          log.warn(what + ": both " + cur + " and " + arch + " exist and " + cur
               + " is no longer readable: the rename had copied it; keeping " + arch);
           catalog.dropTable(cur, false);
           current = null;
@@ -1383,7 +1388,7 @@ public final class SchemaRegistry implements TableTracker {
       int buckets = bucketsAfterRotation(st);
       Map<String, String> carried = carriedOptions(archived.options());
       if (!carried.isEmpty()) {
-        LOG.info(
+        log.info(
             what + ": the new " + cur + " keeps the options set on the archived one: " + carried);
       }
       catalog.createTable(cur,
@@ -1399,7 +1404,7 @@ public final class SchemaRegistry implements TableTracker {
     }
     forget0(hk);
     st.baseline = ddlLsn;
-    LOG.info(what + ": history table " + cur + " archived as " + arch + "; a new " + cur
+    log.info(what + ": history table " + cur + " archived as " + arch + "; a new " + cur
         + " starts at " + SlotConsumer.formatLsn(ddlLsn));
   }
 
@@ -1426,7 +1431,7 @@ public final class SchemaRegistry implements TableTracker {
     }
     java.util.OptionalInt measured = HistBuckets.measured(bytesByDay);
     if (measured.isPresent()) {
-      LOG.info("history of " + st.current + ": " + bytesByDay.size() + " day(s) measured,"
+      log.info("history of " + st.current + ": " + bytesByDay.size() + " day(s) measured,"
           + " the new history table gets " + measured.getAsInt() + " bucket(s) per day");
       st.buckets = measured.getAsInt();
     }
@@ -1486,7 +1491,7 @@ public final class SchemaRegistry implements TableTracker {
     }
     var archive = st.archives.higherEntry(changeLsn);
     if (archive == null) {
-      LOG.warning("a change of " + st.current + " at " + SlotConsumer.formatLsn(changeLsn)
+      log.warn("a change of " + st.current + " at " + SlotConsumer.formatLsn(changeLsn)
           + " predates the history table's baseline " + SlotConsumer.formatLsn(st.baseline)
           + " and no archive covers it (removed by hand?): it is not written to the" + " history");
       return 0;
@@ -1509,8 +1514,8 @@ public final class SchemaRegistry implements TableTracker {
       String what = "alter_col '" + name + "' on " + identifiers.get(relid)
           + ": no such column in the Paimon schema";
       requireNoRecordedLsn(relid, what);
-      LOG.warning(what + "; this table has no recorded DDL LSN, so the column may have"
-          + " been renamed or dropped by a later message already applied: skipped");
+      log.warn("{}; this table has no recorded DDL LSN, so the column may have"
+          + " been renamed or dropped by a later message already applied: skipped", what);
       return;
     }
     if (current.type().equals(wanted)) {
@@ -1550,10 +1555,11 @@ public final class SchemaRegistry implements TableTracker {
       // Both forms: the X/XXXXXXXX one to compare with pg_replication_slots and the
       // writer's own messages, the decimal one because that is what the schema option
       // holds and what an operator reading it back will see.
-      LOG.info(what + " on " + identifiers.get(relid) + " at " + SlotConsumer.formatLsn(ddlLsn)
-          + " (" + Long.toUnsignedString(ddlLsn) + ") is at or below the last applied DDL LSN "
-          + SlotConsumer.formatLsn(applied) + " (" + Long.toUnsignedString(applied)
-          + "): replay, no-op");
+      log.info(
+          "{} on {} at {} ({}) is at or below the last applied DDL LSN {} ({})" + ": replay, no-op",
+          what, identifiers.get(relid), SlotConsumer.formatLsn(ddlLsn),
+          Long.toUnsignedString(ddlLsn), SlotConsumer.formatLsn(applied),
+          Long.toUnsignedString(applied));
       return true;
     }
     return false;
@@ -1591,8 +1597,7 @@ public final class SchemaRegistry implements TableTracker {
     try {
       return Long.parseUnsignedLong(v);
     } catch (NumberFormatException e) {
-      LOG.warning(
-          "ignoring unparseable " + DDL_LSN_OPTION + " '" + v + "' on " + identifiers.get(relid));
+      log.warn("ignoring unparseable {} '{}' on {}", DDL_LSN_OPTION, v, identifiers.get(relid));
       return 0;
     }
   }
@@ -1641,13 +1646,14 @@ public final class SchemaRegistry implements TableTracker {
     if (ddlLsn != 0) {
       long applied = appliedDdlLsn(relid);
       if (applied != 0 && Long.compareUnsigned(applied, ddlLsn) >= 0) {
-        LOG.warning("drop_table for " + id + " at " + SlotConsumer.formatLsn(ddlLsn) + " ("
-            + Long.toUnsignedString(ddlLsn)
-            + ") is STALE and has NOT been applied: the table standing there records an"
-            + " applied-DDL LSN of " + SlotConsumer.formatLsn(applied) + " ("
-            + Long.toUnsignedString(applied) + "), at or above the drop, so it was"
-            + " created after this drop was emitted. Applying it would purge a table the"
-            + " drop was never about. Nothing is dropped and the relation stays tracked");
+        log.warn(
+            "drop_table for {} at {} ({})"
+                + " is STALE and has NOT been applied: the table standing there records an"
+                + " applied-DDL LSN of {} ({}), at or above the drop, so it was"
+                + " created after this drop was emitted. Applying it would purge a table the"
+                + " drop was never about. Nothing is dropped and the relation stays tracked",
+            id, SlotConsumer.formatLsn(ddlLsn), Long.toUnsignedString(ddlLsn),
+            SlotConsumer.formatLsn(applied), Long.toUnsignedString(applied));
         return;
       }
     }
@@ -1660,7 +1666,7 @@ public final class SchemaRegistry implements TableTracker {
     if (hist != null) {
       // Deliberately left standing: the history table is the retained audit trail of a
       // dropped table (paimon.retained_history records it in PostgreSQL).
-      LOG.info("dropped Paimon table " + id + "; its history table " + hist
+      log.info("dropped Paimon table " + id + "; its history table " + hist
           + " and its archives are kept as the audit trail and no longer written");
     }
     forget(relid);
@@ -1714,8 +1720,8 @@ public final class SchemaRegistry implements TableTracker {
     if (HistoryKeys.isHist(relid) || keyless(relid)) {
       rb = new LogRowBuilder(t.fullName(), t.rowType(), meta.columnNames());
     } else {
-      rb = new RowBuilder(name, t.rowType(), meta.columnNames(), config.seqField(),
-          config.opSeqField(), config.xidField());
+      rb = new RowBuilder(name, t.rowType(), meta.columnNames(), config.getSeqField(),
+          config.getOpSeqField(), config.getXidField());
     }
     builders.put(relid, new CachedBuilder(List.copyOf(meta.columnNames()), t, rb));
     return rb;

@@ -185,7 +185,7 @@ class BackfillerTest {
     // Never the live writer's slot (slot names are cluster-wide): this test creates and DROPS it.
     env.put("PGPAIMON_SLOT", System.getenv().getOrDefault("PGPAIMON_IT_SLOT", "paimon_it"));
     env.put("PGPAIMON_FLUSH_MAX_RECORDS", "300"); // 4 chunks
-    WriterConfig cfg = WriterConfig.fromEnv(env);
+    WriterConfig cfg = WriterConfigUtils.fromEnv(env);
 
     Options o = new Options();
     o.set("warehouse", wh);
@@ -227,7 +227,7 @@ class BackfillerTest {
       // a leaked logical slot retains WAL indefinitely and blocks the next run
       try (Connection c = DriverManager.getConnection(jdbc); Statement st = c.createStatement()) {
         st.execute("SELECT pg_drop_replication_slot(slot_name)"
-            + " FROM pg_replication_slots WHERE slot_name = '" + cfg.slotName() + "'");
+            + " FROM pg_replication_slots WHERE slot_name = '" + cfg.getSlotName() + "'");
       }
     }
 
@@ -266,7 +266,7 @@ class BackfillerTest {
     // Never the live writer's slot (slot names are cluster-wide): this test creates and DROPS it.
     env.put("PGPAIMON_SLOT", System.getenv().getOrDefault("PGPAIMON_IT_SLOT", "paimon_it"));
     env.put("PGPAIMON_FLUSH_MAX_RECORDS", "3"); // 3 chunks
-    WriterConfig cfg = WriterConfig.fromEnv(env);
+    WriterConfig cfg = WriterConfigUtils.fromEnv(env);
     Options o = new Options();
     o.set("warehouse", wh);
     Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(o));
@@ -321,7 +321,7 @@ class BackfillerTest {
       catalog.close();
       try (Connection c = DriverManager.getConnection(jdbc); Statement st = c.createStatement()) {
         st.execute("SELECT pg_drop_replication_slot(slot_name)"
-            + " FROM pg_replication_slots WHERE slot_name = '" + cfg.slotName() + "'");
+            + " FROM pg_replication_slots WHERE slot_name = '" + cfg.getSlotName() + "'");
       }
     }
   }
@@ -339,9 +339,9 @@ class BackfillerTest {
       cp = plan.consistentPoint();
       bf.backfill(plan, relid, "public", "bf_log", List.of("id", "v"));
     }
-    try (Connection c = DriverManager.getConnection(cfg.jdbcUrl());
+    try (Connection c = DriverManager.getConnection(cfg.getJdbcUrl());
         Statement st = c.createStatement()) {
-      st.execute("SELECT pg_drop_replication_slot('" + cfg.slotName() + "')");
+      st.execute("SELECT pg_drop_replication_slot('" + cfg.getSlotName() + "')");
     }
     return cp;
   }
@@ -452,26 +452,7 @@ class BackfillerTest {
   private static List<String> mainWarnings(
       Runnable r
   ) {
-    List<String> out = new ArrayList<>();
-    java.util.logging.Logger log =
-        java.util.logging.Logger.getLogger(WriterBootstrap.class.getName());
-    java.util.logging.Handler h = new java.util.logging.Handler() {
-      public void publish(
-          java.util.logging.LogRecord x
-      ) {
-        out.add(x.getMessage());
-      }
-
-      public void flush() {}
-
-      public void close() {}
-    };
-    log.addHandler(h);
-    try {
-      r.run();
-    } finally {
-      log.removeHandler(h);
-    }
-    return out;
+    return Slf4jTestLogs.capture(WriterBootstrap.class, r).stream()
+        .map(event -> event.getFormattedMessage()).toList();
   }
 }

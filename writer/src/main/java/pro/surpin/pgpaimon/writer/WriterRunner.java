@@ -9,9 +9,12 @@ import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
 import pro.surpin.pgpaimon.writer.dto.*;
 
+
 /** Runs replication on the main thread; a fatal failure propagates to Spring Boot. */
+@Component
 public final class WriterRunner implements ApplicationRunner, DisposableBean {
 
   private final @NotNull WriterBootstrap bootstrap;

@@ -22,6 +22,7 @@ import org.jetbrains.annotations.Nullable;
 import pro.surpin.pgpaimon.writer.dto.*;
 
 
+
 /**
  * Converts PostgreSQL text output into Paimon internal values.
  *

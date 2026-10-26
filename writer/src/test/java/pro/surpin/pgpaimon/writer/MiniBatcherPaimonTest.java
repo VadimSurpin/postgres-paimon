@@ -36,7 +36,7 @@ class MiniBatcherPaimonTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db");
     env.put("PGPAIMON_WAREHOUSE", wh.toString());
-    cfg = WriterConfig.fromEnv(env);
+    cfg = WriterConfigUtils.fromEnv(env);
     reg = new SchemaRegistry(catalog, cfg);
     DdlMessageHandler ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
     for (long relid : new long[] {GUARDED, UNGUARDED, A, B, C}) {

@@ -7,15 +7,17 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.decoder.PgOutputDecoder;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.PgEvent;
+
 
 
 /**
@@ -28,6 +30,8 @@ import pro.surpin.pgpaimon.writer.dto.PgEvent;
  * batcher and from the Paimon flush) and from the decoder, is fatal and propagates out of
  * {@link #run}: continuing would advance the slot past data that was never written.
  */
+@Slf4j
+@Service
 public final class SlotConsumer {
 
   public interface Handler {
@@ -68,13 +72,13 @@ public final class SlotConsumer {
     void commitUnconfirmed() throws Exception;
   }
 
-  private static final @NotNull Logger LOG = Logger.getLogger(SlotConsumer.class.getName());
 
   private final @NotNull WriterConfig config;
   private final @NotNull PgOutputDecoder decoder;
   private final @NotNull Handler handler;
-  private volatile @Nullable PGReplicationStream stream;
+  // private volatile @Nullable PGReplicationStream stream;
   private volatile boolean running = true;
+  private volatile @Nullable PGReplicationStream stream;
   private volatile long flushedAtCleanStop;
 
   public SlotConsumer(
@@ -224,28 +228,33 @@ public final class SlotConsumer {
       long startLsn
   ) throws Exception {
     long backoffMs = 500;
-    while (running) {
-      try (Connection conn = connect()) {
-        PGReplicationStream s = open(conn, startLsn);
-        backoffMs = 500;
-        consume(s);
-      } catch (SQLException e) {
-        if (!running) {
-          return;
-        }
-        if (!isConnectionLoss(e)) {
-          throw e; // a missing or invalidated slot cannot resolve itself
-        }
-        LOG.warning("replication stream lost: " + e
-            + "; discarding any open transaction and reconnecting in " + backoffMs + "ms");
-        stream = null;
-        handler.onDisconnect();
-        Thread.sleep(backoffMs);
-        backoffMs = Math.min(backoffMs * 2, 30_000);
-      } finally {
-        stream = null;
-      }
+    while (running)
+      backoffMs = consumeOnce(startLsn, backoffMs);
+  }
+
+  private long consumeOnce(
+      long startLsn,
+      long backoffMs
+  ) throws Exception {
+    try (Connection conn = connect()) {
+      PGReplicationStream s = open(conn, startLsn);
+      backoffMs = 500;
+      consume(s);
+    } catch (SQLException e) {
+      if (!running)
+        return backoffMs;
+      if (!isConnectionLoss(e))
+        throw e;
+      log.warn("replication stream lost; discarding any open transaction and reconnecting in {}ms",
+          backoffMs, e);
+      stream = null;
+      handler.onDisconnect();
+      Thread.sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30_000);
+    } finally {
+      stream = null;
     }
+    return backoffMs;
   }
 
   /**
@@ -287,7 +296,7 @@ public final class SlotConsumer {
       s.forceUpdateStatus();
       flushedAtCleanStop = s.getLastFlushedLSN().asLong();
     } catch (SQLException e) {
-      LOG.warning("final status update failed: " + e);
+      log.warn("final status update failed: " + e);
     }
   }
 
@@ -336,12 +345,12 @@ public final class SlotConsumer {
 
   private @NotNull Connection connect() throws SQLException {
     Properties p = new Properties();
-    p.setProperty("user", config.user());
-    p.setProperty("password", config.password());
+    p.setProperty("user", config.getUser());
+    p.setProperty("password", config.getPassword());
     p.setProperty("replication", "database");
     p.setProperty("preferQueryMode", "simple");
     p.setProperty("assumeMinServerVersion", "18");
-    Connection conn = DriverManager.getConnection(config.jdbcUrl(), p);
+    Connection conn = DriverManager.getConnection(config.getJdbcUrl(), p);
     try {
       // Pinned, not defaulted, and read back: see SessionSettings for each setting and
       // why. A mismatch is a misconfiguration, not connection loss.
@@ -362,8 +371,8 @@ public final class SlotConsumer {
       long startLsn
   ) throws SQLException {
     var b = conn.unwrap(PGConnection.class).getReplicationAPI().replicationStream().logical()
-        .withSlotName(config.slotName()).withSlotOption("proto_version", "2")
-        .withSlotOption("publication_names", config.publicationName())
+        .withSlotName(config.getSlotName()).withSlotOption("proto_version", "2")
+        .withSlotOption("publication_names", config.getPublicationName())
         .withSlotOption("messages", "true").withSlotOption("binary", "false")
         .withSlotOption("streaming", "off").withStatusInterval(10_000, TimeUnit.MILLISECONDS);
     if (startLsn > 0) {

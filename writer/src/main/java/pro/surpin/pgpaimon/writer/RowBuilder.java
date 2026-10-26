@@ -3,7 +3,7 @@ package pro.surpin.pgpaimon.writer;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
@@ -11,6 +11,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.SinkRecord;
+
 
 
 /**
@@ -21,9 +22,9 @@ import pro.surpin.pgpaimon.writer.dto.SinkRecord;
  * attnum order, while the Paimon schema also carries _seq, _op_seq and optionally _xid, and a DROP
  * COLUMN shifts positions on one side only.
  */
+@Slf4j
 public final class RowBuilder implements RowMaker {
 
-  private static final @NotNull Logger LOG = Logger.getLogger(RowBuilder.class.getName());
 
   private final @NotNull RowType rowType;
   private final @NotNull int[] paimonIndexForPgColumn;
@@ -87,14 +88,15 @@ public final class RowBuilder implements RowMaker {
       // values are genuinely unwanted -- but the other cause of this warning is a Paimon
       // schema left behind the registry, where the same line reports permanent, silent
       // loss of a column's values. Saying which it is is impossible here, so say both.
-      LOG.warning("table " + (tableName == null ? "(unnamed)" : tableName)
-          + ": DISCARDING the values of PostgreSQL column(s) " + ignored
-          + ", which have no counterpart in the Paimon schema. Expected if their drop_col"
-          + " came earlier in the stream, or on a replay of changes from before it -- the"
-          + " values are unwanted then. But if the Paimon schema is simply BEHIND (a DDL"
-          + " message lost with a dropped slot), this line is permanent data loss, one per"
-          + " row: compare the Paimon schema with paimon.table_registry and re-register"
-          + " the table if they disagree");
+      log.warn(
+          "table {}: DISCARDING the values of PostgreSQL column(s) {}"
+              + ", which have no counterpart in the Paimon schema. Expected if their drop_col"
+              + " came earlier in the stream, or on a replay of changes from before it -- the"
+              + " values are unwanted then. But if the Paimon schema is simply BEHIND (a DDL"
+              + " message lost with a dropped slot), this line is permanent data loss, one per"
+              + " row: compare the Paimon schema with paimon.table_registry and re-register"
+              + " the table if they disagree",
+          tableName == null ? "(unnamed)" : tableName, ignored);
     }
   }
 

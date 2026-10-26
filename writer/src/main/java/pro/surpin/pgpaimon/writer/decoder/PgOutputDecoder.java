@@ -14,12 +14,14 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.springframework.stereotype.Component;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.ColumnValue;
 import pro.surpin.pgpaimon.writer.dto.PgEvent;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
 import pro.surpin.pgpaimon.writer.dto.TupleData;
 import pro.surpin.pgpaimon.writer.util.ByteBufferUtils;
+
 
 
 /**
@@ -48,6 +50,7 @@ import pro.surpin.pgpaimon.writer.util.ByteBufferUtils;
  * <p>
  * Not thread-safe: it holds the relation cache.
  */
+@Component
 public final class PgOutputDecoder {
 
   private final @NotNull Map<Long, RelationMeta> relations = new HashMap<>();

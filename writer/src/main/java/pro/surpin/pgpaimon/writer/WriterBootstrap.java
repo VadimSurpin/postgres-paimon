@@ -19,8 +19,9 @@ import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 import java.util.function.LongPredicate;
 import java.util.function.Predicate;
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.BackfillPlan;
 import pro.surpin.pgpaimon.writer.dto.DdlMessage;
@@ -29,10 +30,12 @@ import pro.surpin.pgpaimon.writer.dto.RegistryRow;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
 
 
+
 /** Restores the writer state and preserves the replication pipeline ordering. */
+@Slf4j
+@Service
 public class WriterBootstrap {
 
-  private static final @NotNull Logger LOG = Logger.getLogger(WriterBootstrap.class.getName());
 
   private final @NotNull WriterConfig config;
   private final @NotNull SchemaRegistry registry;
@@ -78,14 +81,14 @@ public class WriterBootstrap {
       preflight(conn);
       // 2. CHECK that the slot exists. WriterBootstrap never creates it: the initial backfill must
       // read the snapshot exported by the slot's own creation (Backfiller, Task 13).
-      slotExists = slotExists(conn, config.slotName());
+      slotExists = slotExists(conn, config.getSlotName());
       // 2a. a slot that exists must be usable: not invalidated, and the writer's own.
       if (slotExists) {
-        checkSlot(conn, config.slotName());
+        checkSlot(conn, config.getSlotName());
       }
       // 2b. ... and where a clean stop left it, unless someone moved it since (StopMark).
       StopMark.check(StopMark.inWarehouse(config),
-          slotExists ? confirmedFlush(conn, config.slotName()) : 0, config.slotName());
+          slotExists ? confirmedFlush(conn, config.getSlotName()) : 0, config.getSlotName());
       // 3. rebuild the registry from paimon.table_registry BEFORE the stream opens. A
       // 'create' message is emitted once and consumed once; without this a restarted
       // writer knows no tables and silently discards every replicated row.
@@ -114,7 +117,7 @@ public class WriterBootstrap {
       }
     }
     BackfillAction action =
-        decideBackfill(slotExists, due.size(), rows.size(), stranded, config.slotName());
+        decideBackfill(slotExists, due.size(), rows.size(), stranded, config.getSlotName());
 
     // 3b'. the warehouse belongs to this cluster (ClusterIdentity says why it matters):
     // refused here, still before anything is written.
@@ -143,7 +146,7 @@ public class WriterBootstrap {
       }
     }
     ClusterIdentity.decide(stamps, cluster, highest, slotExists, action != BackfillAction.NONE,
-        config.acceptSystemIdentifier());
+        config.getAcceptSystemIdentifier());
     registry.identityOptions(cluster.options());
 
     // 3c. only now does anything in the warehouse change. Existing tables first take the
@@ -159,15 +162,15 @@ public class WriterBootstrap {
       registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
           r.changelogProducer(), r.buckets(), !slotExists, r.hist());
     }
-    LOG.info("registry rebuilt: " + rows.size() + " table(s), slot "
-        + (slotExists ? "exists" : "absent"));
+    log.info("registry rebuilt: {} table(s), slot {}", rows.size(),
+        slotExists ? "exists" : "absent");
 
     // Resume across the main tables and their histories after backfill.
     List<Long> relids = resumeKeys(rows);
     runBackfill(config, registry, sink, rows, due, action);
     long resume = offsets.highestCommittedLsn(relids);
 
-    warnOnStaleSkipLsn(config.skipLsn(), resume);
+    warnOnStaleSkipLsn(config.getSkipLsnValue(), resume);
 
     return resume;
   }
@@ -206,13 +209,14 @@ public class WriterBootstrap {
       return;
     }
     if (resume != 0 && Long.compareUnsigned(skipLsn, resume) <= 0) {
-      LOG.warning("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn)
-          + " is at or below the resume position " + SlotConsumer.formatLsn(resume)
-          + ", so it can never fire: that record is already behind the stream. If its skip"
-          + " has already happened, unset the variable; if it has not, the LSN is wrong.");
+      log.warn(
+          "PGPAIMON_SKIP_LSN={} is at or below the resume position {}"
+              + ", so it can never fire: that record is already behind the stream. If its skip"
+              + " has already happened, unset the variable; if it has not, the LSN is wrong.",
+          SlotConsumer.formatLsn(skipLsn), SlotConsumer.formatLsn(resume));
       return;
     }
-    LOG.warning("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn) + " is armed: the ONE"
+    log.warn("PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn) + " is armed: the ONE"
         + " record at that change LSN will be dropped, and logged in full, if and only if it"
         + " fails because a value has no Paimon representation; or the ONE DDL message at that"
         + " LSN, if and only if it is rejected for its credential. Every other failure there,"
@@ -347,11 +351,11 @@ public class WriterBootstrap {
       return;
     }
     if (action == BackfillAction.RECREATE_SLOT_AND_BACKFILL) {
-      LOG.warning("slot '" + config.slotName() + "' exists but every table awaits its"
-          + " initial backfill (an interrupted first load): dropping and recreating it");
+      log.warn("slot '{}' exists but every table awaits its initial backfill"
+          + " (an interrupted first load): dropping and recreating it", config.getSlotName());
       try (Connection conn = plainConnection(config);
           PreparedStatement ps = conn.prepareStatement("SELECT pg_drop_replication_slot(?)")) {
-        ps.setString(1, config.slotName());
+        ps.setString(1, config.getSlotName());
         ps.execute();
       }
       // The slot is gone NOW, so anything that was still in it is LOST, not pending --
@@ -363,7 +367,7 @@ public class WriterBootstrap {
       // finding 4, reopened on this one path.
       //
       // Before the load, deliberately: the reloaded rows must carry the added column.
-      LOG.info("re-running the registry bootstrap now the slot is gone: a DDL message that"
+      log.info("re-running the registry bootstrap now the slot is gone: a DDL message that"
           + " was pending in it is lost, so a column missing from Paimon is reconciled");
       for (RegistryRow r : rows) {
         registry.bootstrapTable(r.relid(), r.schema(), r.table(), r.pk(), r.cols(),
@@ -397,15 +401,15 @@ public class WriterBootstrap {
   static Connection plainConnection(
       WriterConfig config
   ) throws java.sql.SQLException {
-    return DriverManager.getConnection(config.jdbcUrl(), plainProperties(config));
+    return DriverManager.getConnection(config.getJdbcUrl(), plainProperties(config));
   }
 
   static Properties plainProperties(
       WriterConfig config
   ) {
     Properties p = new Properties();
-    p.setProperty("user", config.user());
-    p.setProperty("password", config.password());
+    p.setProperty("user", config.getUser());
+    p.setProperty("password", config.getPassword());
     p.setProperty("options", "-c search_path=pg_catalog,pg_temp");
     return p;
   }
@@ -489,17 +493,17 @@ public class WriterBootstrap {
       return;
     }
     try (Connection conn = plainConnection(config)) {
-      if (!slotExists(conn, config.slotName())) {
-        LOG.severe("replication slot '" + config.slotName() + "' was dropped while the"
+      if (!slotExists(conn, config.getSlotName())) {
+        log.error("replication slot '" + config.getSlotName() + "' was dropped while the"
             + " writer ran (DROP of the slot by hand?). Re-bootstrap"
             + " (docs/logical-slot-architecture.md, section 3, 'Re-bootstrapping').");
         return;
       }
-      checkSlot(conn, config.slotName(), "while running (the stream was refused)");
+      checkSlot(conn, config.getSlotName(), "while running (the stream was refused)");
     } catch (IllegalStateException diagnosis) {
-      LOG.severe(diagnosis.getMessage());
+      log.error(diagnosis.getMessage());
     } catch (Exception other) {
-      LOG.warning("could not look up why the slot was refused: " + other);
+      log.warn("could not look up why the slot was refused: " + other);
     }
   }
 
@@ -532,7 +536,7 @@ public class WriterBootstrap {
           }
           throw HealthCheck.checkFailed(e, "at startup (paimon.slot_health)");
         }
-        LOG.warning("paimon.slot_health() timed out at startup; retrying in 2 s");
+        log.warn("paimon.slot_health() timed out at startup; retrying in 2 s");
         try {
           Thread.sleep(2_000);
         } catch (InterruptedException ie) {
@@ -739,7 +743,7 @@ public class WriterBootstrap {
           // is no Paimon table left to empty. Truncating a table that is about to be
           // dropped is pointless anyway.
           if (!tracked.test(relid)) {
-            LOG.info("skipping the buffered truncate of relation " + relid
+            log.info("skipping the buffered truncate of relation " + relid
                 + ": it stopped being tracked before this transaction committed"
                 + " (dropped in the same transaction)");
             continue;
@@ -812,7 +816,7 @@ public class WriterBootstrap {
     @Override
     public void commitUnconfirmed() throws Exception {
       if (mini.hasBuffered()) {
-        LOG.fine("keepalive guard: committing " + mini.bufferedRows()
+        log.debug("keepalive guard: committing " + mini.bufferedRows()
             + " buffered record(s) before an auto-advance could confirm past them");
         mini.flushBuffered();
       }

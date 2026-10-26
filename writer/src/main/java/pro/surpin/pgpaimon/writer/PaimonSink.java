@@ -4,15 +4,18 @@ package pro.surpin.pgpaimon.writer;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import lombok.extern.java.Log;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.TableWriteImpl;
 import org.jetbrains.annotations.NotNull;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
 import pro.surpin.pgpaimon.writer.dto.SinkRecord;
+
 
 
 /**
@@ -28,8 +31,8 @@ import pro.surpin.pgpaimon.writer.dto.SinkRecord;
  * <li>only {@link TableCommitImpl#filterAndCommit} consults the committed-identifier set; the plain
  * {@code commit(identifier, messages)} would write a second snapshot with duplicate data and
  * changelog on replay, so it is never called here;
- * <li>that set is scoped to the commit user, so {@code config.commitUser()} must be stable across
- * restarts (it is derived from the slot name, see {@link WriterConfig});</li>
+ * <li>that set is scoped to the commit user, so {@code config.getCommitUser()} must be stable
+ * across restarts (it is derived from the slot name, see {@link WriterConfig});</li>
  * <li>the table has a fixed bucket count, so {@code write(row)} is used and Paimon hashes the
  * primary key to choose the bucket. Dynamic-bucket mode -- no {@code bucket} option -- required
  * {@code write(row, 0)} instead, since dynamic mode rejects the one-argument form, and paid for it
@@ -47,7 +50,8 @@ import pro.surpin.pgpaimon.writer.dto.SinkRecord;
  * An exception from {@link #flush} is fatal to the writer. TxnBatcher has already discarded the
  * batch; the process must exit and resume from the last confirmed LSN.
  */
-@Log
+@Slf4j
+@Service
 public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
 
   private record Entry(
@@ -85,6 +89,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
   private final Map<Long, RelationMeta> relations = new LinkedHashMap<>();
   private final CrashHook hook;
 
+  @Autowired
   public PaimonSink(
       SchemaRegistry registry,
       WriterConfig config
@@ -217,8 +222,8 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         int applied = e.commit().filterAndCommit(Map.of(commitLsn, msgs));
         if (applied < 1) {
           allApplied = false;
-          log.info("commit identifier " + commitLsn + " for relation " + relid
-              + " was already committed; replay skipped (applied " + applied + " of 1)");
+          log.info("commit identifier {} for relation {} was already committed; replay skipped"
+              + " (applied {} of 1)", commitLsn, relid, applied);
           // The writer already holds this transaction's files in its LSM tree but the
           // table never saw them; reusing it makes a later compaction delete files the
           // table does not know ("File deletion conflicts detected"). Dropping the
@@ -330,7 +335,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
         "POISON RECORD in " + where + ", in the commit batch ending at "
             + SlotConsumer.formatLsn(commitLsn) + ": " + cause.getMessage()
             + ". THIS IS NOT TRANSIENT and will not clear by itself: the change is already in"
-            + " replication slot '" + config.slotName() + "', the slot advances only after a"
+            + " replication slot '" + config.getSlotName() + "', the slot advances only after a"
             + " successful Paimon commit, so every restart replays this same record and fails"
             + " identically. Deleting or correcting the row in PostgreSQL does NOT help -- the"
             + " offending WAL record stays in the slot. The only recourse today is the"
@@ -340,7 +345,7 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
             + " are logged so you can reinsert the row by hand with the value corrected, and"
             + " nothing else is skipped -- only this LSN, and only this kind of failure. Unset it"
             + " afterwards. (2) Failing that, the re-bootstrap procedure: stop the writer, SELECT"
-            + " pg_drop_replication_slot('" + config.slotName() + "'); UPDATE"
+            + " pg_drop_replication_slot('" + config.getSlotName() + "'); UPDATE"
             + " paimon.table_registry SET backfill_due = true; and start the writer again, which"
             + " reloads every tracked table from a fresh snapshot and loses all Paimon-side"
             + " changelog history. See docs/logical-slot-architecture.md, 'A record the writer"
@@ -371,11 +376,11 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
     // to none, so the "truncate" would remove nothing. Off, an empty overwrite of the whole
     // table (no static partition) empties every partition.
     FileStoreTable t = registry.table(relid).copy(Map.of("dynamic-partition-overwrite", "false"));
-    try (TableCommitImpl c = t.newCommit(config.commitUser()).withOverwrite(Map.of())) {
+    try (TableCommitImpl c = t.newCommit(config.getCommitUser()).withOverwrite(Map.of())) {
       applied = c.filterAndCommit(Map.of(commitLsn, List.<CommitMessage>of())) >= 1;
       if (!applied) {
-        log.info("truncate of relation " + relid + " at " + commitLsn
-            + " was already committed; replay skipped");
+        log.info("truncate of relation {} at {} was already committed; replay skipped", relid,
+            commitLsn);
       }
     } finally {
       dropEntry(relid);
@@ -421,7 +426,8 @@ public final class PaimonSink implements TxnBatcher.Flusher, AutoCloseable {
     if (e != null) {
       dropEntry(relid); // schema changed under us
     }
-    Entry fresh = new Entry(t, t.newWrite(config.commitUser()), t.newCommit(config.commitUser()));
+    Entry fresh =
+        new Entry(t, t.newWrite(config.getCommitUser()), t.newCommit(config.getCommitUser()));
     entries.put(relid, fresh);
     return fresh;
   }

@@ -1,53 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 package pro.surpin.pgpaimon.writer;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.options.Options;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.env.Environment;
-import pro.surpin.pgpaimon.writer.decoder.PgOutputDecoder;
-import pro.surpin.pgpaimon.writer.decoder.PgOutputMessageDecoder;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
 
 /** Spring owns the pipeline components and closes their resources in dependency order. */
 @Configuration(proxyBeanMethods = false)
-@ComponentScan(basePackageClasses = PgOutputMessageDecoder.class)
+@EnableConfigurationProperties(WriterConfig.class)
 public class WriterConfiguration {
 
+  /** Preserve the original environment names while using Spring constructor binding. */
   @Bean
-  @NotNull
-  WriterConfig writerConfig(
-      @NotNull Environment environment
+  static org.springframework.beans.factory.config.BeanFactoryPostProcessor legacyEnvironmentProperties(
+      org.springframework.core.env.ConfigurableEnvironment environment
   ) {
-    var values = new HashMap<String, String>();
-    for (String key : List.of("PGPAIMON_COMMIT_USER", "PGPAIMON_BATCH_MAX_ROWS",
-        "PGPAIMON_BATCH_MAX_BYTES", "PGPAIMON_BATCH_MAX_INTERVAL_MS", "PGPAIMON_HEALTH_INTERVAL_MS",
-        "PGPAIMON_TXN_MAX_BYTES", "PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER", "PGPAIMON_S3_ENDPOINT",
-        "PGPAIMON_S3_ACCESS_KEY", "PGPAIMON_S3_SECRET_KEY", "PGPAIMON_FLUSH_MAX_RECORDS",
-        "PGPAIMON_JDBC_URL", "PGPAIMON_MESSAGE_PREFIX", "PGPAIMON_OP_SEQ_FIELD",
-        "PGPAIMON_PASSWORD", "PGPAIMON_PUBLICATION", "PGPAIMON_SEQ_FIELD", "PGPAIMON_SKIP_LSN",
-        "PGPAIMON_SLOT", "PGPAIMON_USER", "PGPAIMON_WAREHOUSE", "PGPAIMON_XID_FIELD")) {
-      String property = "pgpaimon."
-          + key.substring("PGPAIMON_".length()).toLowerCase(Locale.ROOT).replace('_', '-');
-      String value = environment.getProperty(property);
-      if (value == null) {
-        value = environment.getProperty(key);
+    return beanFactory -> {
+      java.util.Map<String, Object> aliases = new java.util.LinkedHashMap<>();
+      for (String suffix : java.util.List.of("JDBC_URL", "WAREHOUSE", "USER", "PASSWORD", "SLOT",
+          "PUBLICATION", "MESSAGE_PREFIX", "COMMIT_USER", "SEQ_FIELD", "OP_SEQ_FIELD", "XID_FIELD",
+          "FLUSH_MAX_RECORDS", "SKIP_LSN", "BATCH_MAX_ROWS", "BATCH_MAX_BYTES",
+          "BATCH_MAX_INTERVAL_MS", "HEALTH_INTERVAL_MS", "TXN_MAX_BYTES",
+          "ACCEPT_SYSTEM_IDENTIFIER", "S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY")) {
+        String value = environment.getProperty("PGPAIMON_" + suffix);
+        if (value == null || value.isBlank())
+          continue;
+        String property = suffix.toLowerCase(java.util.Locale.ROOT).replace('_', '-');
+        if (property.startsWith("s3-"))
+          property = "s3." + property.substring(3);
+        aliases.put("pgpaimon." + property, value);
       }
-      if (value != null) {
-        values.put(key, value);
-      }
-    }
-    return WriterConfig.fromEnv(values);
+      environment.getPropertySources()
+          .addLast(new org.springframework.core.env.MapPropertySource("legacyPgpaimon", aliases));
+    };
   }
 
   @Bean(destroyMethod = "close")
@@ -56,77 +49,7 @@ public class WriterConfiguration {
       @NotNull WriterConfig config
   ) {
     return CatalogFactory
-        .createCatalog(CatalogContext.create(Options.fromMap(config.catalogOptions())));
-  }
-
-  @Bean
-  @NotNull
-  SchemaRegistry schemaRegistry(
-      @NotNull Catalog catalog,
-      @NotNull WriterConfig config
-  ) {
-    return new SchemaRegistry(catalog, config);
-  }
-
-  @Bean(destroyMethod = "close")
-  @NotNull
-  PaimonSink paimonSink(
-      @NotNull SchemaRegistry registry,
-      @NotNull WriterConfig config
-  ) {
-    return new PaimonSink(registry, config);
-  }
-
-  @Bean
-  @NotNull
-  OffsetStore offsetStore(
-      @NotNull SchemaRegistry registry,
-      @NotNull WriterConfig config
-  ) {
-    return new OffsetStore(registry, config);
-  }
-
-  @Bean
-  @NotNull
-  WriterBootstrap writerBootstrap(
-      @NotNull WriterConfig config,
-      @NotNull SchemaRegistry registry,
-      @NotNull PaimonSink sink,
-      @NotNull OffsetStore offsets
-  ) {
-    return new WriterBootstrap(config, registry, sink, offsets);
-  }
-
-  @Bean
-  @NotNull
-  PgOutputDecoder pgOutputDecoder(
-      @NotNull List<PgOutputMessageDecoder> pgOutputMessageDecoders
-  ) {
-    return new PgOutputDecoder(pgOutputMessageDecoders);
-  }
-
-  @Bean
-  @NotNull
-  ToastResolver toastResolver() {
-    return new ToastResolver();
-  }
-
-  @Bean
-  @NotNull
-  @org.springframework.context.annotation.Lazy
-  DdlMessageHandler ddlMessageHandler(
-      @NotNull SchemaRegistry registry,
-      @NotNull WriterConfig config
-  ) {
-    java.util.function.Supplier<String> token = () -> {
-      try (var conn = WriterBootstrap.plainConnection(config)) {
-        return WriterBootstrap.readToken(conn);
-      } catch (java.sql.SQLException e) {
-        throw WriterBootstrap.missingGrant(e);
-      }
-    };
-    return new DdlMessageHandler(registry, config.messagePrefix(), token.get(), config.skipLsn(),
-        token);
+        .createCatalog(CatalogContext.create(Options.fromMap(config.getCatalogOptions())));
   }
 
   @Bean
@@ -136,8 +59,8 @@ public class WriterConfiguration {
       WriterConfig config,
       ObjectProvider<SlotConsumer> consumer
   ) {
-    var limits = new MiniBatcher.Limits(config.batchMaxRows(), config.batchMaxBytes(),
-        config.batchMaxIntervalMs());
+    var limits = new MiniBatcher.Limits(config.getBatchMaxRows(), config.getBatchMaxBytes(),
+        config.getBatchMaxIntervalMs());
     return new MiniBatcher(
         WriterBootstrap.confirmingFlusher(sink, lsn -> consumer.getObject().confirm(lsn)),
         offsets::highestCommitted, limits);
@@ -147,8 +70,8 @@ public class WriterConfiguration {
   HealthCheck healthCheck(
       WriterConfig config
   ) {
-    return new HealthCheck(() -> WriterBootstrap.plainConnection(config), config.healthIntervalMs(),
-        config.slotName());
+    return new HealthCheck(() -> WriterBootstrap.plainConnection(config),
+        config.getHealthIntervalMs(), config.getSlotName());
   }
 
   @Bean
@@ -160,10 +83,10 @@ public class WriterConfiguration {
       @NotNull WriterConfig config,
       @NotNull MiniBatcher mini
   ) {
-    return new TxnBatcher(resolver, registry, mini, config.skipLsn(), (
+    return new TxnBatcherImpl(resolver, registry, mini, config.getSkipLsnValue(), (
         record,
         meta) -> registry.rowBuilder(record.relid(), meta).build(record))
-        .withMaxBytes(config.txnMaxBytes());
+        .withMaxBytes(config.getTxnMaxBytes());
   }
 
   @Bean
@@ -204,22 +127,5 @@ public class WriterConfiguration {
         }, batcher, mini, health::maybeCheck);
   }
 
-  @Bean
-  @NotNull
-  SlotConsumer slotConsumer(
-      @NotNull WriterConfig config,
-      @NotNull PgOutputDecoder decoder,
-      @NotNull SlotConsumer.Handler handler
-  ) {
-    return new SlotConsumer(config, decoder, handler);
-  }
 
-  @Bean
-  @NotNull
-  WriterRunner writerRunner(
-      @NotNull WriterBootstrap bootstrap,
-      @NotNull SlotConsumer consumer
-  ) {
-    return new WriterRunner(bootstrap, consumer);
-  }
 }

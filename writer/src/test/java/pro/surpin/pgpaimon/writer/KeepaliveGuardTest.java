@@ -300,7 +300,7 @@ class KeepaliveGuardTest {
         confirmed.add(lsn);
         ref[0].confirm(lsn);
       }), relid -> 0L, limits, () -> now);
-      TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, mini);
+      TxnBatcher batcher = new TxnBatcherImpl(new ToastResolver(), null, mini);
       WriterBootstrap.PipelineHandler handler =
           new WriterBootstrap.PipelineHandler(r -> true, r -> List.of("id"), m -> {
           }, m -> false, new WriterBootstrap.PipelineHandler.Target() {

@@ -46,7 +46,7 @@ class PaimonSinkTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db");
     env.put("PGPAIMON_WAREHOUSE", wh.toString());
-    cfg = WriterConfig.fromEnv(env);
+    cfg = WriterConfigUtils.fromEnv(env);
     reg = new SchemaRegistry(catalog, cfg);
     ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
     ddl.handle(msg("""
@@ -149,8 +149,8 @@ class PaimonSinkTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db");
     env.put("PGPAIMON_WAREHOUSE", wh.toString());
-    WriterConfig again = WriterConfig.fromEnv(env);
-    assertEquals(cfg.commitUser(), again.commitUser());
+    WriterConfig again = WriterConfigUtils.fromEnv(env);
+    assertEquals(cfg.getCommitUser(), again.getCommitUser());
     try (PaimonSink restarted = new PaimonSink(reg, again)) {
       restarted.setRelation(RELID, META);
       restarted.flush(List.of(rec(RowKind.INSERT, "9", "z", 300L, 0)), 300L, 310L);
@@ -249,7 +249,7 @@ class PaimonSinkTest {
   @Order(8)
   void offsetStoreIgnoresSnapshotsFromOtherUsers() throws Exception {
     WriterConfig other =
-        WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+        WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
             "PGPAIMON_WAREHOUSE", wh.toString(), "PGPAIMON_COMMIT_USER", "someone-else"));
     assertEquals(0L, new OffsetStore(reg, other).highestCommittedLsn(List.of(RELID)));
   }
@@ -301,7 +301,7 @@ class PaimonSinkTest {
     long snaps = latest();
     assertFalse(sink.truncate(RELID, 550L), "a filtered truncate must be reported");
     assertEquals(snaps, latest(), "a replayed truncate is filtered, not a second snapshot");
-    assertEquals(cfg.commitUser(),
+    assertEquals(cfg.getCommitUser(),
         reg.table(RELID).snapshotManager().latestSnapshot().commitUser());
     sink.flush(List.of(
         new SinkRecord(RELID, RowKind.INSERT, Arrays.asList("6", "after", "1"), 600L, 0, 4711L)),
@@ -384,7 +384,7 @@ class PaimonSinkTest {
     Options o = new Options();
     o.set("warehouse", ownWh.toString());
     Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
-    WriterConfig c = WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL",
+    WriterConfig c = WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL",
         "jdbc:postgresql://localhost/db", "PGPAIMON_WAREHOUSE", ownWh.toString()));
     SchemaRegistry r = new SchemaRegistry(cat, c);
     new DdlMessageHandler(r, "paimon", TestAuth.TOKEN).handle(msg("""
@@ -435,7 +435,7 @@ class PaimonSinkTest {
     java.nio.file.Path freshWh = wh.resolveSibling("fresh-wh");
     o.set("warehouse", freshWh.toString());
     Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
-    WriterConfig c = WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL",
+    WriterConfig c = WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL",
         "jdbc:postgresql://localhost/db", "PGPAIMON_WAREHOUSE", freshWh.toString()));
     SchemaRegistry r = new SchemaRegistry(cat, c);
     r.createTable(17000, "public", "never_loaded", List.of("id"),
@@ -445,7 +445,7 @@ class PaimonSinkTest {
 
     // Another commitUser's snapshots are not ours either.
     WriterConfig other =
-        WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
+        WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db",
             "PGPAIMON_WAREHOUSE", wh.toString(), "PGPAIMON_COMMIT_USER", "someone-else"));
     assertFalse(new OffsetStore(reg, other).hasCommitted(RELID));
   }
@@ -484,7 +484,7 @@ class PaimonSinkTest {
       assertTrue(m.contains("1/9ABCDEF0"), m); // the LSN of the change
       assertTrue(m.contains("1/9ABCDEF1"), m); // and of its commit
       assertTrue(m.contains("already in"), m); // the record is in the slot
-      assertTrue(m.contains(cfg.slotName()), m);
+      assertTrue(m.contains(cfg.getSlotName()), m);
       assertTrue(m.contains("does NOT help"), m); // deleting the row will not do
       assertTrue(m.contains("NOT TRANSIENT"), m);
       // both recoveries, the cheap one first, with the LSN already substituted in
@@ -692,7 +692,7 @@ class PaimonSinkTest {
     Options o = new Options();
     o.set("warehouse", ownWh.toString());
     Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
-    WriterConfig c = WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL",
+    WriterConfig c = WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL",
         "jdbc:postgresql://localhost/db", "PGPAIMON_WAREHOUSE", ownWh.toString()));
     SchemaRegistry r = new SchemaRegistry(cat, c);
     DdlMessageHandler h = new DdlMessageHandler(r, "paimon", TestAuth.TOKEN);
@@ -743,7 +743,7 @@ class PaimonSinkTest {
     Options o = new Options();
     o.set("warehouse", ownWh.toString());
     Catalog cat = CatalogFactory.createCatalog(CatalogContext.create(o));
-    WriterConfig c = WriterConfig.fromEnv(Map.of("PGPAIMON_JDBC_URL",
+    WriterConfig c = WriterConfigUtils.fromEnv(Map.of("PGPAIMON_JDBC_URL",
         "jdbc:postgresql://localhost/db", "PGPAIMON_WAREHOUSE", ownWh.toString()));
     SchemaRegistry r = new SchemaRegistry(cat, c);
     DdlMessageHandler h = new DdlMessageHandler(r, "paimon", TestAuth.TOKEN);

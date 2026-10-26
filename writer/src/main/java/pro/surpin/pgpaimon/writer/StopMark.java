@@ -54,8 +54,8 @@ final class StopMark {
   static Store inWarehouse(
       WriterConfig config
   ) throws IOException {
-    Options o = Options.fromMap(config.catalogOptions());
-    Path path = new Path(config.warehouse(), "_pgpaimon_stopped_" + config.slotName());
+    Options o = Options.fromMap(config.getCatalogOptions());
+    Path path = new Path(config.getWarehouse(), "_pgpaimon_stopped_" + config.getSlotName());
     FileIO io = FileIO.get(path, CatalogContext.create(o));
     return new Store() {
       @Override

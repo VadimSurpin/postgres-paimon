@@ -11,7 +11,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.paimon.types.RowKind;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -63,9 +63,9 @@ import pro.surpin.pgpaimon.writer.dto.SinkRecord;
  * streamed history (a re-bootstrap) that history is kept, and the reload's {@code R} rows are
  * appended after it.
  */
+@Slf4j
 public final class Backfiller implements AutoCloseable {
 
-  private static final @NotNull Logger LOG = Logger.getLogger(Backfiller.class.getName());
 
   private final @NotNull WriterConfig config;
   private final @NotNull SchemaRegistry registry;
@@ -87,7 +87,7 @@ public final class Backfiller implements AutoCloseable {
    * until {@link #close()}.
    */
   public @NotNull BackfillPlan createSlotAndExportSnapshot() throws SQLException {
-    String slot = config.slotName();
+    String slot = config.getSlotName();
     if (!slot.matches("[a-z0-9_]+")) {
       // a replication command takes the name unquoted
       throw new IllegalArgumentException(
@@ -97,12 +97,12 @@ public final class Backfiller implements AutoCloseable {
       throw new IllegalStateException("a snapshot is already exported by this Backfiller");
     }
     Properties p = new Properties();
-    p.setProperty("user", config.user());
-    p.setProperty("password", config.password());
+    p.setProperty("user", config.getUser());
+    p.setProperty("password", config.getPassword());
     p.setProperty("replication", "database");
     p.setProperty("preferQueryMode", "simple");
     p.setProperty("assumeMinServerVersion", "18");
-    Connection conn = DriverManager.getConnection(config.jdbcUrl(), p);
+    Connection conn = DriverManager.getConnection(config.getJdbcUrl(), p);
     int major;
     try {
       major = conn.getMetaData().getDatabaseMajorVersion();
@@ -122,7 +122,7 @@ public final class Backfiller implements AutoCloseable {
             + " snapshot_name=" + snapshot);
       }
       long cp = LogSequenceNumber.valueOf(lsn).asLong();
-      LOG.info("created slot " + slot + " at " + lsn + ", snapshot " + snapshot
+      log.info("created slot " + slot + " at " + lsn + ", snapshot " + snapshot
           + (major >= 17 ? ", failover enabled"
               : ", without failover (PostgreSQL " + major
                   + " has none; a promoted standby will not have this slot)"));
@@ -174,7 +174,7 @@ public final class Backfiller implements AutoCloseable {
     // Paimon identity, frozen at registration. `schema` and `table` only name the Paimon
     // side (the sink resolves it by relid too) and appear in messages.
     String qualified;
-    int chunk = config.flushMaxRecords();
+    int chunk = config.getFlushMaxRecords();
 
     try (Connection conn = WriterBootstrap.plainConnection(config)) {
       conn.setAutoCommit(true);
@@ -268,8 +268,8 @@ public final class Backfiller implements AutoCloseable {
         ps.execute();
       }
     }
-    LOG.info("backfilled " + qualified + " (paimon " + schema + "." + table + ") at "
-        + plan.consistentPoint());
+    log.info("backfilled {} (paimon {}.{}) at {}", qualified, schema, table,
+        plan.consistentPoint());
   }
 
   /**

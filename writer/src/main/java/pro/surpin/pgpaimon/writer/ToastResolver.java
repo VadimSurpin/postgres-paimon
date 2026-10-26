@@ -7,6 +7,7 @@ import java.util.Objects;
 import org.apache.paimon.types.RowKind;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.springframework.stereotype.Component;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.ColState;
 import pro.surpin.pgpaimon.writer.dto.ColumnValue;
@@ -14,6 +15,7 @@ import pro.surpin.pgpaimon.writer.dto.PartialRecord;
 import pro.surpin.pgpaimon.writer.dto.PgEvent;
 import pro.surpin.pgpaimon.writer.dto.RelationMeta;
 import pro.surpin.pgpaimon.writer.dto.TupleData;
+
 
 
 /**
@@ -31,9 +33,12 @@ import pro.surpin.pgpaimon.writer.dto.TupleData;
  * retained or mutated by this class. Lists may contain null elements (SQL NULL), so List.copyOf
  * must not be used on them.
  */
+@Component
 public final class ToastResolver {
 
-  /** Shared by every "no faithful before-image" failure so they all point at the same place. */
+  /**
+   * Shared by every "no faithful before-image" failure so they all point at the same place.
+   */
   private static final @NotNull String REMEDY =
       "(its replica identity is not FULL: check pg_class.relreplident, which must be 'f';"
           + " without it the writer cannot produce a faithful before-image;"
@@ -43,27 +48,33 @@ public final class ToastResolver {
       @NotNull PgEvent event,
       @Nullable RelationMeta meta
   ) {
-    if (event instanceof PgEvent.Insert i) {
-      return List.of(new PartialRecord(i.relid(), RowKind.INSERT, plain(i.newTuple(), null, meta)));
-    }
-    if (event instanceof PgEvent.Delete d) {
-      requireFullOld(d.oldTuple(), d.oldIsKeyOnly(), null, meta);
-      return List.of(new PartialRecord(d.relid(), RowKind.DELETE, plain(d.oldTuple(), null, meta)));
-    }
-    if (event instanceof PgEvent.Update u) {
-      requireFullOld(u.oldTuple(), u.oldIsKeyOnly(), u.newTuple(), meta);
-      // Separate lists per record: the old values are never shared with the new.
-      List<String> oldValues = plain(u.oldTuple(), null, meta);
-      List<String> newValues = plain(u.newTuple(), u.oldTuple(), meta);
-
-      if (keyChanged(oldValues, newValues, meta)) {
-        return List.of(new PartialRecord(u.relid(), RowKind.DELETE, oldValues),
-            new PartialRecord(u.relid(), RowKind.INSERT, newValues));
+    switch (event) {
+      case PgEvent.Insert i -> {
+        return List
+            .of(new PartialRecord(i.relid(), RowKind.INSERT, plain(i.newTuple(), null, meta)));
       }
-      return List.of(new PartialRecord(u.relid(), RowKind.UPDATE_BEFORE, oldValues),
-          new PartialRecord(u.relid(), RowKind.UPDATE_AFTER, newValues));
+      case PgEvent.Delete d -> {
+        requireFullOld(d.oldTuple(), d.oldIsKeyOnly(), null, meta);
+        return List
+            .of(new PartialRecord(d.relid(), RowKind.DELETE, plain(d.oldTuple(), null, meta)));
+      }
+      case PgEvent.Update u -> {
+        requireFullOld(u.oldTuple(), u.oldIsKeyOnly(), u.newTuple(), meta);
+        // Separate lists per record: the old values are never shared with the new.
+        List<String> oldValues = plain(u.oldTuple(), null, meta);
+        List<String> newValues = plain(u.newTuple(), u.oldTuple(), meta);
+
+        if (keyChanged(oldValues, newValues, meta)) {
+          return List.of(new PartialRecord(u.relid(), RowKind.DELETE, oldValues),
+              new PartialRecord(u.relid(), RowKind.INSERT, newValues));
+        }
+        return List.of(new PartialRecord(u.relid(), RowKind.UPDATE_BEFORE, oldValues),
+            new PartialRecord(u.relid(), RowKind.UPDATE_AFTER, newValues));
+      }
+      default -> {
+        return List.of();
+      }
     }
-    return List.of();
   }
 
   /**
@@ -85,7 +96,7 @@ public final class ToastResolver {
       if (fresh != null) {
         for (int i = 0; i < fresh.columns().size(); i++) {
           if (fresh.columns().get(i).state() == ColState.UNCHANGED) {
-            unchanged.append(unchanged.length() == 0 ? "; unchanged column(s): " : ", ")
+            unchanged.append(unchanged.isEmpty() ? "; unchanged column(s): " : ", ")
                 .append(columnName(meta, i));
           }
         }

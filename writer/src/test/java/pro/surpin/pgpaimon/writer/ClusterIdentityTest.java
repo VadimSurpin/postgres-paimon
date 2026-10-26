@@ -97,8 +97,8 @@ class ClusterIdentityTest {
     java.util.Map<String, String> env = new java.util.HashMap<>(
         java.util.Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://h/db", "PGPAIMON_WAREHOUSE",
             "/tmp/wh", "PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER", "7461234567890123456"));
-    assertEquals("7461234567890123456", WriterConfig.fromEnv(env).acceptSystemIdentifier());
+    assertEquals("7461234567890123456", WriterConfigUtils.fromEnv(env).getAcceptSystemIdentifier());
     env.put("PGPAIMON_ACCEPT_SYSTEM_IDENTIFIER", "yes");
-    assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(env));
+    assertThrows(IllegalArgumentException.class, () -> WriterConfigUtils.fromEnv(env));
   }
 }

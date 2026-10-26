@@ -23,7 +23,7 @@ class StopMarkTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost:5432/testdb");
     env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
-    return StopMark.inWarehouse(WriterConfig.fromEnv(env));
+    return StopMark.inWarehouse(WriterConfigUtils.fromEnv(env));
   }
 
   @Test

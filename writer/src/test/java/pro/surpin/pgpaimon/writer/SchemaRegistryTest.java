@@ -3,6 +3,8 @@ package pro.surpin.pgpaimon.writer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
@@ -39,7 +41,7 @@ class SchemaRegistryTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost:5432/testdb");
     env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
-    cfg = WriterConfig.fromEnv(env);
+    cfg = WriterConfigUtils.fromEnv(env);
     reg = new SchemaRegistry(catalog, cfg);
     handler = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
   }
@@ -194,28 +196,10 @@ class SchemaRegistryTest {
   @Test
   @Order(12)
   void ddlForAnUnregisteredTableIsIgnoredNotFatal() {
-    List<LogRecord> logged = new ArrayList<>();
-    Logger log = Logger.getLogger(DdlMessageHandler.class.getName());
-    Handler h = new Handler() {
-      public void publish(
-          LogRecord r
-      ) {
-        logged.add(r);
-      }
-
-      public void flush() {}
-
-      public void close() {}
-    };
-    log.addHandler(h);
-    try {
-      ignoredBody();
-    } finally {
-      log.removeHandler(h);
-    }
+    List<ILoggingEvent> logged = Slf4jTestLogs.capture(DdlMessageHandler.class, this::ignoredBody);
     assertEquals(2, logged.size());
-    assertTrue(logged.stream().allMatch(r -> r.getLevel() == Level.WARNING));
-    assertTrue(logged.get(0).getMessage().contains("999999"));
+    assertTrue(logged.stream().allMatch(r -> r.getLevel() == Level.WARN));
+    assertTrue(logged.get(0).getFormattedMessage().contains("999999"));
   }
 
   private void ignoredBody() {
@@ -359,37 +343,12 @@ class SchemaRegistryTest {
         SchemaRegistry.parseType("DECIMAL(10, 2)"));
   }
 
-  /**
-   * What the registry logs about MAIN tables while {@code r} runs. Lines about a history table
-   * (they say "history table") are left out: the same DDL is fanned out to it and logs its own
-   * lines, which SchemaRegistryHistoryTest asserts.
-   */
-  private static List<LogRecord> captureWarnings(
+  private static List<ILoggingEvent> captureWarnings(
       Class<?> c,
       Runnable r
   ) {
-    List<LogRecord> logged = new ArrayList<>();
-    Logger log = Logger.getLogger(c.getName());
-    Handler h = new Handler() {
-      public void publish(
-          LogRecord x
-      ) {
-        if (!x.getMessage().contains("history table")) {
-          logged.add(x);
-        }
-      }
-
-      public void flush() {}
-
-      public void close() {}
-    };
-    log.addHandler(h);
-    try {
-      r.run();
-    } finally {
-      log.removeHandler(h);
-    }
-    return logged;
+    return Slf4jTestLogs.capture(c, r).stream()
+        .filter(e -> !e.getFormattedMessage().contains("history table")).toList();
   }
 
   @Test
@@ -399,7 +358,7 @@ class SchemaRegistryTest {
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost:5432/testdb");
     env.put("PGPAIMON_WAREHOUSE", warehouse.toString());
     env.put("PGPAIMON_XID_FIELD", "_xid");
-    SchemaRegistry xr = new SchemaRegistry(catalog, WriterConfig.fromEnv(env));
+    SchemaRegistry xr = new SchemaRegistry(catalog, WriterConfigUtils.fromEnv(env));
     xr.createTable(40001L, "public", "xid_t", List.of("id"),
         List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")));
     assertEquals(List.of("id", "_seq", "_op_seq", "_xid"), xr.table(40001L).schema().fieldNames());
@@ -412,13 +371,13 @@ class SchemaRegistryTest {
     handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t")));
     long ver = reg.table(40002L).schema().id();
 
-    List<LogRecord> a = captureWarnings(SchemaRegistry.class,
+    List<ILoggingEvent> a = captureWarnings(SchemaRegistry.class,
         () -> handler.handle(msg(CREATE_FIXTURE.replace("19228", "40002")
             .replace("cap_t", "drift_t").replace("DECIMAL(10, 2)", "DECIMAL(12, 2)"))));
     assertEquals(1, a.size());
-    assertEquals(Level.WARNING, a.get(0).getLevel());
-    assertTrue(a.get(0).getMessage().contains("'price'"), a.get(0).getMessage());
-    assertTrue(a.get(0).getMessage().contains("DECIMAL(10, 2)"));
+    assertEquals(Level.WARN, a.get(0).getLevel());
+    assertTrue(a.get(0).getFormattedMessage().contains("'price'"), a.get(0).getFormattedMessage());
+    assertTrue(a.get(0).getFormattedMessage().contains("DECIMAL(10, 2)"));
 
     // A different KEY is no drift to warn about: merged on another key, the table would
     // collapse rows PostgreSQL keeps apart. Refused, and nothing is altered (review of the
@@ -430,7 +389,7 @@ class SchemaRegistryTest {
 
     assertEquals(ver, reg.table(40002L).schema().id(), "drift must not alter the table");
 
-    List<LogRecord> clean = captureWarnings(SchemaRegistry.class, () -> handler
+    List<ILoggingEvent> clean = captureWarnings(SchemaRegistry.class, () -> handler
         .handle(msg(CREATE_FIXTURE.replace("19228", "40002").replace("cap_t", "drift_t"))));
     assertTrue(clean.isEmpty(), "an identical replay must not warn");
   }
@@ -468,21 +427,23 @@ class SchemaRegistryTest {
 
     // slot PRESENT: reported, never applied -- the pending message will apply it
     long ver = reg.table(40003L).schema().id();
-    List<LogRecord> pending = captureWarnings(SchemaRegistry.class, () -> reg.bootstrapTable(40003L,
-        "public", "recon_t", List.of("id"), drifted, "input", false));
+    List<ILoggingEvent> pending = captureWarnings(SchemaRegistry.class, () -> reg
+        .bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input", false));
     assertEquals(1, pending.size(), pending.toString());
-    assertTrue(pending.get(0).getMessage().contains("should still be in the stream"),
-        pending.get(0).getMessage());
+    assertTrue(pending.get(0).getFormattedMessage().contains("should still be in the stream"),
+        pending.get(0).getFormattedMessage());
     assertEquals(original, reg.table(40003L).schema().fieldNames(),
         "with the slot present the column must NOT be fabricated");
     assertEquals(ver, reg.table(40003L).schema().id());
 
     // slot ABSENT: the message is lost, so apply it
-    List<LogRecord> lost = captureWarnings(SchemaRegistry.class, () -> reg.bootstrapTable(40003L,
-        "public", "recon_t", List.of("id"), drifted, "input", true));
+    List<ILoggingEvent> lost = captureWarnings(SchemaRegistry.class, () -> reg
+        .bootstrapTable(40003L, "public", "recon_t", List.of("id"), drifted, "input", true));
     assertEquals(1, lost.size(), lost.toString());
-    assertTrue(lost.get(0).getMessage().contains("'extra'"), lost.get(0).getMessage());
-    assertTrue(lost.get(0).getMessage().contains("has been added"), lost.get(0).getMessage());
+    assertTrue(lost.get(0).getFormattedMessage().contains("'extra'"),
+        lost.get(0).getFormattedMessage());
+    assertTrue(lost.get(0).getFormattedMessage().contains("has been added"),
+        lost.get(0).getFormattedMessage());
     assertEquals(List.of("id", "qty", "price", "note", "_seq", "_op_seq", "extra"),
         reg.table(40003L).schema().fieldNames(),
         "the missing column must be applied, not merely warned about");
@@ -495,10 +456,11 @@ class SchemaRegistryTest {
     long ver2 = reg.table(40003L).schema().id();
     List<DdlMessage.Col> conflicting = new ArrayList<>(drifted);
     conflicting.set(2, new DdlMessage.Col(3, "price", "DECIMAL(12, 2)"));
-    List<LogRecord> conflict = captureWarnings(SchemaRegistry.class, () -> reg
+    List<ILoggingEvent> conflict = captureWarnings(SchemaRegistry.class, () -> reg
         .bootstrapTable(40003L, "public", "recon_t", List.of("id"), conflicting, "input", true));
     assertEquals(1, conflict.size(), conflict.toString());
-    assertTrue(conflict.get(0).getMessage().contains("'price'"), conflict.get(0).getMessage());
+    assertTrue(conflict.get(0).getFormattedMessage().contains("'price'"),
+        conflict.get(0).getFormattedMessage());
     assertEquals(ver2, reg.table(40003L).schema().id(),
         "a conflicting difference must not alter the table");
   }
@@ -611,13 +573,14 @@ class SchemaRegistryTest {
     assertEquals(0L, reg.appliedDdlLsn(41100L));
     long before = reg.table(41100L).schema().id();
 
-    List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () -> handler.handle(msg("""
+    List<ILoggingEvent> warn = captureWarnings(SchemaRegistry.class, () -> handler.handle(msg("""
         {"v":1,"op":"add_col","relid":41100,
          "col":{"id":2,"name":"n","type":"INT"}}""")));
     assertEquals(1, warn.size(), warn.toString());
-    assertTrue(warn.get(0).getMessage().contains("leaving the stored type alone"),
-        warn.get(0).getMessage());
-    assertTrue(warn.get(0).getMessage().contains("no recorded DDL LSN"), warn.get(0).getMessage());
+    assertTrue(warn.get(0).getFormattedMessage().contains("leaving the stored type alone"),
+        warn.get(0).getFormattedMessage());
+    assertTrue(warn.get(0).getFormattedMessage().contains("no recorded DDL LSN"),
+        warn.get(0).getFormattedMessage());
     assertEquals("BIGINT", reg.table(41100L).rowType().getField("n").type().asSQLString());
     assertEquals(before, reg.table(41100L).schema().id());
   }
@@ -650,10 +613,11 @@ class SchemaRegistryTest {
     reg.bootstrapTable(41101L, "public", "nolsn2_t", List.of("id"),
         List.of(new DdlMessage.Col(1, "id", "INT NOT NULL")), "input", false);
     assertEquals(0L, reg.appliedDdlLsn(41101L));
-    List<LogRecord> warn = captureWarnings(SchemaRegistry.class, () -> handler.handle(msg("""
+    List<ILoggingEvent> warn = captureWarnings(SchemaRegistry.class, () -> handler.handle(msg("""
         {"v":1,"op":"alter_col","relid":41101,"id":9,"name":"ghost","type":"INT"}""")));
     assertEquals(1, warn.size(), warn.toString());
-    assertTrue(warn.get(0).getMessage().contains("no recorded DDL LSN"), warn.get(0).getMessage());
+    assertTrue(warn.get(0).getFormattedMessage().contains("no recorded DDL LSN"),
+        warn.get(0).getFormattedMessage());
 
     // with an identifier recorded, the same message is a genuine disagreement
     handler.handle(msg("""
@@ -950,11 +914,13 @@ class SchemaRegistryTest {
     // so this is the case that matters: the recreated table reusing the dropped OID.
     String dropReplay = """
         {"v":1,"op":"drop_table","relid":43001,"schema":"public","table":"recycled"}""";
-    List<LogRecord> warn =
+    List<ILoggingEvent> warn =
         captureWarnings(SchemaRegistry.class, () -> handler.handle(msg(dropReplay, 0x60100L)));
     assertEquals(1, warn.size(), warn.toString());
-    assertTrue(warn.get(0).getMessage().contains("STALE"), warn.get(0).getMessage());
-    assertTrue(warn.get(0).getMessage().contains("has NOT been applied"), warn.get(0).getMessage());
+    assertTrue(warn.get(0).getFormattedMessage().contains("STALE"),
+        warn.get(0).getFormattedMessage());
+    assertTrue(warn.get(0).getFormattedMessage().contains("has NOT been applied"),
+        warn.get(0).getFormattedMessage());
     assertTrue(reg.tracked(43001L), "the relation must stay tracked");
     assertDoesNotThrow(() -> catalog.getTable(Identifier.create("public", "recycled")),
         "the table must still be there");
@@ -1006,13 +972,13 @@ class SchemaRegistryTest {
         .of(new DdlMessage.Col(1, "id", "INT NOT NULL"), new DdlMessage.Col(2, "before", "STRING")),
         "input", false);
     // the registry has renamed it; Paimon still has the old name beside the new one
-    List<LogRecord> logs = captureWarnings(SchemaRegistry.class,
+    List<ILoggingEvent> logs = captureWarnings(SchemaRegistry.class,
         () -> reg.bootstrapTable(43004L, "public", "orphan_t", List.of("id"),
             List.of(new DdlMessage.Col(1, "id", "INT NOT NULL"),
                 new DdlMessage.Col(2, "after", "STRING")),
             "input", true));
-    List<String> orphan =
-        logs.stream().map(LogRecord::getMessage).filter(m -> m.contains("'before'")).toList();
+    List<String> orphan = logs.stream().map(ILoggingEvent::getFormattedMessage)
+        .filter(m -> m.contains("'before'")).toList();
     assertEquals(1, orphan.size(), logs.toString());
     String m = orphan.get(0);
     assertTrue(m.contains("NULL for every row"), m);

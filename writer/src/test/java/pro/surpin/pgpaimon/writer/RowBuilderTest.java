@@ -62,21 +62,7 @@ class RowBuilderTest {
 
   @Test
   void aPgColumnWithNoPaimonCounterpartIsIgnoredWithOneWarning() {
-    java.util.List<java.util.logging.LogRecord> logged = new java.util.ArrayList<>();
-    java.util.logging.Logger log = java.util.logging.Logger.getLogger(RowBuilder.class.getName());
-    java.util.logging.Handler h = new java.util.logging.Handler() {
-      public void publish(
-          java.util.logging.LogRecord r
-      ) {
-        logged.add(r);
-      }
-
-      public void flush() {}
-
-      public void close() {}
-    };
-    log.addHandler(h);
-    try {
+    var logged = Slf4jTestLogs.capture(RowBuilder.class, () -> {
       RowBuilder b = new RowBuilder("public.t", paimonSchema(), List.of("id", "v", "surprise"),
           "_seq", "_op_seq", null);
       GenericRow r1 = b.build(new SinkRecord(1, RowKind.INSERT, List.of("1", "x", "y"), 1L, 0, 1L));
@@ -86,12 +72,10 @@ class RowBuilderTest {
       assertEquals(1L, r1.getLong(2));
       assertEquals(2, r2.getInt(0));
       assertEquals(4, r2.getFieldCount());
-      assertEquals(1, logged.size(), "once per builder, not once per row");
-      assertEquals(java.util.logging.Level.WARNING, logged.get(0).getLevel());
-      assertTrue(logged.get(0).getMessage().contains("surprise"));
-      assertTrue(logged.get(0).getMessage().contains("public.t"));
-    } finally {
-      log.removeHandler(h);
-    }
+    });
+    assertEquals(1, logged.size(), "once per builder, not once per row");
+    assertEquals(ch.qos.logback.classic.Level.WARN, logged.get(0).getLevel());
+    assertTrue(logged.get(0).getFormattedMessage().contains("surprise"));
+    assertTrue(logged.get(0).getFormattedMessage().contains("public.t"));
   }
 }

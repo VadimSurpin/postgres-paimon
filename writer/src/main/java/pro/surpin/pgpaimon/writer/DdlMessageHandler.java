@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 package pro.surpin.pgpaimon.writer;
 
-import java.util.logging.Logger;
+import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.dto.*;
 import pro.surpin.pgpaimon.writer.dto.DdlMessage;
 import pro.surpin.pgpaimon.writer.dto.PgEvent;
+
 
 
 /**
@@ -14,9 +17,11 @@ import pro.surpin.pgpaimon.writer.dto.PgEvent;
  * column's name can be reused by a column added in the same ALTER TABLE; apply them exactly as
  * received.
  */
+@Slf4j
+@Service
+@org.springframework.context.annotation.Lazy
 public final class DdlMessageHandler {
 
-  private static final @NotNull Logger LOG = Logger.getLogger(DdlMessageHandler.class.getName());
   static final int WIRE_VERSION = 1;
 
   private final SchemaRegistry registry;
@@ -36,6 +41,25 @@ public final class DdlMessageHandler {
       String token
   ) {
     this(registry, expectedPrefix, token, 0, null);
+  }
+
+  @Autowired
+  public DdlMessageHandler(
+      SchemaRegistry registry,
+      WriterConfig config
+  ) {
+    this(registry, config.getMessagePrefix(), currentToken(config), config.getSkipLsnValue(),
+        () -> currentToken(config));
+  }
+
+  private static String currentToken(
+      WriterConfig config
+  ) {
+    try (var conn = WriterBootstrap.plainConnection(config)) {
+      return WriterBootstrap.readToken(conn);
+    } catch (java.sql.SQLException e) {
+      throw WriterBootstrap.missingGrant(e);
+    }
   }
 
   /**
@@ -107,19 +131,19 @@ public final class DdlMessageHandler {
     try {
       d = DdlMessage.parse(m.content());
     } catch (RuntimeException e) {
-      LOG.warning(ignored(m, "it is not a JSON object (" + e.getMessage() + ")"));
+      log.warn(ignored(m, "it is not a JSON object (" + e.getMessage() + ")"));
       return;
     }
     if (d.op() == null) {
-      LOG.warning(ignored(m, "it is a JSON object with no \"op\", so not a DDL message"));
+      log.warn(ignored(m, "it is a JSON object with no \"op\", so not a DDL message"));
       return;
     }
     if (!authentic(d.auth())) {
       String why = d.auth() == null ? "carries no credential"
           : "carries a credential that is not this installation's paimon.secret";
       if (skipLsn != 0 && m.lsn() == skipLsn) {
-        LOG.warning("SKIPPED DDL MESSAGE (PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn)
-            + "): " + describe(d, m) + " " + why + ". Nothing was applied. If it was a"
+        log.warn("SKIPPED DDL MESSAGE (PGPAIMON_SKIP_LSN=" + SlotConsumer.formatLsn(skipLsn) + "): "
+            + describe(d, m) + " " + why + ". Nothing was applied. If it was a"
             + " legitimate DDL message, that DDL is now missing from Paimon: compare the"
             + " Paimon schema of relation " + d.relid() + " with paimon.table_registry and"
             + " re-register the table if they disagree. Unset PGPAIMON_SKIP_LSN before the"
@@ -156,7 +180,7 @@ public final class DdlMessageHandler {
               d.histBucketsUser()));
       case "add_col", "drop_col", "rename_col", "alter_col", "drop_table" -> {
         if (!registry.tracked(d.relid())) {
-          LOG.warning("ignoring " + op + " for unregistered relation " + d.relid());
+          log.warn("ignoring {} for unregistered relation {}", op, d.relid());
           return;
         }
         // m.lsn() is the message's own position in WAL, from the pgoutput 'M' header.
@@ -197,11 +221,11 @@ public final class DdlMessageHandler {
     try {
       now = currentToken.get();
     } catch (RuntimeException e) {
-      LOG.warning("could not re-read paimon.secret to check a DDL message's credential: " + e);
+      log.warn("could not re-read paimon.secret to check a DDL message's credential: " + e);
       return false;
     }
     if (now != null && !now.isEmpty() && same(auth, now)) {
-      LOG.info("paimon.secret has changed since startup; a DDL message carries the new value"
+      log.info("paimon.secret has changed since startup; a DDL message carries the new value"
           + " and is accepted, and the new value is used from now on");
       token = now;
       return true;

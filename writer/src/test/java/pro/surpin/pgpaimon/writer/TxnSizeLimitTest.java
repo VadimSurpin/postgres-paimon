@@ -40,7 +40,7 @@ class TxnSizeLimitTest {
   void aTransactionOverTheLimitStopsWithTheRemedyAndFlushesNothing() throws Exception {
     TxnBatcherTest.Recorder rec = new TxnBatcherTest.Recorder();
     // 100 chars + 1-2 digit id + 48 overhead per record: about 150 bytes each.
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec).withMaxBytes(1_500);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec).withMaxBytes(1_500);
     TxnBatcher.TransactionTooLargeException e =
         assertThrows(TxnBatcher.TransactionTooLargeException.class, () -> txn(b, 50, 10_000));
     assertTrue(e.getMessage().contains("TRANSACTION TOO LARGE"), e.getMessage());
@@ -54,7 +54,7 @@ class TxnSizeLimitTest {
   @Test
   void aTransactionUnderTheLimitIsFlushedWhole() throws Exception {
     TxnBatcherTest.Recorder rec = new TxnBatcherTest.Recorder();
-    TxnBatcher b = new TxnBatcher(new ToastResolver(), null, rec).withMaxBytes(1_500);
+    TxnBatcher b = new TxnBatcherImpl(new ToastResolver(), null, rec).withMaxBytes(1_500);
     txn(b, 9, 10_000);
     assertEquals(1, rec.batches.size());
     assertEquals(9, rec.batches.get(0).size());
@@ -67,10 +67,11 @@ class TxnSizeLimitTest {
   void theLimitIsConfigurableAndDefaultsToAQuarterOfTheHeap() {
     Map<String, String> env = new java.util.HashMap<>(
         Map.of("PGPAIMON_JDBC_URL", "jdbc:postgresql://h/db", "PGPAIMON_WAREHOUSE", "/tmp/wh"));
-    assertEquals(Runtime.getRuntime().maxMemory() / 4, WriterConfig.fromEnv(env).txnMaxBytes());
+    assertEquals(Runtime.getRuntime().maxMemory() / 4,
+        WriterConfigUtils.fromEnv(env).getTxnMaxBytes());
     env.put("PGPAIMON_TXN_MAX_BYTES", "12345");
-    assertEquals(12345, WriterConfig.fromEnv(env).txnMaxBytes());
+    assertEquals(12345, WriterConfigUtils.fromEnv(env).getTxnMaxBytes());
     env.put("PGPAIMON_TXN_MAX_BYTES", "0");
-    assertThrows(IllegalArgumentException.class, () -> WriterConfig.fromEnv(env));
+    assertThrows(IllegalArgumentException.class, () -> WriterConfigUtils.fromEnv(env));
   }
 }

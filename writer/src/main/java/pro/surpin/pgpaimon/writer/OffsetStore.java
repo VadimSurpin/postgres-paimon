@@ -7,7 +7,9 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.SnapshotManager;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.springframework.stereotype.Service;
 import pro.surpin.pgpaimon.writer.dto.*;
+
 
 
 /**
@@ -19,6 +21,7 @@ import pro.surpin.pgpaimon.writer.dto.*;
  * latest snapshot to the newest one that is ours. Identifiers are monotone per user, so that
  * snapshot carries the maximum.
  */
+@Service
 public final class OffsetStore {
 
   private final @NotNull SchemaRegistry registry;
@@ -136,7 +139,7 @@ public final class OffsetStore {
         continue;
       }
       Snapshot s = sm.snapshot(id);
-      if (config.commitUser().equals(s.commitUser())) {
+      if (config.getCommitUser().equals(s.commitUser())) {
         return s.commitIdentifier();
       }
     }

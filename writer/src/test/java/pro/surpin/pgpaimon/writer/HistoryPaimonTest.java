@@ -48,7 +48,7 @@ class HistoryPaimonTest {
     Map<String, String> env = new HashMap<>();
     env.put("PGPAIMON_JDBC_URL", "jdbc:postgresql://localhost/db");
     env.put("PGPAIMON_WAREHOUSE", wh.toString());
-    cfg = WriterConfig.fromEnv(env);
+    cfg = WriterConfigUtils.fromEnv(env);
     reg = new SchemaRegistry(catalog, cfg);
     ddl = new DdlMessageHandler(reg, "paimon", TestAuth.TOKEN);
   }
@@ -101,7 +101,7 @@ class HistoryPaimonTest {
               commitLsn, endLsn);
       mini = new MiniBatcher(WriterBootstrap.confirmingFlusher(partial, confirmed::add),
           new OffsetStore(reg, cfg)::highestCommitted, limits);
-      TxnBatcher batcher = new TxnBatcher(new ToastResolver(), reg, mini);
+      TxnBatcher batcher = new TxnBatcherImpl(new ToastResolver(), reg, mini);
       handler = new WriterBootstrap.PipelineHandler(reg::tracked, reg::primaryKey, ddl::handle,
           ddl::isDdl, new WriterBootstrap.PipelineHandler.Target() {
             @Override

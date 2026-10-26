@@ -34,7 +34,7 @@ class SlotConsumerTest {
   @Test
   void disconnectDiscardsAnOpenTransaction() throws Exception {
     List<List<SinkRecord>> flushed = new ArrayList<>();
-    TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, (
+    TxnBatcher batcher = new TxnBatcherImpl(new ToastResolver(), null, (
         records,
         commitLsn,
         endLsn) -> flushed.add(List.copyOf(records)));
@@ -85,7 +85,7 @@ class SlotConsumerTest {
         calls.add("confirm@" + lsn);
         confirmed.add(lsn);
       }), relid -> 0L, limits, () -> now);
-      batcher = new TxnBatcher(new ToastResolver(), null, mini);
+      batcher = new TxnBatcherImpl(new ToastResolver(), null, mini);
       handler = new WriterBootstrap.PipelineHandler(tracked::contains, r -> List.of("id"),
           m -> calls.add("ddl"), m -> true, this, batcher, mini);
     }
@@ -261,7 +261,7 @@ class SlotConsumerTest {
         r,
         c,
         e) -> calls.add("flush@" + c), x -> 0L, HOLD);
-    TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, mini);
+    TxnBatcher batcher = new TxnBatcherImpl(new ToastResolver(), null, mini);
     WriterBootstrap.PipelineHandler h = new WriterBootstrap.PipelineHandler(x -> true,
         r -> List.of("id"), m -> calls.add("other-message"), m -> false, f, batcher, mini);
     h.onEvent(new PgEvent.Relation(META), 0L);
@@ -391,7 +391,7 @@ class SlotConsumerTest {
         e) -> {
       throw new java.io.IOException("commit failed");
     }, confirmed::add), x -> 0L, new MiniBatcher.Limits(1, 1L << 40, 0));
-    TxnBatcher batcher = new TxnBatcher(new ToastResolver(), null, mini);
+    TxnBatcher batcher = new TxnBatcherImpl(new ToastResolver(), null, mini);
     WriterBootstrap.PipelineHandler h =
         new WriterBootstrap.PipelineHandler(x -> true, r -> List.of("id"), m -> {
         }, m -> true, new Fixture(), batcher, mini);
